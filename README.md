@@ -1,15 +1,25 @@
 # A Separation Principle for Multi-Agent Reinforcement Learning
 This repository contains the code for the paper [A Separation Principle for Multi-Agent Reinforcement Learning]().
 
-## Installation
+## Quickstart
 
-We recommend using [conda](https://conda.io/en/latest/user-guide/install/) to manage the virtual environment.
+### 1. Clone the repository
 
 ```bash
-conda create -n nyc-taxi python=3.13.2
+git clone https://github.com/your-username/nyc-taxi-analysis.git
+cd nyc-taxi-analysis
+```
+
+### 2. Run the setup script
+To install the required dependencies and automatically download and convert the data
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+After the setup is complete, activate the environment manually:
+```bash
 conda activate nyc-taxi
-pip install -r requirements.txt
 ```
 
 ## Dataset
-The full TLC dataset can be downloaded from [NYC TLC Trip Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page):
+The full TLC dataset is publicly available at [NYC TLC Trip Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
