@@ -1,2 +1,48 @@
-*.csv
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Virtual environments
+env/
+venv/
+.nyc-taxi/
+*.egg-info/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Data files
+data/
 *.parquet
+*.csv
+*.zip
+
+# Map shapefiles and large geospatial data
+shapefiles/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Python environment files
+pip-log.txt
+pip-delete-this-directory.txt
+
+# VS Code settings (optional)
+.vscode/
+
+# Conda environment metadata (optional)
+conda-meta/
+
+# Jupyter runtime files (when using jupyter lab)
+*.local/share/jupyter/runtime/
