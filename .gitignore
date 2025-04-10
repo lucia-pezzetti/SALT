@@ -50,6 +50,8 @@ conda-meta/
 # Python cache files
 __pycache__/
 *.py[cod]
+cache/
+
 
 # Jupyter cache / autosave
 .ipynb_checkpoints/
