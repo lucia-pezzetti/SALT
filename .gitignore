@@ -46,3 +46,15 @@ conda-meta/
 
 # Jupyter runtime files (when using jupyter lab)
 *.local/share/jupyter/runtime/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Jupyter cache / autosave
+.ipynb_checkpoints/
+
+# OS/user cache (optional)
+*.DS_Store
+*.log
+*.tmp
