@@ -6,7 +6,7 @@ This repository contains the code for the paper [A Separation Principle for Mult
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/nyc-taxi-analysis.git
+git clone https://github.com/lucia-pezzetti/nyc-taxi-analysis.git
 cd nyc-taxi-analysis
 ```
 
