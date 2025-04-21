@@ -9,6 +9,8 @@ echo "Installing Python dependencies..."
 conda create -y -n nyc-taxi python=3.13.2
 eval "$(conda shell.bash hook)"
 conda activate nyc-taxi
+
+pip install --upgrade pip
 pip install -r requirements.txt
 
 # Create folder structure
