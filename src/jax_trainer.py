@@ -8,10 +8,25 @@ from jax_ppo_agent import Transition, sample_action, ppo_loss
 
 # helper functions
 
-def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
+    """
+    Compute Generalized Advantage Estimation (GAE) and returns.
+    Args:
+        rewards: Array of rewards.
+        values: Array of value estimates.
+        dones: Array of done flags.
+        last_value: Value estimate for the last state.
+        gamma: Discount factor.
+        lam: GAE parameter.
+    Returns:
+        adv: Array of advantages.
+        returns: Array of returns.
+    """
+
     adv = jnp.zeros_like(rewards)
     gae = 0.0
-    next_value = 0.0
+    next_value = last_value
+
     for t in reversed(range(len(rewards))):
         mask = 1.0 - dones[t]
         delta = rewards[t] + gamma * next_value * mask - values[t]
@@ -19,27 +34,46 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
         adv = adv.at[t].set(gae)
         next_value = values[t]
     returns = adv + values
+
+    # advantage normalization
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
     return adv, returns
 
-def maybe_reset(env, state: TaxiState, key, fixed_starts, fixed_pickups, distances):
-    def reset_one(subkey):
-        return init_env(subkey, fixed_starts, fixed_pickups, distances)
-
+@jax.jit
+def maybe_reset(state: TaxiState,
+                key,
+                fixed_starts,
+                fixed_pickups,
+                distances):
+    """
+    Resets the environment if `state.done` is True.
+    * If state.done[i]==True → replace the ith env by a freshly
+      initialised one.
+    * Else → keep the existing state.
+    Returns (new_state, new_key).
+    """
     keys = random.split(key, state.done.shape[0] + 1)
     new_key = keys[0]
-    subkeys = keys[1:]
+    subkeys = keys[1:]                       # shape (N,)
 
-    new_states, _ = jax.vmap(reset_one)(subkeys)
+    # Candidate reset states for every env
+    # vmap over sub‑keys (axis 0) – other args are broadcast (None)
+    reset_states, _ = jax.vmap(init_env,
+                           in_axes=(0, None, None, None))(
+        subkeys, fixed_starts, fixed_pickups, distances
+    )
 
-    def select(old, new):
+    # Choose old or reset values field‑wise
+    def choose(old, new):
         return jnp.where(state.done, new, old)
 
     return TaxiState(
-        current_node = select(state.current_node, new_states.current_node),
-        pickup_node  = select(state.pickup_node,  new_states.pickup_node),
-        ride_phase   = select(state.ride_phase,   new_states.ride_phase),
-        done         = jnp.zeros_like(state.done),
-        step_count   = select(state.step_count,   new_states.step_count),
+        current_node = choose(state.current_node, reset_states.current_node),
+        pickup_node  = choose(state.pickup_node,  reset_states.pickup_node),
+        ride_phase   = choose(state.ride_phase,   reset_states.ride_phase),
+        done         = jnp.zeros_like(state.done),   # clear flags
+        step_count   = choose(state.step_count,   reset_states.step_count),
     ), new_key
 
 
@@ -77,7 +111,7 @@ def batched_rollout(agent, env, state: TaxiState, key, num_steps, obs_fn):
         )
 
         # Reset done envs immediately
-        next_state, key = maybe_reset(env, next_state, key, env.fixed_starts, env.fixed_pickups, env.distances)
+        next_state, key = maybe_reset(next_state, key, env.fixed_starts, env.fixed_pickups, env.distances)
 
         return (next_state, key), trans
 
@@ -99,10 +133,12 @@ def train(
     fixed_starts,
     fixed_pickups,
     distances,
+    num_updates = 1000,
     num_steps=128,
     epochs=4,
     batch_size=64,
-    lr=3e-4
+    lr=3e-4,
+    clip_eps=0.2,
 ):
     """
     PPO training loop. After each rollout, any sub-env whose `done`==True
@@ -116,38 +152,78 @@ def train(
     # initialize batch of states
     state = init_state_fn()
 
-    for update in range(1000):
+    # main training loop
+    for update in range(num_updates):
         # rollout
         transitions, state, key = batched_rollout(
             agent, env, state, key, num_steps, obs_fn
         )
 
-        # flatten & compute GAE
         T, N = transitions.obs.shape[:2]
-        obs      = transitions.obs.reshape(T * N, -1)
-        act      = transitions.action.reshape(T * N)
-        rew      = transitions.reward.reshape(T * N)
-        nxt      = transitions.next_obs.reshape(T * N, -1)
-        don      = transitions.done.reshape(T * N)
-        logp     = transitions.log_prob.reshape(T * N)
-        val      = transitions.value.reshape(T * N)
 
-        adv, ret = compute_gae(rew, val, don)
-        flat_trans = Transition(obs, act, rew, nxt, don, logp, val)
+        # critic value of next state after the rollout (one per env)
+        last_next_obs   = transitions.next_obs[-1]
+        last_values_N   = jax.vmap(agent.critic)(last_next_obs)
+
+        #  keep [T,N] until GAE; swap axes to [N,T] for vmapping
+        rew_NT, val_NT, don_NT = map(
+            lambda x: jnp.swapaxes(x, 0, 1),
+            (transitions.reward, transitions.value, transitions.done)
+        )                                                   # (N, T)
+
+        adv_NT, ret_NT = jax.vmap(compute_gae, in_axes=(0, 0, 0, 0))(
+            rew_NT, val_NT, don_NT, last_values_N
+        )                                                   # (N, T)
+
+        # back to [T,N] then flatten to [T*N]
+        adv = jnp.swapaxes(adv_NT, 0, 1).reshape(-1)
+        ret = jnp.swapaxes(ret_NT, 0, 1).reshape(-1)
+
+        # flatten other tensors
+        flat_obs  = transitions.obs.reshape(T * N, -1)
+        flat_act  = transitions.action.reshape(T * N)
+        flat_logp = transitions.log_prob.reshape(T * N)
+        flat_val  = transitions.value.reshape(T * N)
+        flat_rew  = transitions.reward.reshape(T * N)
+
+        flat_trans = Transition(
+            obs      = flat_obs,
+            action   = flat_act,
+            reward   = flat_rew,   # optional
+            next_obs = transitions.next_obs.reshape(T * N, -1),  # optional
+            done     = transitions.done.reshape(T * N),     # optional
+            log_prob = flat_logp,
+            value    = flat_val
+        )
 
         # PPO updates
+        num_samples = T * N
+        num_minibatches = num_samples // batch_size
+
+        #  "old" param view for optax.update
+        params = eqx.filter(agent, eqx.is_array)
+
         for _ in range(epochs):
             key, subkey = random.split(key)
-            idx = random.permutation(subkey, T * N)[:batch_size]
-            batch     = jax.tree_util.tree_map(lambda x: x[idx], flat_trans)
-            batch_adv = adv[idx]
-            batch_ret = ret[idx]
+            perm = random.permutation(subkey, num_samples)
 
-            loss, grads = ppo_loss(agent, batch, batch_adv, batch_ret, 0.2)
-            grads = eqx.filter(grads, eqx.is_array)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            agent  = eqx.apply_updates(agent, updates)
+            for mb in range(num_minibatches):
+                mb_idx = perm[mb*batch_size : (mb+1)*batch_size]
+
+                batch = jax.tree_util.tree_map(lambda x: x[mb_idx], flat_trans)
+                batch_adv = adv[mb_idx]
+                batch_ret = ret[mb_idx]
+
+                # ----- loss and grads -----
+                loss, grads = eqx.filter_value_and_grad(ppo_loss)(
+                    agent, batch, batch_adv, batch_ret, clip_eps
+                )
+
+                grads = eqx.filter(grads, eqx.is_array)
+                updates, opt_state = optimizer.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+                agent = eqx.apply_updates(agent, updates)
+
 
         # reset any finished sub-envs in Python
         # bring state into NumPy for indexing
@@ -177,6 +253,6 @@ def train(
         )
 
         # logging
-        jax.debug.print("Update {}: Mean Reward {}, Mean Advantage: {}", update, jnp.mean(rew), jnp.mean(adv))
+        jax.debug.print("Update {}/{}: Mean Reward {}, Mean Return {}, Mean Advantage: {}, Std Advantage", update, num_updates, jnp.mean(flat_rew), jnp.mean(ret), jnp.mean(adv), jnp.std(adv))
 
     return agent

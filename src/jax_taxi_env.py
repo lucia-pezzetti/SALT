@@ -5,7 +5,7 @@ import equinox as eqx
 import numpy as np
 import random
 from jax import debug
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 class TaxiState(NamedTuple):
     current_node: int
@@ -14,49 +14,34 @@ class TaxiState(NamedTuple):
     done: bool
     step_count: int = 0
 
-def init_env(rng_key, fixed_starts, fixed_pickups, distances):
+@jax.jit                             # <-- crucial: make it JIT‑safe
+def init_env(rng_key,
+             fixed_starts: Sequence[int],
+             fixed_pickups: Sequence[int],
+             distances: jnp.ndarray     # kept for signature consistency
+            ) -> tuple[TaxiState, jnp.ndarray]:
     """
-    Initializes a taxi environment state using JAX randomness.
-    Returns a tuple of (TaxiState, new_rng_key).
+    Environment reset.
+    Returns (TaxiState, new_rng_key).
     """
-    def single_reset(key):
-        def body_fun(val):
-            key, _, _, _ = val  # correctly unpack the full 4-tuple
-            key, subkey1, subkey2 = jrandom.split(key, 3)
+    # convert the Python lists only once per call
+    starts  = jnp.asarray(fixed_starts,  dtype=jnp.int32)
+    pickups = jnp.asarray(fixed_pickups, dtype=jnp.int32)
 
-            starts = jnp.array(fixed_starts, dtype=jnp.int64)
-            pickups = jnp.array(fixed_pickups, dtype=jnp.int64)
-            taxi_idx = jrandom.randint(subkey1, (), 0, starts.shape[0])
-            pickup_idx = jrandom.randint(subkey2, (), 0, pickups.shape[0])
-            taxi_node = starts[taxi_idx]
-            pickup_node = pickups[pickup_idx]
+    # draw two random indices
+    k1, k2, new_key = jrandom.split(rng_key, 3)
+    taxi_idx   = jrandom.randint(k1, (), 0, starts.shape[0])
+    pickup_idx = jrandom.randint(k2, (), 0, pickups.shape[0])
 
-            valid = (taxi_node != pickup_node) & (distances[taxi_node, pickup_node] > 0)
-            return key, taxi_node, pickup_node, valid
+    return TaxiState(
+        current_node = starts[taxi_idx],
+        pickup_node  = pickups[pickup_idx],
+        ride_phase   = jnp.int32(0),
+        done         = False,
+        step_count   = jnp.int32(0)
+    ), new_key
 
-        def cond_fun(val):
-            _, _, _, valid = val
-            return ~valid
 
-        # initialize dummy values for taxi_node and pickup_node
-        dummy_node = jnp.array(0, dtype=jnp.int64)
-        init_valid = jnp.array(False)
-
-        key, taxi_node, pickup_node, _ = jax.lax.while_loop(
-            cond_fun,
-            body_fun,
-            (key, dummy_node, dummy_node, init_valid)
-        )
-
-        return TaxiState(
-            current_node=taxi_node,
-            pickup_node=pickup_node,
-            ride_phase=0,
-            done=False,
-            step_count=0
-        ), key
-
-    return single_reset(rng_key)
 
 class JAXRideEnv(eqx.Module):
     adj_list: jnp.ndarray         # shape [num_nodes, max_deg]
@@ -69,12 +54,13 @@ class JAXRideEnv(eqx.Module):
     fixed_pickups: jnp.ndarray  
     timeout_penalty: float = -500.0     # penalty if timeout before pickup
 
+    @eqx.filter_jit
     def step(self, state: TaxiState, action: int) -> tuple[TaxiState, float]:
         current = state.current_node
-        next_node = self.adj_list[current, action]
+        next_node = self.adj_list[current, action].astype(state.current_node.dtype)
         time_cost = self.travel_times[current, action]
 
-        # debug.print("current node: {}, next node: {}, time cost: {}", current[0], next_node[0], time_cost[0])
+        debug.print("current node: {}, action: {}, next node: {}, time cost: {}, pickup node: {}", current[0], action[0], next_node[0], time_cost[0], state.pickup_node[0])
 
         # invalid move if no neighbor
         invalid = (next_node == -1)
@@ -87,7 +73,7 @@ class JAXRideEnv(eqx.Module):
         # check timeout
         timeout = (next_step >= self.max_steps) & (~reach_pickup)
         done = invalid | reach_pickup | timeout
-        # debug.print("done: {}, step: {}, reached pickup: {}, invalid: {}, timeout: {}", done[0], state.step_count[0], reach_pickup[0], invalid[0], timeout[0])
+        debug.print("done: {}, step: {}, reached pickup: {}, invalid: {}, timeout: {}", done[0], state.step_count[0], reach_pickup[0], invalid[0], timeout[0])
 
         # base reward: penalize time, heavy penalty for invalid
         base_reward = jnp.where(invalid, -1000.0, -time_cost/60)
@@ -103,9 +89,8 @@ class JAXRideEnv(eqx.Module):
         # penalty for timeout
         timeout_penalty = jnp.where(timeout, self.timeout_penalty, 0.0)
 
-        reward = base_reward + shaping*10 + pickup_bonus + timeout_penalty
-
-        # debug.print("reward: {}, base: {}, shaping: {}, pickup_bonus: {}, timeout_penalty: {}", reward[0], base_reward[0], shaping[0], pickup_bonus[0], timeout_penalty[0])
+        reward = base_reward + shaping * 10 + pickup_bonus + timeout_penalty
+        debug.print("reward: {}, base: {}, shaping: {}, pickup_bonus: {}, timeout_penalty: {}", reward[0], base_reward[0], shaping[0], pickup_bonus[0], timeout_penalty[0])
 
         new_state = TaxiState(
             current_node=next_node,
