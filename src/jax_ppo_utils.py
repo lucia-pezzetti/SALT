@@ -31,8 +31,8 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
     return jnp.array(adj), jnp.array(times)
 
 # --- Observation extraction and normalisation function ---
-def make_obs_fn(G: nx.DiGraph, node_to_idx: dict):
-    """Creates a JAX-compatible observation function using precomputed lat/lon arrays."""
+def make_obs_fn(G: nx.DiGraph, node_to_idx: dict, max_steps: int):
+    """Observation function using lat/lon with delta and normalized step."""
     
     idx_to_node = [node for node, idx in sorted(node_to_idx.items(), key=lambda x: x[1])]
     lats = jnp.array([G.nodes[n]['y'] for n in idx_to_node], dtype=jnp.float32)
@@ -52,7 +52,11 @@ def make_obs_fn(G: nx.DiGraph, node_to_idx: dict):
         return latlon[index]
 
     def single_obs(s):
-        return jnp.concatenate([get_xy(s.current_node), get_xy(s.pickup_node)])
+        current_xy = get_xy(s.current_node)
+        pickup_xy = get_xy(s.pickup_node)
+        delta = pickup_xy - current_xy
+        norm_step = jnp.array([s.step_count / max_steps], dtype=jnp.float32)
+        return jnp.concatenate([current_xy, pickup_xy, delta, norm_step])
 
     @jax.jit
     def obs_fn(state_batch):

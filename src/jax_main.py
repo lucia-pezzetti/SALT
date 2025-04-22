@@ -72,7 +72,7 @@ env = JAXRideEnv(
 )
 
 # --- Create normalized observation function ---
-obs_fn = make_obs_fn(G, node_to_idx)
+obs_fn = make_obs_fn(G, node_to_idx, env.max_steps)
 
 # --- Initialize batched environment state ---
 num_envs = 16
@@ -80,7 +80,7 @@ key = jax_random.PRNGKey(0)
 # split for agent init vs env init
 eval_key, agent_key = jax_random.split(key)
 # init agent
-dim_obs = 4  # [current_lat, current_lon, pickup_lat, pickup_lon]
+dim_obs = 7  # [current_lat, current_lon, pickup_lat, pickup_lon]
 dim_act = adj_list.shape[1]
 agent = make_agent(agent_key, dim_obs, dim_act)
 

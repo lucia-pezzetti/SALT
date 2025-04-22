@@ -60,7 +60,7 @@ class JAXRideEnv(eqx.Module):
         next_node = self.adj_list[current, action].astype(state.current_node.dtype)
         time_cost = self.travel_times[current, action]
 
-        debug.print("current node: {}, action: {}, next node: {}, time cost: {}, pickup node: {}", current[0], action[0], next_node[0], time_cost[0], state.pickup_node[0])
+        # debug.print("current node: {}, action: {}, next node: {}, time cost: {}, pickup node: {}", current[0], action[0], next_node[0], time_cost[0], state.pickup_node[0])
 
         # invalid move if no neighbor
         invalid = (next_node == -1)
@@ -73,7 +73,7 @@ class JAXRideEnv(eqx.Module):
         # check timeout
         timeout = (next_step >= self.max_steps) & (~reach_pickup)
         done = invalid | reach_pickup | timeout
-        debug.print("done: {}, step: {}, reached pickup: {}, invalid: {}, timeout: {}", done[0], state.step_count[0], reach_pickup[0], invalid[0], timeout[0])
+        # debug.print("done: {}, step: {}, reached pickup: {}, invalid: {}, timeout: {}", done[0], state.step_count[0], reach_pickup[0], invalid[0], timeout[0])
 
         # base reward: penalize time, heavy penalty for invalid
         base_reward = jnp.where(invalid, -1000.0, -time_cost/60)
@@ -90,7 +90,7 @@ class JAXRideEnv(eqx.Module):
         timeout_penalty = jnp.where(timeout, self.timeout_penalty, 0.0)
 
         reward = base_reward + shaping * 10 + pickup_bonus + timeout_penalty
-        debug.print("reward: {}, base: {}, shaping: {}, pickup_bonus: {}, timeout_penalty: {}", reward[0], base_reward[0], shaping[0], pickup_bonus[0], timeout_penalty[0])
+        # debug.print("reward: {}, base: {}, shaping: {}, pickup_bonus: {}, timeout_penalty: {}", reward[0], base_reward[0], shaping[0], pickup_bonus[0], timeout_penalty[0])
 
         new_state = TaxiState(
             current_node=next_node,
