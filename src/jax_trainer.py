@@ -27,6 +27,8 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
     gae = 0.0
     next_value = last_value
 
+    # TODO: use jax.lax.scan + fixed length loop.
+    # len(rewards) is not jittable, but you know the length at compile time
     for t in reversed(range(len(rewards))):
         mask = 1.0 - dones[t]
         delta = rewards[t] + gamma * next_value * mask - values[t]
@@ -96,6 +98,7 @@ def batched_rollout(agent, env, state: TaxiState, key, num_steps, obs_fn):
         )
 
         # step env
+        # TODO: step is not jitted correctly I believe
         next_state, rewards = env.step(state, actions)
         dones = next_state.done
 
@@ -111,6 +114,7 @@ def batched_rollout(agent, env, state: TaxiState, key, num_steps, obs_fn):
         )
 
         # Reset done envs immediately
+        # TODO: I think this is triggering recompilations, state may be considered static
         next_state, key = maybe_reset(next_state, key, env.fixed_starts, env.fixed_pickups, env.distances)
 
         return (next_state, key), trans
@@ -153,8 +157,13 @@ def train(
     state = init_state_fn()
 
     # main training loop
+    # TODO: Make sure this is jitted... jax.lax.scan
     for update in range(num_updates):
         # rollout
+        # TODO: I think filter jit will give you a weird behavior.
+        # In fact, you want state to be traced and not static, 
+        # but it is considered static at the moment as it is not a pytree.
+        # Better to use plain jit and rather have an error...
         transitions, state, key = batched_rollout(
             agent, env, state, key, num_steps, obs_fn
         )
@@ -166,11 +175,13 @@ def train(
         last_values_N   = jax.vmap(agent.critic)(last_next_obs)
 
         #  keep [T,N] until GAE; swap axes to [N,T] for vmapping
+        # TODO: I do not think map is jitted, if really needed jax.lax.map
         rew_NT, val_NT, don_NT = map(
             lambda x: jnp.swapaxes(x, 0, 1),
             (transitions.reward, transitions.value, transitions.done)
         )                                                   # (N, T)
 
+        # TODO: jax.vmap is not jitted automatically
         adv_NT, ret_NT = jax.vmap(compute_gae, in_axes=(0, 0, 0, 0))(
             rew_NT, val_NT, don_NT, last_values_N
         )                                                   # (N, T)
@@ -186,6 +197,7 @@ def train(
         flat_val  = transitions.value.reshape(T * N)
         flat_rew  = transitions.reward.reshape(T * N)
 
+        # TODO: Transition is not pytree. Not traced. should be traced, else becomes static and triggers recompilation.
         flat_trans = Transition(
             obs      = flat_obs,
             action   = flat_act,
@@ -203,10 +215,12 @@ def train(
         #  "old" param view for optax.update
         params = eqx.filter(agent, eqx.is_array)
 
+        # TODO: jax lax scan
         for _ in range(epochs):
             key, subkey = random.split(key)
             perm = random.permutation(subkey, num_samples)
 
+            # TODO: jax lax scan
             for mb in range(num_minibatches):
                 mb_idx = perm[mb*batch_size : (mb+1)*batch_size]
 
@@ -229,7 +243,9 @@ def train(
         # bring state into NumPy for indexing
         state_np = jax.tree_util.tree_map(lambda x: jnp.array(x), state)
         new_states = []
+        # TODO: jax lax scan
         for i in range(N):
+            # TODO: jax lax cond
             if state_np.done[i]:
                 s_i, key = init_env(key, fixed_starts, fixed_pickups, distances)
                 new_states.append(s_i)
@@ -244,6 +260,7 @@ def train(
                 ))
 
         # stack back into JAX arrays
+        # TODO: make a pytree, this is not jitted and may trigger recompilations
         state = TaxiState(
             current_node = jnp.array([s.current_node for s in new_states], dtype=jnp.int64),
             pickup_node  = jnp.array([s.pickup_node  for s in new_states], dtype=jnp.int64),
@@ -253,6 +270,7 @@ def train(
         )
 
         # logging
+        # TODO: if everything done correctly, you should not see this print
         jax.debug.print("Update {}/{}: Mean Reward {}, Mean Return {}, Mean Advantage: {}, Std Advantage: {}", update, num_updates, jnp.mean(flat_rew), jnp.mean(ret), jnp.mean(adv), jnp.std(adv))
 
     return agent

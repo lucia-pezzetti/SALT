@@ -94,7 +94,7 @@ single_state, eval_key = init_env(eval_key, fixed_starts_idx, fixed_pickups_idx,
 # tile fields to form a batch
 def tile(x):
     x = jnp.array(x)
-    return jnp.repeat(x[None], num_envs, axis=0)
+    return jnp.repeat(x[None, ...], num_envs, axis=0)
 
 batched_state = TaxiState(
     current_node=tile(single_state.current_node),
