@@ -27,7 +27,7 @@ apply_congestion_model(G)
 locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G, zone_shp_path=zone_shp)
 
 # Get the LocationID for the Financial District
-zone_name = ["Financial District South"]
+zone_name = ["Financial District South", "Financial District North"] #, "Battery Park", "Seaport", "World Trade Center", "Battery Park City", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "East Village", "Little Italy/NoLiTa", "Two Bridges/Seward Park"]
 gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
 filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_name)]
 loc_ids = filtered_zones["LocationID"].tolist()
@@ -58,7 +58,7 @@ def make_has_path_fn(G, idx_to_node):
 
 # --- Build JAX-ready graph structures ---
 print("Building adjacency and travel time matrices")
-adj_list, travel_times = build_adj_and_time_matrix(G, max_deg = 5, node_to_idx=node_to_idx)
+adj_list, travel_times, neighbor_mask_static = build_adj_and_time_matrix(G, node_to_idx=node_to_idx)
 # map fixed nodes to indices
 fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
 fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
@@ -79,9 +79,8 @@ print("Creating environment")
 env = JAXRideEnv(
     adj_list=adj_list,
     travel_times=travel_times,
+    neighbor_mask_static=neighbor_mask_static,
     distances=distances,
-    max_deg=adj_list.shape[1],
-    num_nodes=N,
     max_steps=82,
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
@@ -89,7 +88,8 @@ env = JAXRideEnv(
 )
 
 # --- Create normalized observation function ---
-obs_fn = make_obs_fn(G, node_to_idx, env.max_steps)
+obs_fn, obs_fn_batch = make_obs_fn(G, node_to_idx, env.max_steps)
+
 
 # --- Initialize batched environment state ---
 num_envs = 16
@@ -97,14 +97,13 @@ key = jax_random.PRNGKey(0)
 # split for agent init vs env init
 eval_key, agent_key = jax_random.split(key)
 # init agent
-dim_obs = 5  # [current_lat, current_lon, pickup_lat, pickup_lon]
-# dim_act = adj_list.shape[1]
+dim_obs = 5  # [current_lat, current_lon, pickup_lat, pickup_lon, timestep]
 # agent = make_agent(agent_key, dim_obs, dim_act)
 
 # init a single env state and update key
 has_path_fn = make_has_path_fn(G, idx_to_node)
 # TODO: the key should be split for each env
-single_state, eval_key = init_env(eval_key, fixed_starts_idx, fixed_pickups_idx, distances)
+single_state, eval_key = init_env(eval_key, fixed_starts_idx, fixed_pickups_idx, neighbor_mask_static)
 
 # shortest distance between pickup and dropoff
 # print(f"Number of steps to pickup: {nx.dijkstra_path_length(G, single_state.current_node, single_state.pickup_node, weight='weight')}")
@@ -117,9 +116,10 @@ def tile(x):
 batched_state = TaxiState(
     current_node=tile(single_state.current_node),
     pickup_node=tile(single_state.pickup_node),
-    ride_phase=tile(single_state.ride_phase),
+    # ride_phase=tile(single_state.ride_phase),
     step_count=tile(single_state.step_count),
-    done=tile(single_state.done)
+    done=tile(single_state.done),
+    neighbor_mask=tile(single_state.neighbor_mask)
 )
 
 print("Start training")
@@ -130,17 +130,27 @@ params = train(
     env=env,
     init_state_fn=lambda: batched_state,
     obs_fn=obs_fn,
+    obs_fn_batch=obs_fn_batch,
     key=eval_key,
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
-    distances=distances,
-    num_steps=128,
-    epochs=4,
-    batch_size=64,
-    lr=3e-4
+    num_steps=256,
+    epochs=1000,
+    batch_size=128,
+    lr=3e-4,
+    gamma=0.99,
+    epsilon_start=0.2,
+    epsilon_end=0.05,
 )
 
 # TODO: pickle dump of the params
+# Save trained parameters
+leaves, treedef = jax.tree_util.tree_flatten(params)
+# Move arrays to CPU for pickling
+leaves = [jax.device_get(x) for x in leaves]
+with open("trained_params.pkl", "wb") as f:
+    pickle.dump((leaves, treedef), f)
+print("Saved trained parameters to trained_params.pkl")
 
 # # --- Save trained agent ---
 # leaves, treedef = eqx.tree_serialise_leaves(
