@@ -12,7 +12,8 @@ import geopandas as gpd
 from jax_ppo_utils import build_adj_and_time_matrix, make_obs_fn
 from jax_taxi_env import JAXRideEnv, init_env, TaxiState
 # from jax_ppo_agent import make_agent
-from jax_trainer import train
+# from jax_trainer import train
+from jax_dqn_trainer import train
 from nn import MLP
 
 from utils import load_graph, apply_congestion_model, compute_zone_mappings
@@ -27,17 +28,25 @@ apply_congestion_model(G)
 locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G, zone_shp_path=zone_shp)
 
 # Get the LocationID for the Financial District
-zone_name = ["Financial District South", "Financial District North"] #, "Battery Park", "Seaport", "World Trade Center", "Battery Park City", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "East Village", "Little Italy/NoLiTa", "Two Bridges/Seward Park"]
+zone_name = ["Financial District South" , "Financial District North", "Battery Park", "Seaport", "World Trade Center", "Battery Park City"] #, "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "East Village", "Little Italy/NoLiTa", "Two Bridges/Seward Park"]
 gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
 filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_name)]
 loc_ids = filtered_zones["LocationID"].tolist()
 # Now extract the node IDs
 selected_nodes = [node for loc_id in loc_ids for node in zone_to_nodes.get(loc_id, [])] 
 G_fds = G.subgraph(selected_nodes).copy()
+
+# remove nodes with only one in- and out-degree
+to_remove = [v for v in G_fds.nodes()
+             if G_fds.in_degree(v) == 1 and G_fds.out_degree(v) == 1]
+G_fds.remove_nodes_from(to_remove)
+
 largest_cc = max(nx.strongly_connected_components(G_fds), key=len)
 G = G_fds.subgraph(largest_cc).copy()
 
+
 all_nodes = list(G.nodes())
+print(f"Number of nodes in the graph: {len(all_nodes)}")
 node_to_idx = {node: idx for idx, node in enumerate(all_nodes)}
 idx_to_node = [node for node, idx in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
@@ -45,6 +54,7 @@ idx_to_node = [node for node, idx in sorted(node_to_idx.items(), key=lambda x: x
 # choose fixed start & pickup nodes
 fixed_starts = jnp.array(np.array(random.sample(all_nodes, 1), dtype=np.int64))
 fixed_pickups = jnp.array(np.array(random.sample(all_nodes, 1), dtype=np.int64))
+
 
 def make_has_path_fn(G, idx_to_node):
     def has_path_fn(s_idx, t_idx):
@@ -84,7 +94,7 @@ env = JAXRideEnv(
     max_steps=82,
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
-    timeout_penalty=-500.0
+    timeout_penalty=-50.0
 )
 
 # --- Create normalized observation function ---
@@ -106,7 +116,8 @@ has_path_fn = make_has_path_fn(G, idx_to_node)
 single_state, eval_key = init_env(eval_key, fixed_starts_idx, fixed_pickups_idx, neighbor_mask_static)
 
 # shortest distance between pickup and dropoff
-# print(f"Number of steps to pickup: {nx.dijkstra_path_length(G, single_state.current_node, single_state.pickup_node, weight='weight')}")
+print(f"Starting node: {single_state.current_node}, pickup_node: {single_state.pickup_node}")
+print(f"Number of steps to pickup: {nx.dijkstra_path_length(G, idx_to_node[single_state.current_node], idx_to_node[single_state.pickup_node], weight='weight')}")
 
 # tile fields to form a batch
 def tile(x):
@@ -137,11 +148,12 @@ params = train(
     num_steps=256,
     epochs=1000,
     batch_size=128,
-    lr=3e-4,
+    lr=1e-4,
     gamma=0.99,
-    epsilon_start=0.2,
-    epsilon_end=0.05,
+    epsilon_start=0.1,
+    epsilon_end=0.01,
 )
+
 
 # TODO: pickle dump of the params
 # Save trained parameters

@@ -114,7 +114,7 @@ def get_batched_rollout_v(
 
             # greedy action over masked Qs
             masked_q = jnp.where(bool_mask, q_values, -1e10)
-            jax.debug.print("masked_q: {}", masked_q)
+            # jax.debug.print("masked_q: {}", masked_q)
             greedy_action = jnp.argmax(masked_q, axis=-1)      # [B]
 
             # random action only among real neighbors
@@ -179,7 +179,7 @@ def train(
     # Initialize value network and optimizer
     model = MLP(dim_hidden=[64, 64])
     params = model.init(key, jnp.zeros((1, dim_obs)))
-    jax.debug.print("Model parameters: ", params)
+    # jax.debug.print("Model parameters: ", params)
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(params)
 

@@ -102,7 +102,7 @@ class JAXRideEnv(eqx.Module):
         # debug.print("done: {}, step: {}, reached pickup: {}, invalid: {}, timeout: {}", done[0], state.step_count[0], reach_pickup[0], invalid[0], timeout[0])
 
         # base reward: penalize time, heavy penalty for invalid
-        base_reward = jnp.where(invalid, -1000.0, -time_cost/60)
+        base_reward = jnp.where(invalid, -100.0, -time_cost/60)
 
         # reward shaping: encourage moving towards pickup
         # using precomputed shortest-path distances
@@ -111,11 +111,11 @@ class JAXRideEnv(eqx.Module):
         shaping = dist_current - dist_next
 
         # bonus for actually reaching the pickup
-        pickup_bonus = jnp.where(reach_pickup, 1000.0, 0.0)
+        pickup_bonus = jnp.where(reach_pickup, 100.0, 0.0)
         # penalty for timeout
         timeout_penalty = jnp.where(timeout, self.timeout_penalty, 0.0)
 
-        reward = base_reward + shaping*10 + pickup_bonus + timeout_penalty
+        reward = shaping + pickup_bonus + timeout_penalty
         # debug.print("reward: {}, base: {}, shaping: {}, pickup_bonus: {}, timeout_penalty: {}", reward[0], base_reward[0], shaping[0], pickup_bonus[0], timeout_penalty[0])
 
         nm = self.neighbor_mask_static[next_node]
@@ -137,6 +137,5 @@ class JAXRideEnv(eqx.Module):
             self.fixed_starts,
             self.fixed_pickups,
             self.neighbor_mask_static,
-            self.distances
         )
         return state, new_key
