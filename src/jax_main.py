@@ -7,18 +7,35 @@ from jax import random as jax_random
 import pickle
 import random
 import equinox as eqx
+import geopandas as gpd
 
 from jax_ppo_utils import build_adj_and_time_matrix, make_obs_fn
 from jax_taxi_env import JAXRideEnv, init_env, TaxiState
-from jax_ppo_agent import make_agent
+# from jax_ppo_agent import make_agent
 from jax_trainer import train
+from nn import MLP
 
-from utils import load_graph, apply_congestion_model
+from utils import load_graph, apply_congestion_model, compute_zone_mappings
 
 # --- Load and preprocess graph ---
 place_name = "Manhattan, New York City, New York, USA"
+zone_shp = "../data/processed/taxi_zones.shp"
 G = load_graph(place_name)
 apply_congestion_model(G)
+
+# ---------- TEMP -----------------
+locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G, zone_shp_path=zone_shp)
+
+# Get the LocationID for the Financial District
+zone_name = ["Financial District South"]
+gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
+filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_name)]
+loc_ids = filtered_zones["LocationID"].tolist()
+# Now extract the node IDs
+selected_nodes = [node for loc_id in loc_ids for node in zone_to_nodes.get(loc_id, [])] 
+G_fds = G.subgraph(selected_nodes).copy()
+largest_cc = max(nx.strongly_connected_components(G_fds), key=len)
+G = G_fds.subgraph(largest_cc).copy()
 
 all_nodes = list(G.nodes())
 node_to_idx = {node: idx for idx, node in enumerate(all_nodes)}
@@ -80,12 +97,13 @@ key = jax_random.PRNGKey(0)
 # split for agent init vs env init
 eval_key, agent_key = jax_random.split(key)
 # init agent
-dim_obs = 7  # [current_lat, current_lon, pickup_lat, pickup_lon]
-dim_act = adj_list.shape[1]
-agent = make_agent(agent_key, dim_obs, dim_act)
+dim_obs = 5  # [current_lat, current_lon, pickup_lat, pickup_lon]
+# dim_act = adj_list.shape[1]
+# agent = make_agent(agent_key, dim_obs, dim_act)
 
 # init a single env state and update key
 has_path_fn = make_has_path_fn(G, idx_to_node)
+# TODO: the key should be split for each env
 single_state, eval_key = init_env(eval_key, fixed_starts_idx, fixed_pickups_idx, distances)
 
 # shortest distance between pickup and dropoff
@@ -107,8 +125,8 @@ batched_state = TaxiState(
 print("Start training")
 
 # --- Training ---
-trained_agent = train(
-    agent=agent,
+params = train(
+    dim_obs=dim_obs,
     env=env,
     init_state_fn=lambda: batched_state,
     obs_fn=obs_fn,
@@ -122,15 +140,17 @@ trained_agent = train(
     lr=3e-4
 )
 
-# --- Save trained agent ---
-leaves, treedef = eqx.tree_serialise_leaves(
-    pytree=trained_agent,
-    is_leaf=eqx.is_array
-)
-with open("test.eqx", "wb") as f:
-    # dump both parts so you can reconstruct later
-    pickle.dump((leaves, treedef), f)
+# TODO: pickle dump of the params
 
-with open("test.eqx", "wb") as f:
-    serialized = eqx.tree_serialise_leaves(trained_agent, is_leaf=eqx.is_array)
-    pickle.dump(serialized, f)
+# # --- Save trained agent ---
+# leaves, treedef = eqx.tree_serialise_leaves(
+#     pytree=trained_agent,
+#     is_leaf=eqx.is_array
+# )
+# with open("test.eqx", "wb") as f:
+#     # dump both parts so you can reconstruct later
+#     pickle.dump((leaves, treedef), f)
+
+# with open("test.eqx", "wb") as f:
+#     serialized = eqx.tree_serialise_leaves(trained_agent, is_leaf=eqx.is_array)
+#     pickle.dump(serialized, f)

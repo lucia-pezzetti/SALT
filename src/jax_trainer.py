@@ -3,44 +3,48 @@ import jax.numpy as jnp
 from jax import random
 import equinox as eqx
 import optax
+from functools import partial
 from jax_taxi_env import init_env, TaxiState
-from jax_ppo_agent import Transition, sample_action, ppo_loss
+# from jax_ppo_agent import Transition, sample_action, ppo_loss
+from nn import MLP
 
 # helper functions
 
-def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
-    """
-    Compute Generalized Advantage Estimation (GAE) and returns.
-    Args:
-        rewards: Array of rewards.
-        values: Array of value estimates.
-        dones: Array of done flags.
-        last_value: Value estimate for the last state.
-        gamma: Discount factor.
-        lam: GAE parameter.
-    Returns:
-        adv: Array of advantages.
-        returns: Array of returns.
-    """
+# @partial(jax.jit, static_argnames=["gamma", "lam"])
+# def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
+#     """
+#     Compute Generalized Advantage Estimation (GAE) and returns.
+#     Args:
+#         rewards: Array of rewards.
+#         values: Array of value estimates.
+#         dones: Array of done flags.
+#         last_value: Value estimate for the last state.
+#         gamma: Discount factor.
+#         lam: GAE parameter.
+#     Returns:
+#         adv: Array of advantages.
+#         returns: Array of returns.
+#     """
 
-    adv = jnp.zeros_like(rewards)
-    gae = 0.0
-    next_value = last_value
+#     def gae_step(carry, t):
+#         gae, next_value = carry
+#         mask = 1.0 - dones[t]
+#         delta = rewards[t] + gamma * next_value * mask - values[t]
+#         gae = delta + gamma * lam * mask * gae
+#         adv_t = gae
+#         return (gae, values[t]), adv_t
 
-    # TODO: use jax.lax.scan + fixed length loop.
-    # len(rewards) is not jittable, but you know the length at compile time
-    for t in reversed(range(len(rewards))):
-        mask = 1.0 - dones[t]
-        delta = rewards[t] + gamma * next_value * mask - values[t]
-        gae = delta + gamma * lam * mask * gae
-        adv = adv.at[t].set(gae)
-        next_value = values[t]
-    returns = adv + values
+#     _, adv = jax.lax.scan(
+#         gae_step,
+#         (last_value, 0.0),
+#         jnp.arange(len(rewards)),
+#         reverse=True
+#     )
 
-    # advantage normalization
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-    return adv, returns
+#     returns = adv + values
+#     # Normalize advantages
+#     adv = (adv - jnp.mean(adv)) / (jnp.std(adv) + 1e-8)
+#     return adv, returns
 
 @jax.jit
 def maybe_reset(state: TaxiState,
@@ -78,58 +82,75 @@ def maybe_reset(state: TaxiState,
         step_count   = choose(state.step_count,   reset_states.step_count),
     ), new_key
 
+def get_batched_rollout(model, adj, env, obs_fn, num_steps):
+    def batched_rollout(params, state: TaxiState, key):
+        """
+        Runs `num_steps` in parallel across `num_envs` envs,
+        returns raw final state (no in-scan resets).
+        """
+        def step_fn(carry, _):
+            state, key = carry
 
+            # sample actions
+            key, subkey = random.split(key)
+            obs = obs_fn(state)
+            keys = random.split(subkey, state.current_node.shape[0])
 
-@eqx.filter_jit
-def batched_rollout(agent, env, state: TaxiState, key, num_steps, obs_fn):
-    """
-    Runs `num_steps` in parallel across `num_envs` envs,
-    returns raw final state (no in-scan resets).
-    """
-    def step_fn(carry, _):
-        state, key = carry
+            # TODO:
+            # 1. evaluate value function at all out edges
+            # 2. Bellman
+            # 3. sample eps greedy
+            # TODO: get next lat,lon
+            neighbors = adj[state.current_node]
+            # TODO: actually, the stack should be of current lat, lon
+            obs = jnp.stack([
+                jnp.tile(state.current_node, (neighbors.shape[1], 1)),
+                neighbors
+                # TODO: we can also stack the current time
+            ], axis=1)
 
-        # sample actions
-        key, subkey = random.split(key)
-        obs = obs_fn(state)
-        keys = random.split(subkey, state.current_node.shape[0])
-        actions, logps, values = jax.vmap(sample_action, in_axes=(None, 0, 0))(
-            agent, obs, keys
+            # sample values
+            values = jax.vmap(lambda x : model.apply(params, x, key=subkey))(obs)
+
+            # TODO: sample actions epsilon greedy
+            # jax.random.uniform(subkey, )
+
+            arg_max = jnp.argmax(values, axis=0)
+
+            # step env
+            # TODO: step is not jitted correctly I believe
+            next_state, rewards = env.step(state, arg_max)
+            dones = next_state.done
+
+            # record transition
+            trans = Transition(
+                obs=obs,
+                action=actions,
+                reward=rewards,
+                next_obs=obs_fn(next_state),
+                done=dones,
+                log_prob=logps,
+                value=values
+            )
+
+            # Reset done envs immediately
+            # TODO: I think this is triggering recompilations, state may be considered static
+            next_state, key = maybe_reset(next_state, key, env.fixed_starts, env.fixed_pickups, env.distances)
+
+            return (next_state, key), trans
+
+        (final_state, final_key), transitions = jax.lax.scan(
+            step_fn,
+            (state, key),
+            xs=None,
+            length=num_steps
         )
-
-        # step env
-        # TODO: step is not jitted correctly I believe
-        next_state, rewards = env.step(state, actions)
-        dones = next_state.done
-
-        # record transition
-        trans = Transition(
-            obs=obs,
-            action=actions,
-            reward=rewards,
-            next_obs=obs_fn(next_state),
-            done=dones,
-            log_prob=logps,
-            value=values
-        )
-
-        # Reset done envs immediately
-        # TODO: I think this is triggering recompilations, state may be considered static
-        next_state, key = maybe_reset(next_state, key, env.fixed_starts, env.fixed_pickups, env.distances)
-
-        return (next_state, key), trans
-
-    (final_state, final_key), transitions = jax.lax.scan(
-        step_fn,
-        (state, key),
-        xs=None,
-        length=num_steps
-    )
-    return transitions, final_state, final_key
+        return transitions, final_state, final_key
+    return batched_rollout
 
 
 def train(
-    agent,
+    dim_obs,
     env,
     init_state_fn,
     obs_fn,
@@ -148,25 +169,48 @@ def train(
     PPO training loop. After each rollout, any sub-env whose `done`==True
     is re-initialized by calling init_env (in plain Python).
     """
+    # Define the model
+    dim_hidden = [64, 64]  # Example hidden layer dimensions
+    model = MLP(dim_hidden=dim_hidden)
+
+    # Initialize the model
+    # TODO: shape of keys?
+    keys = jax.random.split(key, N)
+    input_shape = (1, dim_obs)
+    params = model.init(key, jnp.ones(input_shape))
+
     # optimizer setup
-    params = eqx.filter(agent, eqx.is_array)
-    optimizer = optax.adam(lr)
-    opt_state = optimizer.init(params)
+    tx = optax.adam(learning_rate=lr)
+    opt_state = tx.init(params)
 
     # initialize batch of states
-    state = init_state_fn()
+    states = init_state_fn()
+    # TODO: jit but the agent needs to be passed
+    batched_rollout = get_batched_rollout(model, env, obs_fn, num_steps)
 
     # main training loop
     # TODO: Make sure this is jitted... jax.lax.scan
     for update in range(num_updates):
-        # rollout
-        # TODO: I think filter jit will give you a weird behavior.
-        # In fact, you want state to be traced and not static, 
-        # but it is considered static at the moment as it is not a pytree.
-        # Better to use plain jit and rather have an error...
-        transitions, state, key = batched_rollout(
-            agent, env, state, key, num_steps, obs_fn
-        )
+
+        # Option 1
+        def loss_fn(p):
+            transitions, state, key = jax.vmap(
+                lambda s, k: batched_rollout(p, s, k))(states, keys)
+            # TODO: Compute loss as per value iteration (bellman error) or TD(0) maybe easier to start
+            return loss
+        
+        # Option 2: batched_rollout outside loss
+        # Define loss for each minibatch
+        def get_loss_fn(minibatch):
+            def loss_fn(p):
+                # TODO: Compute loss as per minibatch
+                return loss
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, new_opt_state = tx.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        print("Loss: ", loss)
+
 
         T, N = transitions.obs.shape[:2]
 
@@ -181,14 +225,12 @@ def train(
             (transitions.reward, transitions.value, transitions.done)
         )                                                   # (N, T)
 
-        # TODO: jax.vmap is not jitted automatically
-        adv_NT, ret_NT = jax.vmap(compute_gae, in_axes=(0, 0, 0, 0))(
+        adv, ret = jax.vmap(compute_gae, in_axes=(0, 0, 0, 0))(
             rew_NT, val_NT, don_NT, last_values_N
         )                                                   # (N, T)
-
-        # back to [T,N] then flatten to [T*N]
-        adv = jnp.swapaxes(adv_NT, 0, 1).reshape(-1)
-        ret = jnp.swapaxes(ret_NT, 0, 1).reshape(-1)
+        
+        adv = jnp.swapaxes(adv, 0, 1).reshape(T * N)  # (T*N,)
+        ret = jnp.swapaxes(ret, 0, 1).reshape(T * N)    # (T*N,)
 
         # flatten other tensors
         flat_obs  = transitions.obs.reshape(T * N, -1)
@@ -215,7 +257,7 @@ def train(
         #  "old" param view for optax.update
         params = eqx.filter(agent, eqx.is_array)
 
-        # TODO: jax lax scan
+        # TODO: jax lax foriloop
         for _ in range(epochs):
             key, subkey = random.split(key)
             perm = random.permutation(subkey, num_samples)
