@@ -28,21 +28,21 @@ apply_congestion_model(G)
 locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G, zone_shp_path=zone_shp)
 
 # Get the LocationID for the Financial District
-zone_name = ["Financial District South" , "Financial District North", "Battery Park", "Seaport", "World Trade Center", "Battery Park City"] #, "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "East Village", "Little Italy/NoLiTa", "Two Bridges/Seward Park"]
+zone_name = ["Financial District South" , "Financial District North", "Battery Park", "Seaport", "World Trade Center", "Battery Park City", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "East Village", "Little Italy/NoLiTa", "Two Bridges/Seward Park"]
 gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
 filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_name)]
 loc_ids = filtered_zones["LocationID"].tolist()
 # Now extract the node IDs
 selected_nodes = [node for loc_id in loc_ids for node in zone_to_nodes.get(loc_id, [])] 
-G_fds = G.subgraph(selected_nodes).copy()
+G = G.subgraph(selected_nodes).copy()
 
 # remove nodes with only one in- and out-degree
-to_remove = [v for v in G_fds.nodes()
-             if G_fds.in_degree(v) == 1 and G_fds.out_degree(v) == 1]
-G_fds.remove_nodes_from(to_remove)
+to_remove = [v for v in G.nodes()
+             if G.in_degree(v) == 1 and G.out_degree(v) == 1]
+G.remove_nodes_from(to_remove)
 
-largest_cc = max(nx.strongly_connected_components(G_fds), key=len)
-G = G_fds.subgraph(largest_cc).copy()
+largest_cc = max(nx.strongly_connected_components(G), key=len)
+G = G.subgraph(largest_cc).copy()
 
 
 all_nodes = list(G.nodes())
@@ -52,8 +52,8 @@ idx_to_node = [node for node, idx in sorted(node_to_idx.items(), key=lambda x: x
 
 
 # choose fixed start & pickup nodes
-fixed_starts = jnp.array(np.array(random.sample(all_nodes, 1), dtype=np.int64))
-fixed_pickups = jnp.array(np.array(random.sample(all_nodes, 1), dtype=np.int64))
+fixed_starts = jnp.array(np.array(random.sample(all_nodes, 12), dtype=np.int64))
+fixed_pickups = jnp.array(np.array(random.sample(all_nodes, 12), dtype=np.int64))
 
 
 def make_has_path_fn(G, idx_to_node):
@@ -94,7 +94,7 @@ env = JAXRideEnv(
     max_steps=82,
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
-    timeout_penalty=-50.0
+    timeout_penalty=-5.0
 )
 
 # --- Create normalized observation function ---
@@ -113,28 +113,33 @@ dim_obs = 5  # [current_lat, current_lon, pickup_lat, pickup_lon, timestep]
 # init a single env state and update key
 has_path_fn = make_has_path_fn(G, idx_to_node)
 # TODO: the key should be split for each env
-single_state, eval_key = init_env(eval_key, fixed_starts_idx, fixed_pickups_idx, neighbor_mask_static)
-
-# shortest distance between pickup and dropoff
-print(f"Starting node: {single_state.current_node}, pickup_node: {single_state.pickup_node}")
-print(f"Number of steps to pickup: {nx.dijkstra_path_length(G, idx_to_node[single_state.current_node], idx_to_node[single_state.pickup_node], weight='weight')}")
-
-# tile fields to form a batch
-def tile(x):
-    x = jnp.array(x)
-    return jnp.repeat(x[None, ...], num_envs, axis=0)
-
-batched_state = TaxiState(
-    current_node=tile(single_state.current_node),
-    pickup_node=tile(single_state.pickup_node),
-    # ride_phase=tile(single_state.ride_phase),
-    step_count=tile(single_state.step_count),
-    done=tile(single_state.done),
-    neighbor_mask=tile(single_state.neighbor_mask)
+keys = jax_random.split(eval_key, num_envs)
+batched_states, eval_keys = jax.vmap(init_env, in_axes=(0, None, None, None))(
+    keys, jnp.array(fixed_starts_idx), jnp.array(fixed_pickups_idx), neighbor_mask_static
 )
 
-print("Start training")
+# Use batched_states directly to construct batched_state
+batched_state = TaxiState(
+    current_node=batched_states.current_node,
+    pickup_node=batched_states.pickup_node,
+    # ride_phase=batched_states.ride_phase,  # Uncomment if ride_phase is needed
+    step_count=batched_states.step_count,
+    done=batched_states.done,
+    neighbor_mask=batched_states.neighbor_mask
+)
 
+# Split the eval_key into two separate keys
+# key1, key2 = jax_random.split(eval_key)
+
+# Use key1 for init_state_fn
+# def init_state_fn():
+#     keys = jax_random.split(key1, num_envs)
+#     batched_states, _ = jax.vmap(init_env, in_axes=(0, None, None, None))(
+#         keys, jnp.array(fixed_starts_idx), jnp.array(fixed_pickups_idx), neighbor_mask_static
+#     )
+#     return batched_states
+
+print("Start training")
 # --- Training ---
 params = train(
     dim_obs=dim_obs,
@@ -146,11 +151,11 @@ params = train(
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
     num_steps=256,
-    epochs=1000,
+    epochs=100_000,
     batch_size=128,
     lr=1e-4,
     gamma=0.99,
-    epsilon_start=0.1,
+    epsilon_start=0.3,
     epsilon_end=0.01,
 )
 

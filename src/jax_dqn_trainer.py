@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from jax import random
 import optax
+from functools import partial
 from nn import MLP
 from jax_taxi_env import TaxiState, init_env
 from flax import linen as nn
@@ -34,7 +35,7 @@ class Batch(NamedTuple):
 
 
 
-@jax.jit
+# @jax.jit
 def maybe_reset(state: TaxiState, key: jnp.ndarray, fixed_starts, fixed_pickups, neighbor_mask_static):
     batch_size = state.done.shape[0]
     keys = random.split(key, batch_size + 1)
@@ -71,7 +72,6 @@ def get_batched_rollout_q(
     *,
     num_steps: int = 128,
 ):
-    @jax.jit
     def batched_rollout_q(
         env,
         init_states: TaxiState,
@@ -112,11 +112,11 @@ def get_batched_rollout_q(
 
             return next_state, (state, action, reward, next_state, done, reach_pickup)
 
-        _, traj = jax.lax.scan(step_fn, init_states, keys)
+        final_state, traj = jax.lax.scan(step_fn, init_states, keys)
         states, actions, rewards, next_states, dones, pickups = traj
-        return Batch(states, actions, rewards, next_states, dones, pickups)
+        return Batch(states, actions, rewards, next_states, dones, pickups), final_state
 
-    return batched_rollout_q
+    return jax.jit(batched_rollout_q)
 
 
 def train(
@@ -138,8 +138,11 @@ def train(
 ):
     # --- Q-network outputs one Q per action ---
     action_dim = env.neighbor_mask_static.shape[-1]
-    model = QNetwork(dim_hidden=[64,64], num_actions=action_dim)
+    model = QNetwork(dim_hidden=[128,128], num_actions=action_dim)
     params = model.init(key, jnp.zeros((1, dim_obs)))
+    # target network
+    target_params = params
+
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(params)
 
@@ -147,24 +150,40 @@ def train(
     pickup_count = 0
     done_count = 0
 
-    # Q-loss: only for taken action
-    @jax.jit
-    def q_loss(params, obs_batch: jnp.ndarray, actions: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
-        q = model.apply(params, obs_batch)             # [N, action_dim]
-        q_taken = jnp.take_along_axis(q, actions[:, None], axis=-1).squeeze(-1)
-        return jnp.mean((q_taken - targets) ** 2)
-
     rollout = get_batched_rollout_q(
         model, obs_fn_batch, 
         fixed_starts, fixed_pickups, 
         env.neighbor_mask_static, num_steps=num_steps
     )
 
+    @partial(jax.jit, static_argnums=(8,))
+    def train_step(params, target_params, opt_state, obs_flat, acts_flat, rews_flat, next_obs_flat, dones_flat, gamma: float):
+        # compute Q and target on full batch
+        def loss_fn(p):
+            q = model.apply(p, obs_flat)
+            q_taken = jnp.take_along_axis(q, acts_flat[:, None], -1).squeeze(-1)
+            # compute next Q using frozen target network
+            qn = model.apply(target_params, next_obs_flat)
+            max_q_next = jnp.max(qn, axis=-1)
+            td = rews_flat + gamma * max_q_next * (1.0 - dones_flat)
+            td_target = jax.lax.stop_gradient(td)
+            return jnp.mean((q_taken - td_target)**2)
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, new_opt_state = optimizer.update(grads, opt_state)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss
+
+    states = init_state_fn()
     for epoch in range(1, epochs + 1):
         epsilon = epsilon_start + (epsilon_end - epsilon_start) * (epoch / epochs)
-        states = init_state_fn()
         key, subkey = random.split(key)
-        batch = rollout(env, states, subkey, params, epsilon)
+        batch, states = rollout(env, states, subkey, params, epsilon)
+        states_seq, acts_seq, rews_seq, next_states_seq, dones_seq, _ = batch
+
+        # compute observations outside jit
+        obs_seq = jax.vmap(obs_fn_batch)(states_seq)       # (T, B, dim_obs)
+        next_obs_seq = jax.vmap(obs_fn_batch)(next_states_seq)
 
         # Count pickups
         per_env_picked  = jnp.any(batch.pickups,  axis=0)
@@ -177,34 +196,33 @@ def train(
         pickup_rate = 100.0 * pickup_count / done_count
         epoch_rate = n_picked / n_done
 
-        # Compute targets: r + gamma * max_a' Q(next_state, a') * (1 - done)
-        def max_q_next(ns):
-            obs = obs_fn(ns)
-            qn = model.apply(params, obs)
-            return jnp.max(qn, axis=-1)
-
-        q_next = jax.vmap(max_q_next, in_axes=0)(batch.next_state)  # [T, B]
-        targets = batch.reward + gamma * q_next * (1 - batch.done)
 
         # flatten trajectories and get obs
-        T, B = targets.shape
-        obs_seq = jax.vmap(obs_fn_batch, in_axes=0)(batch.state)   # [T, B, dim_obs]
+        T, B = acts_seq.shape
         obs_flat = obs_seq.reshape((T * B, dim_obs))
-        actions_flat = batch.action.reshape(-1)
-        targets_flat = targets.reshape(-1)
+        acts_flat = acts_seq.reshape((T * B,))
+        rews_flat = rews_seq.reshape((T * B,))
+        next_obs_flat = next_obs_seq.reshape((T * B, dim_obs))
+        dones_flat = dones_seq.reshape((T * B,))
 
         # Shuffle and minibatch update
         idx = random.permutation(key, T * B)
         for i in range(0, T * B, batch_size):
             mb = idx[i : i + batch_size]
-            mb_obs = jax.tree_util.tree_map(lambda x: x[mb], obs_flat)
-            mb_act = actions_flat[mb]
-            mb_tgt = targets_flat[mb]
-            loss, grads = jax.value_and_grad(q_loss)(params, mb_obs, mb_act, mb_tgt)
-            updates, opt_state = optimizer.update(grads, opt_state)
-            params = optax.apply_updates(params, updates)
+            mb_obs = obs_flat[mb]
+            mb_act = acts_flat[mb]
+            mb_rew = rews_flat[mb]
+            mb_next_obs = next_obs_flat[mb]
+            mb_done = dones_flat[mb]
+
+            params, opt_state, loss = train_step(
+                params, target_params, opt_state,
+                mb_obs, mb_act, mb_rew, mb_next_obs, mb_done,
+                gamma
+            )
 
         print(f"Epoch {epoch}/{epochs} - Q Loss: {loss:.4f} - Pickup Rate: {pickup_rate:.2f}% - Epoch Rate: {epoch_rate:.2f}")
+        # print(f"Model params: {jax.tree_util.tree_flatten(params)[0]}")
 
     with open("trained_q_params.pkl", "wb") as f:
         pickle.dump(params, f)
