@@ -35,8 +35,6 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
         # Neighbor mask: 1 for real neighbors, 0 for padded
         neighbor_mask[i, :n_neighbors] = 1.0
 
-    # print(f"adj matrix: {adj}, neighbor mask: {neighbor_mask}")
-
     return jnp.array(adj), jnp.array(times), jnp.array(neighbor_mask)
 
 

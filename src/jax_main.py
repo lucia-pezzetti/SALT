@@ -113,9 +113,18 @@ dim_obs = 5  # [current_lat, current_lon, pickup_lat, pickup_lon, timestep]
 # init a single env state and update key
 has_path_fn = make_has_path_fn(G, idx_to_node)
 # TODO: the key should be split for each env
+@jax.jit
+def init_env_batch(keys, fixed_starts, fixed_pickups, neighbor_mask_static):
+    return jax.vmap(init_env, in_axes=(0, None, None, None))(
+        keys, fixed_starts, fixed_pickups, neighbor_mask_static
+    )
+
 keys = jax_random.split(eval_key, num_envs)
-batched_states, eval_keys = jax.vmap(init_env, in_axes=(0, None, None, None))(
-    keys, jnp.array(fixed_starts_idx), jnp.array(fixed_pickups_idx), neighbor_mask_static
+batched_states, eval_keys = init_env_batch(
+    keys,
+    jnp.array(fixed_starts_idx),
+    jnp.array(fixed_pickups_idx),
+    neighbor_mask_static
 )
 
 # Use batched_states directly to construct batched_state
@@ -151,7 +160,7 @@ params = train(
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
     num_steps=256,
-    epochs=100_000,
+    epochs=1_000,
     batch_size=128,
     lr=1e-4,
     gamma=0.99,

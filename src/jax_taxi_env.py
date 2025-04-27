@@ -15,7 +15,7 @@ class TaxiState(NamedTuple):
     step_count: int = 0
     neighbor_mask: jnp.ndarray = None  # [batch, max_degree]
 
-# @jax.jit
+@jax.jit
 def init_env(rng_key,
              fixed_starts: Sequence[int],
              fixed_pickups: Sequence[int],
@@ -80,7 +80,7 @@ class JAXRideEnv(eqx.Module):
         self.fixed_pickups = fixed_pickups
         self.timeout_penalty = timeout_penalty
 
-    # @jax.jit
+    @jax.jit
     def step(self, state: TaxiState, action: int) -> tuple[TaxiState, float]:
         current = state.current_node
         next_node = self.adj_list[current, action].astype(state.current_node.dtype)
@@ -130,6 +130,7 @@ class JAXRideEnv(eqx.Module):
         )
         return new_state, reward, reach_pickup
 
+    @jax.jit
     def reset(self, rng_key) -> Tuple[TaxiState, jnp.ndarray]:
         # Reset environment and sample initial state with mask
         state, new_key = init_env(

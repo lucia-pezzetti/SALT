@@ -35,7 +35,7 @@ class Batch(NamedTuple):
 
 
 
-# @jax.jit
+@jax.jit
 def maybe_reset(state: TaxiState, key: jnp.ndarray, fixed_starts, fixed_pickups, neighbor_mask_static):
     batch_size = state.done.shape[0]
     keys = random.split(key, batch_size + 1)
@@ -72,6 +72,7 @@ def get_batched_rollout_q(
     *,
     num_steps: int = 128,
 ):
+    @jax.jit
     def batched_rollout_q(
         env,
         init_states: TaxiState,
@@ -116,7 +117,7 @@ def get_batched_rollout_q(
         states, actions, rewards, next_states, dones, pickups = traj
         return Batch(states, actions, rewards, next_states, dones, pickups), final_state
 
-    return jax.jit(batched_rollout_q)
+    return batched_rollout_q
 
 
 def train(
