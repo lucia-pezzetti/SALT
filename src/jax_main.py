@@ -52,8 +52,22 @@ idx_to_node = [node for node, idx in sorted(node_to_idx.items(), key=lambda x: x
 
 
 # choose fixed start & pickup nodes
-fixed_starts = jnp.array(np.array(random.sample(all_nodes, 12), dtype=np.int64))
-fixed_pickups = jnp.array(np.array(random.sample(all_nodes, 12), dtype=np.int64))
+fixed_starts = []
+fixed_pickups = []
+
+nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
+colored_nodes = nodes_gdf.dropna(subset=['zone'])
+
+# Fix a node for every zone
+for loc_id, nodes in zone_to_nodes.items():
+    if nodes:
+        # Use the first node in the list for each zone
+        fixed_starts.append(nodes[0])
+        fixed_pickups.append(nodes[0])
+
+# Convert to JAX arrays
+fixed_starts = jnp.array(np.array(all_nodes, dtype=np.int64))
+fixed_pickups = jnp.array(np.array(all_nodes, dtype=np.int64))
 
 
 def make_has_path_fn(G, idx_to_node):
@@ -73,6 +87,8 @@ adj_list, travel_times, neighbor_mask_static = build_adj_and_time_matrix(G, node
 fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
 fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
 
+print(fixed_starts_idx)
+
 # --- Precompute shortest-path distance matrix for reward shaping ---
 print("Precomputing shortest-path distance matrix")
 N = adj_list.shape[0]
@@ -84,6 +100,8 @@ for u, lengths in nx.all_pairs_dijkstra_path_length(G, weight="weight"):
         dist_mat[ui, vi] = d
 distances = jnp.array(dist_mat)
 
+print("example distances", distances[0, 1:10])
+
 # --- Create environment ---
 print("Creating environment")
 env = JAXRideEnv(
@@ -91,7 +109,7 @@ env = JAXRideEnv(
     travel_times=travel_times,
     neighbor_mask_static=neighbor_mask_static,
     distances=distances,
-    max_steps=82,
+    max_steps=128,
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
     timeout_penalty=-5.0
@@ -148,6 +166,10 @@ batched_state = TaxiState(
 #     )
 #     return batched_states
 
+# Upload pretrained parameters 
+# with open("pretrained_q_params_pretrain2_negtime.pkl", "rb") as f:
+#     pretrained_params = pickle.load(f)
+
 print("Start training")
 # --- Training ---
 params = train(
@@ -159,8 +181,9 @@ params = train(
     key=eval_key,
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
+    # init_q_params=pretrained_params,
     num_steps=256,
-    epochs=1_000,
+    epochs=100_000,
     batch_size=128,
     lr=1e-4,
     gamma=0.99,
@@ -174,7 +197,7 @@ params = train(
 leaves, treedef = jax.tree_util.tree_flatten(params)
 # Move arrays to CPU for pickling
 leaves = [jax.device_get(x) for x in leaves]
-with open("trained_params.pkl", "wb") as f:
+with open("trained_params_all.pkl", "wb") as f:
     pickle.dump((leaves, treedef), f)
 print("Saved trained parameters to trained_params.pkl")
 

@@ -1,6 +1,6 @@
 import pickle
 from typing import NamedTuple, Callable, Sequence
-
+import time
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -129,6 +129,7 @@ def train(
     key: jnp.ndarray,
     fixed_starts,
     fixed_pickups,
+    init_q_params=None,
     num_steps: int = 128,
     epochs: int = 4,
     batch_size: int = 64,
@@ -139,8 +140,14 @@ def train(
 ):
     # --- Q-network outputs one Q per action ---
     action_dim = env.neighbor_mask_static.shape[-1]
-    model = QNetwork(dim_hidden=[128,128], num_actions=action_dim)
-    params = model.init(key, jnp.zeros((1, dim_obs)))
+    model = QNetwork(dim_hidden=[256,256], num_actions=action_dim)
+    # params = model.init(key, jnp.zeros((1, dim_obs)))
+
+    if init_q_params is not None:
+        params = init_q_params
+    else:
+        params = model.init(key, jnp.zeros((1, dim_obs)))
+        
     # target network
     target_params = params
 
@@ -157,7 +164,7 @@ def train(
         env.neighbor_mask_static, num_steps=num_steps
     )
 
-    @partial(jax.jit, static_argnums=(8,))
+    @partial(jax.jit, static_argnames=("gamma",))
     def train_step(params, target_params, opt_state, obs_flat, acts_flat, rews_flat, next_obs_flat, dones_flat, gamma: float):
         # compute Q and target on full batch
         def loss_fn(p):
@@ -177,6 +184,7 @@ def train(
 
     states = init_state_fn()
     for epoch in range(1, epochs + 1):
+        t0 = time.perf_counter()
         epsilon = epsilon_start + (epsilon_end - epsilon_start) * (epoch / epochs)
         key, subkey = random.split(key)
         batch, states = rollout(env, states, subkey, params, epsilon)
@@ -207,6 +215,38 @@ def train(
         dones_flat = dones_seq.reshape((T * B,))
 
         # Shuffle and minibatch update
+        # idx = random.permutation(key, T * B)
+        # n_mb = (T * B) // batch_size
+        # def mb_body(i, carry):
+        #     params, opt_state, loss = carry
+        #     start = i * batch_size
+
+        #     # grab the batch of indices dynamically
+        #     mb_idx = jax.lax.dynamic_slice(idx,   (start,), (batch_size,))
+
+        #     # gather your minibatch data
+        #     mb_obs      = obs_flat[mb_idx]
+        #     mb_act      = acts_flat[mb_idx]
+        #     mb_rew      = rews_flat[mb_idx]
+        #     mb_next_obs = next_obs_flat[mb_idx]
+        #     mb_done     = dones_flat[mb_idx]
+
+        #     # one gradient step
+        #     new_params, new_opt_state, new_loss = train_step(
+        #         params, target_params, opt_state,
+        #         mb_obs, mb_act, mb_rew, mb_next_obs, mb_done,
+        #         gamma
+        #     )
+        #     return (new_params, new_opt_state, new_loss)
+
+        # (params, opt_state, loss) = jax.lax.fori_loop(
+        #     0,               # start
+        #     n_mb,            # stop
+        #     mb_body,         # body(i, carry) → new carry
+        #     (params, opt_state, 0.0)  # initial carry: (params, opt_state, dummy loss)
+        # )
+
+        # Shuffle and minibatch update
         idx = random.permutation(key, T * B)
         for i in range(0, T * B, batch_size):
             mb = idx[i : i + batch_size]
@@ -222,6 +262,17 @@ def train(
                 gamma
             )
 
+        jax.tree_util.tree_map(lambda x: x.block_until_ready(), params)
+        dt = time.perf_counter() - t0
+        env_steps = num_steps * 16
+        # print(f"Epoch {epoch}: {env_steps/dt*60:,.0f} steps/min")
+        avg_reward = jnp.mean(rews_flat)
+        min_reward = jnp.min(rews_flat)
+        max_reward = jnp.max(rews_flat)
+        avg_q_value = jnp.mean(model.apply(params, obs_flat))
+        min_q_value = jnp.min(model.apply(params, obs_flat))
+        max_q_value = jnp.max(model.apply(params, obs_flat))
+        print(f"Average Reward: {avg_reward:.4f} - Max Reward {max_reward:.4f} - Min Reward {min_reward:.4f} - Average Q Value: {avg_q_value:.4f} - Max Q Value: {max_q_value:.4f} - Min Q Value: {min_q_value:.4f}")
         print(f"Epoch {epoch}/{epochs} - Q Loss: {loss:.4f} - Pickup Rate: {pickup_rate:.2f}% - Epoch Rate: {epoch_rate:.2f}")
         # print(f"Model params: {jax.tree_util.tree_flatten(params)[0]}")
 
