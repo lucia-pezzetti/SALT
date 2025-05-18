@@ -63,7 +63,7 @@ def load_taxi_data(rides_path: str,
 
 
 def compute_zone_mappings(G_scc: nx.DiGraph,
-                          zone_shp_path: str) -> (dict, dict, gpd.GeoDataFrame):
+                          zone_shp_path: str):
     """
     Build mappings from LocationID → list of node IDs and node → zone.
     Also returns the nodes GeoDataFrame (with 'zone' column).
@@ -130,7 +130,7 @@ def apply_congestion_model(G_scc: nx.DiGraph,
         data['bpr_alpha'] = alpha
 
 
-def compute_distributions(filtered_df: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
+def compute_distributions(filtered_df: pd.DataFrame):
     """
     From filtered taxi DataFrame, compute:
       - pickup_dist: DataFrame P(pickup_node | hour)
