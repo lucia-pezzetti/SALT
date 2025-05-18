@@ -9,6 +9,7 @@ def load_graph(place_name: str, network_type: str = "drive") -> nx.DiGraph:
     """
     Download and preprocess the OSMnx graph for a place, keeping only the
     largest strongly-connected component and adding 'congested_time'.
+    Removes self-loops from the graph.
     """
     # 1) Download & basic routing attributes
     G = ox.graph.graph_from_place(place_name, network_type=network_type)
@@ -23,7 +24,10 @@ def load_graph(place_name: str, network_type: str = "drive") -> nx.DiGraph:
     else:
         G_scc = G.copy()
 
-    # 3) Alias travel_time → congested_time
+    # 3) Remove self-loops
+    G_scc.remove_edges_from(nx.selfloop_edges(G_scc))
+
+    # 4) Alias travel_time → congested_time
     for u, v, k, data in G_scc.edges(keys=True, data=True):
         data['congested_time'] = data.get('travel_time', data.get('length', 0) / 10)
 
@@ -59,7 +63,7 @@ def load_taxi_data(rides_path: str,
 
 
 def compute_zone_mappings(G_scc: nx.DiGraph,
-                          zone_shp_path: str) -> (dict, dict, gpd.GeoDataFrame):
+                          zone_shp_path: str):
     """
     Build mappings from LocationID → list of node IDs and node → zone.
     Also returns the nodes GeoDataFrame (with 'zone' column).
@@ -126,7 +130,7 @@ def apply_congestion_model(G_scc: nx.DiGraph,
         data['bpr_alpha'] = alpha
 
 
-def compute_distributions(filtered_df: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
+def compute_distributions(filtered_df: pd.DataFrame):
     """
     From filtered taxi DataFrame, compute:
       - pickup_dist: DataFrame P(pickup_node | hour)
