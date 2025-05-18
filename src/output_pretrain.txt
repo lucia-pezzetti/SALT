@@ -1,0 +1,187 @@
+Number of nodes: 76
+Building adjacency & time matrices
+Precomputing distance matrix
+Instantiating environment
+Starting DQN training...
+Saved trained Q-network parameters.
+Training complete. Parameters saved to trained_params_test_3zones.pkl
+Evaluating agent policy against SP baseline...
+RL: 0, start: 62, pickup: 31
+Step 1: next node; 20, action 0, travel 2.869584321975708, wait 6.806907653808594
+Step 2: next node; 33, action 0, travel 42.22111892700195, wait 13.284004211425781
+Step 3: next node; 29, action 0, travel 6.422108173370361, wait 7.4133453369140625
+Step 4: next node; 39, action 0, travel 27.242752075195312, wait 0.0
+Step 5: next node; 67, action 1, travel 15.825610160827637, wait 0.0
+Step 6: next node; 65, action 0, travel 9.681575775146484, wait 15.018234252929688
+Step 7: next node; 31, action 0, travel 11.842070579528809, wait 23.322113037109375
+Rl count: 7, total_rl: 181.94942474365234
+SP: 0, start: 62, pickup: 31
+SP Step 1: node; 20, action 0, travel 2.869584321975708, wait 6.806907653808594
+SP Step 2: node; 33, action 0, travel 42.22111892700195, wait 13.284004211425781
+SP Step 3: node; 29, action 0, travel 6.422108173370361, wait 7.4133453369140625
+SP Step 4: node; 39, action 0, travel 27.242752075195312, wait 0.0
+SP Step 5: node; 58, action 0, travel 5.999939441680908, wait 0.0
+SP Step 6: node; 64, action 0, travel 2.231409788131714, wait 0.0
+SP Step 7: node; 67, action 0, travel 7.26556921005249, wait 0.0
+SP Step 8: node; 65, action 0, travel 9.681575775146484, wait 15.346923828125
+SP Step 9: node; 31, action 0, travel 11.842070579528809, wait 23.322113037109375
+SP count: 9, total_sp: 181.94942259788513
+RL: 1, start: 43, pickup: 72
+Step 1: next node; 36, action 0, travel 15.500041961669922, wait 19.303096771240234
+Step 2: next node; 37, action 1, travel 30.509366989135742, wait 0.0
+Step 3: next node; 74, action 0, travel 19.70623207092285, wait 12.066123962402344
+Step 4: next node; 8, action 0, travel 16.979473114013672, wait 29.529983520507812
+Step 5: next node; 35, action 1, travel 19.425947189331055, wait 5.6114501953125
+Step 6: next node; 32, action 3, travel 12.269441604614258, wait 2.807586669921875
+Step 7: next node; 72, action 0, travel 19.27669906616211, wait 0.0
+Rl count: 7, total_rl: 202.98544311523438
+SP: 1, start: 43, pickup: 72
+SP Step 1: node; 36, action 0, travel 15.500041961669922, wait 19.303096771240234
+SP Step 2: node; 34, action 0, travel 14.146133422851562, wait 12.26849365234375
+SP Step 3: node; 9, action 0, travel 14.841212272644043, wait 0.0
+SP Step 4: node; 10, action 0, travel 15.8463716506958, wait 13.262725830078125
+SP Step 5: node; 12, action 0, travel 13.810628890991211, wait 15.266693115234375
+SP Step 6: node; 13, action 0, travel 18.616682052612305, wait 14.227462768554688
+SP Step 7: node; 69, action 0, travel 10.803871154785156, wait 4.637908935546875
+SP count: 7, total_sp: 182.53132343292236
+RL: 2, start: 63, pickup: 68
+Step 1: next node; 28, action 3, travel 42.58243942260742, wait 8.16019058227539
+Step 2: next node; 0, action 0, travel 14.855152130126953, wait 0.0
+Step 3: next node; 66, action 1, travel 18.011816024780273, wait 14.022117614746094
+Step 4: next node; 19, action 1, travel 15.971254348754883, wait 0.0
+Step 5: next node; 26, action 1, travel 15.934478759765625, wait 11.793716430664062
+Step 6: next node; 57, action 1, travel 17.199081420898438, wait 18.720108032226562
+Step 7: next node; 47, action 0, travel 12.704895973205566, wait 0.0
+Step 8: next node; 37, action 0, travel 10.894994735717773, wait 0.0
+Step 9: next node; 27, action 1, travel 8.310805320739746, wait 0.0
+Step 10: next node; 73, action 1, travel 10.872492790222168, wait 10.60888671875
+Step 11: next node; 69, action 0, travel 19.6263370513916, wait 12.262542724609375
+Step 12: next node; 68, action 1, travel 23.057823181152344, wait 0.0
+Rl count: 12, total_rl: 285.5891361236572
+SP: 2, start: 63, pickup: 68
+SP Step 1: node; 38, action 0, travel 11.254319190979004, wait 0.0
+SP Step 2: node; 50, action 0, travel 9.943283081054688, wait 26.807907104492188
+SP Step 3: node; 38, action 0, travel 9.943283081054688, wait 0.0
+SP Step 4: node; 50, action 0, travel 9.943283081054688, wait 0.0
+SP Step 5: node; 38, action 0, travel 9.943283081054688, wait 28.550079345703125
+SP Step 6: node; 50, action 0, travel 9.943283081054688, wait 0.0
+SP Step 7: node; 38, action 0, travel 9.943283081054688, wait 0.0
+SP Step 8: node; 50, action 0, travel 9.943283081054688, wait 0.0
+SP Step 9: node; 38, action 0, travel 9.943283081054688, wait 20.22686767578125
+SP count: 9, total_sp: 166.38543796539307
+RL: 3, start: 59, pickup: 36
+Step 1: next node; 57, action 0, travel 36.73774719238281, wait 0.0
+Step 2: next node; 55, action 1, travel 29.282651901245117, wait 0.0
+Step 3: next node; 43, action 0, travel 12.149547576904297, wait 0.0
+Step 4: next node; 36, action 0, travel 15.500041961669922, wait 0.0
+Rl count: 4, total_rl: 93.66998863220215
+SP: 3, start: 59, pickup: 36
+SP Step 1: node; 57, action 0, travel 36.73774719238281, wait 0.0
+SP Step 2: node; 47, action 0, travel 12.704895973205566, wait 19.024234771728516
+SP Step 3: node; 37, action 0, travel 10.894994735717773, wait 0.0
+SP Step 4: node; 74, action 0, travel 19.70623207092285, wait 0.0
+SP count: 4, total_sp: 99.0681037902832
+RL: 4, start: 62, pickup: 65
+Step 1: next node; 20, action 0, travel 2.869584321975708, wait 6.806907653808594
+Step 2: next node; 33, action 0, travel 42.22111892700195, wait 13.284004211425781
+Step 3: next node; 29, action 0, travel 6.422108173370361, wait 7.4133453369140625
+Step 4: next node; 39, action 0, travel 27.242752075195312, wait 0.0
+Step 5: next node; 67, action 1, travel 15.825610160827637, wait 0.0
+Step 6: next node; 65, action 0, travel 9.681575775146484, wait 15.018234252929688
+Rl count: 6, total_rl: 146.78524017333984
+SP: 4, start: 62, pickup: 65
+SP Step 1: node; 20, action 0, travel 2.869584321975708, wait 6.806907653808594
+SP Step 2: node; 33, action 0, travel 42.22111892700195, wait 13.284004211425781
+SP Step 3: node; 29, action 0, travel 6.422108173370361, wait 7.4133453369140625
+SP Step 4: node; 39, action 0, travel 27.242752075195312, wait 0.0
+SP Step 5: node; 58, action 0, travel 5.999939441680908, wait 0.0
+SP Step 6: node; 64, action 0, travel 2.231409788131714, wait 0.0
+SP Step 7: node; 67, action 0, travel 7.26556921005249, wait 0.0
+SP Step 8: node; 65, action 0, travel 9.681575775146484, wait 15.346923828125
+SP count: 8, total_sp: 146.78523802757263
+RL: 5, start: 63, pickup: 45
+Step 1: next node; 28, action 3, travel 42.58243942260742, wait 8.16019058227539
+Step 2: next node; 21, action 3, travel 4.56395149230957, wait 0.0
+Step 3: next node; 56, action 1, travel 25.238431930541992, wait 11.9200439453125
+Step 4: next node; 61, action 1, travel 12.544748306274414, wait 0.0
+Step 5: next node; 59, action 0, travel 16.995838165283203, wait 0.0
+Step 6: next node; 57, action 0, travel 36.73774719238281, wait 18.5069580078125
+Step 7: next node; 47, action 0, travel 12.704895973205566, wait 0.0
+Step 8: next node; 37, action 0, travel 10.894994735717773, wait 0.0
+Step 9: next node; 74, action 0, travel 19.70623207092285, wait 26.528396606445312
+Step 10: next node; 8, action 0, travel 16.979473114013672, wait 29.529998779296875
+Step 11: next node; 45, action 2, travel 10.919865608215332, wait 0.0
+Rl count: 11, total_rl: 304.5142059326172
+SP: 5, start: 63, pickup: 45
+SP Step 1: node; 38, action 0, travel 11.254319190979004, wait 0.0
+SP Step 2: node; 50, action 0, travel 9.943283081054688, wait 26.807907104492188
+SP Step 3: node; 38, action 0, travel 9.943283081054688, wait 0.0
+SP Step 4: node; 50, action 0, travel 9.943283081054688, wait 0.0
+SP Step 5: node; 38, action 0, travel 9.943283081054688, wait 28.550079345703125
+SP Step 6: node; 50, action 0, travel 9.943283081054688, wait 0.0
+SP Step 7: node; 38, action 0, travel 9.943283081054688, wait 0.0
+SP count: 7, total_sp: 126.27200412750244
+RL: 6, start: 73, pickup: 46
+Step 1: next node; 69, action 0, travel 19.6263370513916, wait 2.90496826171875
+Step 2: next node; 74, action 0, travel 19.481895446777344, wait 5.071662902832031
+Step 3: next node; 8, action 0, travel 16.979473114013672, wait 29.529983520507812
+Step 4: next node; 35, action 1, travel 19.425947189331055, wait 0.0
+Step 5: next node; 46, action 2, travel 6.32790994644165, wait 0.0
+Rl count: 5, total_rl: 119.34817743301392
+SP: 6, start: 73, pickup: 46
+SP Step 1: node; 69, action 0, travel 19.6263370513916, wait 2.90496826171875
+SP Step 2: node; 74, action 0, travel 19.481895446777344, wait 5.071662902832031
+SP Step 3: node; 8, action 0, travel 16.979473114013672, wait 29.529983520507812
+SP Step 4: node; 74, action 0, travel 16.979473114013672, wait 0.0
+SP count: 4, total_sp: 110.57379341125488
+RL: 7, start: 23, pickup: 15
+Step 1: next node; 70, action 0, travel 13.081070899963379, wait 0.0
+Step 2: next node; 71, action 1, travel 14.087761878967285, wait 8.319450378417969
+Step 3: next node; 72, action 1, travel 28.51173973083496, wait 4.7957916259765625
+Step 4: next node; 32, action 2, travel 19.27669906616211, wait 0.0
+Step 5: next node; 35, action 2, travel 12.269441604614258, wait 8.289772033691406
+Step 6: next node; 46, action 2, travel 6.32790994644165, wait 0.0
+Step 7: next node; 15, action 2, travel 13.008580207824707, wait 0.0
+Rl count: 7, total_rl: 127.9682183265686
+SP: 7, start: 23, pickup: 15
+SP Step 1: node; 70, action 0, travel 13.081070899963379, wait 0.0
+SP Step 2: node; 23, action 0, travel 13.081070899963379, wait 0.0
+SP Step 3: node; 70, action 0, travel 13.081070899963379, wait 7.881706237792969
+SP Step 4: node; 23, action 0, travel 13.081070899963379, wait 6.2067413330078125
+SP Step 5: node; 70, action 0, travel 13.081070899963379, wait 27.631118774414062
+SP Step 6: node; 23, action 0, travel 13.081070899963379, wait 6.2067413330078125
+SP Step 7: node; 70, action 0, travel 13.081070899963379, wait 27.631118774414062
+SP count: 7, total_sp: 167.1249179840088
+RL: 8, start: 14, pickup: 70
+Step 1: next node; 15, action 0, travel 16.342315673828125, wait 0.0
+Step 2: next node; 16, action 1, travel 13.891366004943848, wait 0.0
+Step 3: next node; 48, action 2, travel 15.78727912902832, wait 6.679222106933594
+Step 4: next node; 49, action 0, travel 20.221784591674805, wait 0.0
+Step 5: next node; 72, action 1, travel 5.070970058441162, wait 0.0
+Step 6: next node; 71, action 1, travel 28.51173973083496, wait 0.0
+Step 7: next node; 70, action 0, travel 14.087761878967285, wait 0.0
+Rl count: 7, total_rl: 120.5924391746521
+SP: 8, start: 14, pickup: 70
+SP Step 1: node; 15, action 0, travel 16.342315673828125, wait 0.0
+SP Step 2: node; 14, action 0, travel 16.342315673828125, wait 0.0
+SP Step 3: node; 15, action 0, travel 16.342315673828125, wait 0.0
+SP Step 4: node; 14, action 0, travel 16.342315673828125, wait 0.0
+SP Step 5: node; 15, action 0, travel 16.342315673828125, wait 24.654098510742188
+SP Step 6: node; 14, action 0, travel 16.342315673828125, wait 19.555435180664062
+SP Step 7: node; 15, action 0, travel 16.342315673828125, wait 7.7599334716796875
+SP Step 8: node; 14, action 0, travel 16.342315673828125, wait 0.0
+SP count: 8, total_sp: 182.70799255371094
+RL: 9, start: 73, pickup: 14
+Step 1: next node; 12, action 1, travel 11.595562934875488, wait 2.6498336791992188
+Step 2: next node; 13, action 0, travel 18.616682052612305, wait 14.227455139160156
+Step 3: next node; 40, action 1, travel 12.23489761352539, wait 3.1894912719726562
+Step 4: next node; 14, action 0, travel 16.68517303466797, wait 0.0
+Rl count: 4, total_rl: 79.19909763336182
+SP: 9, start: 73, pickup: 14
+SP Step 1: node; 69, action 0, travel 19.6263370513916, wait 2.90496826171875
+SP Step 2: node; 74, action 0, travel 19.481895446777344, wait 5.071662902832031
+SP Step 3: node; 8, action 0, travel 16.979473114013672, wait 29.529983520507812
+SP Step 4: node; 74, action 0, travel 16.979473114013672, wait 0.0
+SP count: 4, total_sp: 110.57379341125488
+RL avg time: 166.26
+SP avg time: 147.40

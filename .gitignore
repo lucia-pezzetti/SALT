@@ -60,3 +60,17 @@ src/cache/
 *.DS_Store
 *.log
 *.tmp
+
+src/models/
+src/plots/
+test/models/
+src/output/
+*.pkl
+
+first_version/
+
+src/simulation.py
+src/simulation_and_dropoff.py
+src/run_jax_taxi.sh
+
+test/
