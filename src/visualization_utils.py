@@ -1,62 +1,99 @@
 import os
-from typing import Sequence
 import matplotlib.pyplot as plt
+from typing import List
 
 class TrainingLogger:
-    """
-    Logger for training metrics: total rewards and wait times per episode.
-    """
     def __init__(self):
-        # Lists to store metrics per episode
-        self.episode_rewards = []  # Total reward per episode
-        self.avg_waits = []        # Average wait time per episode
+        # existing buffers
+        self.episode_rewards: List[float] = []
+        self.episode_waits:    List[List[float]] = []
+        # new metric buffers
+        self.loss_history:     List[float] = []
+        # additional metric buffers for DQN convergence
+        self.update_norm_history:  List[float] = []
+        self.q_stability_history:  List[float] = []
 
-    def log(self, reward: float, waits: Sequence[float]):
+    def log(self, reward: float, waits: List[float]):
         """
-        Log the total reward and wait times for an episode.
-
-        Args:
-            reward: Total reward accumulated in the episode.
-            waits: Sequence of wait times recorded at each step.
+        Log per-episode reward and wait times.
         """
-        # Record total reward
         self.episode_rewards.append(reward)
-        # Compute and record average wait time
-        if waits:
-            avg_wait = float(sum(waits) / len(waits))
-        else:
-            avg_wait = 0.0
-        self.avg_waits.append(avg_wait)
+        self.episode_waits.append(waits)
+
+    def log_metrics(
+        self,
+        losses: List[float],
+        update_norms: List[float] = None,
+        q_stabilities: List[float] = None
+    ):
+        """
+        Log training metrics: per-epoch (or per-step) loss, Q-value spread,
+        network update norm, and Q-value stability.
+        """
+        self.loss_history = losses
+        if update_norms is not None:
+            self.update_norm_history = update_norms
+        if q_stabilities is not None:
+            self.q_stability_history = q_stabilities
 
     def save_plots(self, out_dir: str = "plots"):
         """
-        Save training plots for rewards and average wait times.
-
-        Args:
-            out_dir: Directory where plots will be saved. Created if nonexistent.
+        Save reward and wait-time plots, plus any metric plots if logged.
         """
-        # Ensure output directory exists
         os.makedirs(out_dir, exist_ok=True)
 
-        # Plot: Reward per Episode
+        # 1) Reward per episode
         plt.figure()
         plt.plot(self.episode_rewards)
-        plt.xlabel("Episode")
-        plt.ylabel("Total Reward")
-        plt.title("Reward per Episode")
+        plt.xlabel('Episode')
+        plt.ylabel('Total Reward')
+        plt.title('Reward per Episode')
         plt.grid(True)
-        reward_path = os.path.join(out_dir, "reward_per_episode.png")
-        plt.savefig(reward_path)
+        plt.savefig(os.path.join(out_dir, 'reward_per_episode.png'))
         plt.close()
 
-        # Plot: Average Wait Time per Episode
+        # 2) Average wait per episode
+        avg_waits = [sum(w)/len(w) if w else 0.0 for w in self.episode_waits]
         plt.figure()
-        plt.plot(self.avg_waits)
-        plt.xlabel("Episode")
-        plt.ylabel("Average Wait Time")
-        plt.title("Average Wait per Episode")
+        plt.plot(avg_waits)
+        plt.xlabel('Episode')
+        plt.ylabel('Average Wait Time')
+        plt.title('Average Wait Time per Episode')
         plt.grid(True)
-        wait_path = os.path.join(out_dir, "avg_wait_per_episode.png")
-        plt.savefig(wait_path)
+        plt.savefig(os.path.join(out_dir, 'avg_wait_per_episode.png'))
         plt.close()
 
+        # 3) Training metrics, if available
+        if self.loss_history:
+            plt.figure()
+            plt.plot(self.loss_history, label='Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Value')
+            plt.title('Training Loss per Epoch')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(out_dir, 'loss.png'))
+            plt.close()
+
+        # 4) DQN convergence metrics
+        if self.update_norm_history:
+            plt.figure()
+            plt.plot(self.update_norm_history, label='Update Norm')
+            plt.xlabel('Epoch')
+            plt.ylabel('||Δθ||')
+            plt.title('Network Update Norm per Epoch')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(out_dir, 'update_norm.png'))
+            plt.close()
+
+        if self.q_stability_history:
+            plt.figure()
+            plt.plot(self.q_stability_history, label='Q-Value Stability')
+            plt.xlabel('Epoch')
+            plt.ylabel('Mean |ΔQ|')
+            plt.title('Q-Value Stability per Epoch')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(out_dir, 'q_value_stability.png'))
+            plt.close()

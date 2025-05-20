@@ -5,7 +5,7 @@ from typing import NamedTuple, Callable, Sequence, Dict, Tuple
 import jax
 import jax.numpy as jnp
 import jax.random as random
-from jax import lax
+from jax import lax, tree_util
 import optax
 from flax import linen as nn
 from flax.training import checkpoints
@@ -267,8 +267,6 @@ def train(
     max_deg = env.max_deg
     freeze_epochs = 0.1*epochs
     model = QNetwork(max_deg=max_deg)
-
-        # Dummy init to get param shapes
     # D_state = 2(curr_xy)+2(pick_xy)+2(delta_xy)+1(norm_step) = 7
     D_state  = 7
     # D_action = 2 (travel_time, wait_time)
@@ -282,9 +280,7 @@ def train(
     if pretrain_ckpt:
         with open(pretrain_ckpt, 'rb') as f:
             pretrained = pickle.load(f)
-        # start from init_params
         params = init_params
-        # merge old weights, zero‑init new wait feature
         params = adapt_pretrained_zeroinit(params, pretrained, init_params)
     else:
         params = init_params
@@ -294,12 +290,31 @@ def train(
     opt_state = opt.init(params)
 
     # For percentage of pickups
-    pickup_count = 0
-    done_count = 0
+    # pickup_count = 0
+    # done_count = 0
 
     rollout = get_batched_rollout_q(model, obs_fn_batch,
                                     jnp.array(fixed_starts), jnp.array(fixed_pickups),
                                     num_steps=num_steps)
+    
+    # Set up logger and fixed validation batch
+    logger = TrainingLogger()
+    key, vkey = random.split(key)
+    init_states_val = init_state_fn()
+    batch_val, _  = rollout(env, init_states_val, vkey, params, 0.0)
+    obs_val       = obs_fn_batch(batch_val.state)
+    T_val, B_val  = batch_val.action.shape
+    N_val         = T_val * B_val
+    sf_val = obs_val['state_feats'].reshape((N_val, -1))
+    af_val = obs_val['action_feats'].reshape((N_val, max_deg, D_action))
+    mask_val = batch_val.state.neighbor_mask.reshape((N_val, max_deg))
+    act_val = batch_val.action.reshape((N_val,))
+
+    # Metrics buffers
+    loss_history = []
+    update_norms = []
+    q_stabilities = []
+    q_prev_val = None
 
     # Loss & update function
     @jax.jit
@@ -330,11 +345,11 @@ def train(
         return new_params, new_opt_state, loss
 
     # Training epochs
-    logger = TrainingLogger()
+
     states = init_state_fn()
     for ep in range(1, epochs+1):
         freeze_mask = (ep <= freeze_epochs)
-        t0 = time.time()
+        # t0 = time.time()
         eps = epsilon_start + (epsilon_end - epsilon_start) * (ep/epochs)
         key, subkey = random.split(key)
         batch, states = rollout(env, states, subkey, params, eps)
@@ -355,6 +370,7 @@ def train(
         sf = sf.reshape((N,-1));    
         af  = af.reshape((N, max_deg, D_action))
         mask = mask.reshape((N,max_deg))
+
         act = batch.action.reshape((N,))
         rew = batch.reward.reshape((N,))
         sf2 = sf2.reshape((N,-1))  
@@ -366,16 +382,63 @@ def train(
         travels = batch.travel.reshape((T * B,)).tolist()
         logger.log(float(jnp.sum(rew)), waits)
 
-        # Count pickups
-        per_env_picked  = jnp.any(batch.pickup,  axis=0)
-        per_env_done = jnp.any(batch.done, axis=0)
-        n_picked  = int(jnp.sum(per_env_picked))
-        n_done   = int(jnp.sum(per_env_done))
-        pickup_count  += n_picked
-        done_count   += n_done
+        # Clone params before epoch updates
+        params_before = params
 
-        pickup_rate = 100.0 * pickup_count / done_count
-        epoch_rate = n_picked / n_done
+        # Epoch of minibatch updates
+        loss = 0.0
+        idx = random.permutation(key, sf.shape[0])
+        for i in range(0, sf.shape[0], batch_size):
+            mb = idx[i:i+batch_size]
+            params, opt_state, loss = train_step(
+                params, target_params, opt_state,
+                sf[mb], af[mb], mask[mb],
+                act[mb], rew[mb], sf2[mb], af2[mb], mask2[mb], done[mb],
+                ep <= int(0.1*epochs)
+            )
+
+        # Append loss
+        loss_history.append(loss.item())
+
+        # Compute validation Q-values for metrics
+        q_vals_val = model.apply(params, sf_val, af_val, mask_val)  # [N_val, max_deg]
+
+        # 7) Update norm: ||params - params_before||_2
+        leaves_new, _ = tree_util.tree_flatten(params)
+        leaves_old, _ = tree_util.tree_flatten(params_before)
+        total_sq = 0.0
+        for p_new, p_old in zip(leaves_new, leaves_old):
+            diff = (p_new - p_old).ravel()
+            total_sq += jnp.sum(diff * diff)
+        update_norms.append(jnp.sqrt(total_sq).item())
+
+        # 8) Q-value stability
+        q_sel_val = jnp.take_along_axis(q_vals_val, act_val[:,None], axis=1).squeeze()
+        if q_prev_val is None:
+            q_prev_val = q_sel_val
+            q_stabilities.append(0.0)
+        else:
+            stab = jnp.mean(jnp.abs(q_sel_val - q_prev_val)).item()
+            q_stabilities.append(stab)
+            q_prev_val = q_sel_val
+
+        # 9) Log into TrainingLogger
+        logger.log_metrics(
+            losses=loss_history,
+            update_norms=update_norms,
+            q_stabilities=q_stabilities
+        )
+
+        # # Count pickups
+        # per_env_picked  = jnp.any(batch.pickup,  axis=0)
+        # per_env_done = jnp.any(batch.done, axis=0)
+        # n_picked  = int(jnp.sum(per_env_picked))
+        # n_done   = int(jnp.sum(per_env_done))
+        # pickup_count  += n_picked
+        # done_count   += n_done
+
+        # pickup_rate = 100.0 * pickup_count / done_count
+        # epoch_rate = n_picked / n_done
 
         # Shuffle indices
         idx = random.permutation(key, N)
@@ -388,9 +451,18 @@ def train(
                 freeze_mask
             )
 
+        loss_history.append(loss.item())
+        
+        logger.log_metrics(
+            losses=loss_history,
+            update_norms=update_norms,
+            q_stabilities=q_stabilities
+        )
+
         # Sync target network
         target_params = params
-        dt = time.time() - t0
+        
+        # dt = time.time() - t0
         # print(f"Ep {ep}/{epochs} loss={loss:.4f} t={dt:.2f}s - Pickup Rate: {pickup_rate:.2f}% - Epoch Rate: {epoch_rate:.2f}%")
 
     logger.save_plots(out_dir="plots")   # writes reward_per_episode.png and avg_wait_per_episode.png

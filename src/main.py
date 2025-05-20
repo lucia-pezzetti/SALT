@@ -46,9 +46,29 @@ print(f"Number of nodes: {len(all_nodes)}")
 node_to_idx = {n: i for i, n in enumerate(all_nodes)}
 idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
-# Choose fixed start & pickup sets (here: all nodes)
-fixed_starts_idx = list(range(len(all_nodes)))
-fixed_pickups_idx = list(range(len(all_nodes)))
+# # Choose fixed start & pickup sets (here: all nodes)
+# fixed_starts_idx = list(range(len(all_nodes)))
+# fixed_pickups_idx = list(range(len(all_nodes)))
+
+# choose fixed start & pickup nodes
+fixed_starts = []
+fixed_pickups = []
+
+nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
+colored_nodes = nodes_gdf.dropna(subset=['zone'])
+
+# Fix a node for every zone
+for loc_id, nodes in zone_to_nodes.items():
+    if nodes:
+        # Use the first node in the list for each zone
+        fixed_starts.append(nodes[0])
+        fixed_pickups.append(nodes[0])
+
+fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
+fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
+print(f"Fixed starts: {fixed_starts_idx}")
+print(f"Fixed pickups: {fixed_pickups_idx}")
+
 
 # --- Build JAX-ready graph structures ---
 print("Building adjacency & time matrices")
