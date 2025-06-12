@@ -24,9 +24,7 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
         for j, nbr in enumerate(neighbors[:max_deg]):
             best_k = min(G[node][nbr], key=lambda k: G[node][nbr][k]['travel_time_congested'])
             time_min = G[node][nbr][best_k]['travel_time_congested']
-            print(f"Node {node} -> Neighbor {nbr}: {time_min:.2f} sec")
             time_sec = time_min * 60.0
-            print(f"   Time in seconds: {time_sec:.2f}")
             adj[i, j] = node_to_idx[nbr]
             times[i, j] = time_sec
         if 0 < n_neighbors < max_deg:

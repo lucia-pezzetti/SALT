@@ -5,6 +5,41 @@ import geopandas as gpd
 import numpy as np
 from shapely.geometry import Point
 
+from taxi_env_utils import build_traffic_params
+
+
+# --- Load and preprocess graph ---
+def build_env(args):
+    """
+    Build graph G, node_to_idx mapping, fixed start/pickup indices.
+    Returns: G, node_to_idx, fixed_starts_idx, fixed_pickups_idx
+    """
+    if args.env_type == 'manhattan':
+        # --- Load and preprocess Manhattan graph ---
+        G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp)
+
+        fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
+            G, nodes_gdf, node_to_zone, zone_to_nodes, all = True
+        )
+
+    elif args.env_type == 'simple':
+        G = load_simple_graph()
+        # index mappings
+        nodes = list(G.nodes())
+        node_to_idx = {n: i for i, n in enumerate(nodes)}
+        idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
+
+        # only one fixed start (node 0) and one fixed pickup (last one)
+        fixed_starts_idx = [node_to_idx[0]]
+        fixed_pickups_idx = [node_to_idx[nodes[-1]]]
+
+    else:
+        raise ValueError(f"Unknown env_type: {args.env_type}")
+    
+    traffic_params = build_traffic_params(G, node_to_idx, seed=42)
+
+    return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
+
 
 def load_graph(place_name: str, zone_shp: str, network_type: str = "drive") -> nx.DiGraph:
     """
@@ -143,7 +178,6 @@ def apply_congestion_model(G_scc: nx.DiGraph,
     for u, v, k, data in G_scc.edges(keys=True, data=True):
         speed_kph = data.get('speed_kph', 30)
         length_m = data.get('length', 0)
-        print(f"Edge {u} → {v} (key={k}): speed={speed_kph} kph, length={length_m} m")
         t_free_min = (length_m/1000)/speed_kph*60
         hw = data.get('highway', 'default')
         if isinstance(hw, list): hw = hw[0]
@@ -152,8 +186,6 @@ def apply_congestion_model(G_scc: nx.DiGraph,
         data['travel_time_freeflow'] = t_free_min
         data['travel_time_congested'] = t_cong_min
         data['bpr_alpha'] = alpha
-        print(f"  Freeflow time: {data['travel_time_freeflow']:.2f} min, Congested time: {data['travel_time_congested']:.2f} min, alpha: {data['bpr_alpha']}")
-
 
 def compute_distributions(filtered_df: pd.DataFrame):
     """

@@ -10,23 +10,23 @@ from jax import lax
 from flax import linen as nn
 import optax
 from functools import partial
+from jax.tree_util import tree_map
+import matplotlib.pyplot as plt
 
-# Enable 64-bit precision in JAX
-jax.config.update("jax_enable_x64", True)
+# Enable 64-bit precision\anjax.config.update("jax_enable_x64", True)
 
-from utils import load_graph, apply_congestion_model, compute_zone_mappings
+from utils import build_env
 from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn
 from taxi_env import TaxiState, JAXRideEnv
 from dqn_trainer import QNetwork
 
 
 def compute_true_returns(start_nodes: jnp.ndarray,
-                          pickups:     jnp.ndarray,
-                          dist_mat:    jnp.ndarray,
-                          pickup_bonus: float = 50.0) -> jnp.ndarray:
+                         pickups:     jnp.ndarray,
+                         dist_mat:    jnp.ndarray,
+                         pickup_bonus: float = 50.0) -> jnp.ndarray:
     """
-    Vectorized closed-form Monte Carlo return for shortest-path expert:
-    G = (1 - 1/60) * dist[start, pickup] + pickup_bonus
+    Expert return: (1 - 1/60)*distance + bonus
     """
     d = dist_mat[start_nodes, pickups]
     return (1.0 - 1.0/60.0) * d + pickup_bonus
@@ -41,203 +41,204 @@ def generate_expert_data(adj_list:      jnp.ndarray,
                          n_samples:     int,
                          pickup_bonus:  float = 50.0):
     """
-    Samples expert transitions and returns entirely on-device.
+    Samples expert transitions on-device:
+    Returns (start, action, pickup, return, new_key)
     """
-    N, max_deg = adj_list.shape
+    N, _ = adj_list.shape
     key, k1, k2 = jax_random.split(key, 3)
 
-    # Sample starting nodes
+    # sample start and random neighbor action
     start = jax_random.randint(k1, (n_samples,), 0, N)
-    # Random neighbor action
-    valid   = neighbor_mask[start]
-    probs   = valid.astype(jnp.float32)
-    probs   = probs / probs.sum(axis=1, keepdims=True)
-    acts    = jax_random.categorical(k2, jnp.log(probs), axis=1).astype(jnp.int32)
-    nextn   = adj_list[start, acts]
+    valid = neighbor_mask[start]
+    probs = valid.astype(jnp.float32)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    acts = jax_random.categorical(k2, jnp.log(probs), axis=1).astype(jnp.int32)
 
-    # Sample pickup destinations
+    # sample pickup destinations
     key, k3 = jax_random.split(key)
     pickups = jax_random.randint(k3, (n_samples,), 0, N)
 
-    # Compute full Monte Carlo returns
+    # compute returns
     returns = compute_true_returns(start, pickups, dist_mat, pickup_bonus)
-    return start, acts, returns, nextn, pickups, key
+    return start, acts, pickups, returns, key
 
 
 def main():
     parser = argparse.ArgumentParser(description="Pretrain DQN using random expert")
-    parser.add_argument("--place",               type=str,   default="Manhattan, New York City, New York, USA")
-    parser.add_argument("--n_expert_samples",    type=int,   default=50000)
-    parser.add_argument("--hidden_dims", nargs='+',      type=int,   default=[512, 512])
-    parser.add_argument("--lr",                  type=float, default=3e-4)
-    parser.add_argument("--epochs",              type=int,   default=100000)
-    parser.add_argument("--batch_size",          type=int,   default=64)
-    parser.add_argument("--max_steps",           type=int,   default=30)
-    parser.add_argument("--timeout_penalty",     type=float, default=-5.0)
-    parser.add_argument("--seed",                type=int,   default=42)
-    parser.add_argument("--output",              type=str,   default="pretrained_q_params_512.pkl")
+    parser.add_argument("--env_type", type=str, choices=["manhattan", "simple"], default="manhattan", help="Type of environment to use")
+    parser.add_argument("--place_name", type=str, default="Manhattan, New York City, New York, USA")
+    parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zones.shp")
+    parser.add_argument("--n_expert_samples", type=int, default=50000)
+    parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512])
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--epochs", type=int, default=100000)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--max_steps", type=int, default=30)
+    parser.add_argument("--timeout_penalty", type=float, default=-5.0)
+    parser.add_argument("--pickup_bonus", type=float, default=5.0)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output", type=str, default="pretrained_params.pkl")
     args = parser.parse_args()
 
-    # 1) Load and filter graph
-    G = load_graph(args.place)
-    apply_congestion_model(G)
-    zone_shp = "../data/processed/taxi_zones.shp"
-    locationID_to_nodes, zone_to_nodes, node_to_zone, _ = compute_zone_mappings(G, zone_shp_path=zone_shp)
+    # build env and graph
+    G, node_to_idx, _, fixed_starts, fixed_pickups, traffic_params = build_env(args)
+    adj_list, travel_times, neighbor_mask = build_adj_and_time_matrix(
+        G, node_to_idx=node_to_idx
+    )
+    N = len(G)
 
-    selected_zones = ["Financial District South", "Financial District North", "Battery Park"]
-    gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
-    loc_ids   = gdf_zones[gdf_zones["zone"].isin(selected_zones)]["LocationID"].tolist()
-    nodes     = [n for loc in loc_ids for n in zone_to_nodes.get(loc, [])]
-    G         = G.subgraph(nodes).copy()
-
-    # Prune low-degree nodes and take largest SCC
-    to_remove = [v for v in G.nodes()
-                 if (G.in_degree(v)==1 and G.out_degree(v)==1 and
-                     list(G.predecessors(v))[0]==list(G.successors(v))[0])
-                 or (G.in_degree(v)==1 and G.out_degree(v)==0)
-                 or (G.in_degree(v)==0 and G.out_degree(v)==1)]
-    G.remove_nodes_from(to_remove)
-    largest_cc = max(nx.strongly_connected_components(G), key=len)
-    G = G.subgraph(largest_cc).copy()
-
-    # Build index mappings
-    all_nodes   = list(G.nodes())
-    node_to_idx = {n: i for i, n in enumerate(all_nodes)}
-    N           = len(all_nodes)
-
-    # Compute full-pair distance matrix via NetworkX (host-side once)
+    # precompute distance matrix
     dist_mat = np.zeros((N, N), dtype=np.float32)
     for u, lengths in nx.all_pairs_dijkstra_path_length(G, weight='travel_time_congested'):
-        i = node_to_idx[u]
+        ui = node_to_idx[u]
         for v, d in lengths.items():
-            j = node_to_idx[v]
-            dist_mat[i, j] = d
+            dist_mat[ui, node_to_idx[v]] = d
+    distances = jax.device_put(jnp.array(dist_mat))
 
-    # Build adjacency list, travel times, neighbor mask (use keyword arg)
-    adj_list, travel_times, neighbor_mask = build_adj_and_time_matrix(
-        G,
-        node_to_idx=node_to_idx
-    )
+    # move arrays to device
+    adj_dev  = jax.device_put(jnp.array(adj_list, dtype=jnp.int32))
+    tt_dev   = jax.device_put(jnp.array(travel_times, dtype=jnp.float32))
+    mask_dev = jax.device_put(jnp.array(neighbor_mask, dtype=bool))
 
-    # Move arrays to device
-    adj_list      = jax.device_put(jnp.array(adj_list,      dtype=jnp.int32))
-    travel_times  = jax.device_put(jnp.array(travel_times,  dtype=jnp.float32))
-    neighbor_mask = jax.device_put(jnp.array(neighbor_mask, dtype=bool))
-    dist_mat_j    = jax.device_put(jnp.array(dist_mat,      dtype=jnp.float32))
-
-    # Create environment
+    # init env
     env = JAXRideEnv(
-        adj_list=adj_list,
-        travel_times=travel_times,
-        neighbor_mask_static=neighbor_mask,
-        fixed_starts=jnp.arange(N, dtype=jnp.int32),
-        fixed_pickups=jnp.arange(N, dtype=jnp.int32),
-        distances=dist_mat_j,
+        adj_list=adj_dev,
+        travel_times=tt_dev,
+        neighbor_mask_static=mask_dev,
+        fixed_starts=jnp.array(fixed_starts, dtype=jnp.int32),
+        fixed_pickups=jnp.array(fixed_pickups, dtype=jnp.int32),
+        distances=distances,
         max_steps=args.max_steps,
-        timeout_penalty=args.timeout_penalty
+        timeout_penalty=args.timeout_penalty,
+        pickup_bonus=args.pickup_bonus,
+        gamma=args.gamma,
+        traffic_params=traffic_params
     )
 
-    # Build observation functions
-    obs_fn, obs_fn_batch = make_obs_fn(G, node_to_idx, args.max_steps)
+    # build obs fns
+    obs_fn, obs_fn_batch = make_obs_fn(env, G, node_to_idx)
 
-    # Initialize model & optimizer
-    rng = jax_random.PRNGKey(args.seed)
+    # init model & optimizer
+    key = jax_random.PRNGKey(args.seed)
+    rng, init_key = jax_random.split(key)
     dummy_state = TaxiState(
         current_node=jnp.zeros((1,), dtype=jnp.int32),
         pickup_node=jnp.zeros((1,), dtype=jnp.int32),
         done=jnp.zeros((1,), dtype=bool),
         step_count=jnp.zeros((1,), dtype=jnp.int32),
-        neighbor_mask=neighbor_mask[0:1]
+        neighbor_mask=mask_dev[None],
+        time=jnp.zeros((1,), dtype=jnp.float32)
     )
-    dummy_obs = obs_fn(dummy_state)
-    model = QNetwork(dim_hidden=args.hidden_dims,
-                     num_actions=neighbor_mask.shape[-1])
-    rng, init_key = jax_random.split(rng)
-    params        = model.init(init_key, dummy_obs)
-    optimizer     = optax.adam(args.lr)
-    opt_state     = optimizer.init(params)
+    s_dummy, a_dummy, g_dummy = obs_fn(dummy_state)
+    # mask dummy based on a_dummy shape
+    m_dummy = jnp.ones_like(a_dummy[...,0], dtype=bool)
+    model = QNetwork(ctx_dim=128, node_hidden=64, pool="mean", num_actions=mask_dev.shape[-1])
+    params = model.init(init_key, s_dummy, a_dummy, m_dummy, g_dummy)
+    optimizer = optax.adam(args.lr)
+    opt_state = optimizer.init(params)
 
-    # Sample expert data ONCE
-    curr, acts, true_returns, nextn, pickups, rng = generate_expert_data(
-        adj_list, neighbor_mask, dist_mat_j, travel_times,
-        rng, args.n_expert_samples, pickup_bonus=50.0
+    # sample expert data once
+    curr, acts, pickups, returns, rng = generate_expert_data(
+        adj_dev, mask_dev, distances, tt_dev,
+        rng, args.n_expert_samples, args.pickup_bonus
     )
 
-    # Build batch of initial states
-    masks_flat = neighbor_mask[curr]
+    # build batch states
     batch_states = TaxiState(
         current_node=curr,
         pickup_node=pickups,
-        done=jnp.zeros_like(curr, dtype=bool),
-        step_count=jnp.zeros_like(curr, dtype=jnp.int32),
-        neighbor_mask=masks_flat
+        done=jnp.zeros_like(curr),
+        step_count=jnp.zeros_like(curr),
+        neighbor_mask=mask_dev[curr],
+        time=jnp.zeros_like(curr, dtype=jnp.float32)
     )
-    obs_all = obs_fn_batch(batch_states)
+    obs_all = obs_fn_batch(batch_states)          # tuple of (s_feats, a_feats, g_feats)
+    mask_all = batch_states.neighbor_mask         # shape [B, max_deg]
 
-    # Training and stats functions
+    # loss history
+    loss_history = []
+
     @jax.jit
-    def train_step(params, opt_state, obs_b, act_b, ret_b):
+    def train_step(params, opt_state, s_feats, a_feats, g_feats, mask, act_b, ret_b):
         def loss_fn(p):
-            q_all = model.apply(p, obs_b)
+            q_all = model.apply(p, s_feats, a_feats, mask, g_feats)
             q_sa  = jnp.take_along_axis(q_all, act_b[:, None], 1).squeeze(1)
             return jnp.mean((q_sa - ret_b) ** 2)
-        loss, grads    = jax.value_and_grad(loss_fn)(params)
-        updates, opt_s = optimizer.update(grads, opt_state)
-        return optax.apply_updates(params, updates), opt_s, loss
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, new_opt = optimizer.update(grads, opt_state)
+        return optax.apply_updates(params, updates), new_opt, loss
 
     @jax.jit
-    def epoch_train(params, opt_state, obs_all, acts, rets, key):
-        N = obs_all.shape[0]
+    def epoch_train(params, opt_state, obs_all, mask_all, acts, rets, key):
+        s_all = obs_all["state_feats"]
+        a_all = obs_all["action_feats"]
+        g_all = obs_all["global_feats"]
+        B = s_all.shape[0]
         key, subkey = jax_random.split(key)
-        perm = jax_random.permutation(subkey, N)
-        n_batches  = N // args.batch_size
-        perm = perm[:n_batches * args.batch_size].reshape((n_batches, args.batch_size))
+        perm = jax_random.permutation(subkey, B)
+        nbatches = B // args.batch_size
+        perm = perm[:nbatches * args.batch_size].reshape((nbatches, args.batch_size))
 
         def batch_step(carry, idx):
             p, o, tot = carry
-            batch_idx = perm[idx]
-            ob, ac, rt = obs_all[batch_idx], acts[batch_idx], rets[batch_idx]
-            p2, o2, l = train_step(p, o, ob, ac, rt)
+            idxs = perm[idx]
+            s_b = s_all[idxs]
+            a_b = a_all[idxs]
+            g_b = g_all[idxs]
+            m_b = mask_all[idxs]
+            act_b = acts[idxs]
+            ret_b = rets[idxs]
+            p2, o2, l = train_step(p, o, s_b, a_b, g_b, m_b, act_b, ret_b)
             return (p2, o2, tot + l * args.batch_size), None
 
-        (new_p, new_opt, total_loss), _ = lax.scan(batch_step,
-                                                  (params, opt_state, 0.0),
-                                                  jnp.arange(n_batches))
-        return new_p, new_opt, total_loss / N, key
+        (new_p, new_opt, total_loss), _ = lax.scan(
+            batch_step,
+            (params, opt_state, 0.0),
+            jnp.arange(nbatches)
+        )
+        return new_p, new_opt, total_loss / B, key
 
     @jax.jit
-    def q_stats(params, obs, acts, rets):
-        q_all = model.apply(params, obs)
+    def q_stats(params, obs_all, mask_all, acts, rets):
+        s_all = obs_all["state_feats"]
+        a_all = obs_all["action_feats"]
+        g_all = obs_all["global_feats"]
+        q_all = model.apply(params, s_all, a_all, mask_all, g_all)
         q_sa  = jnp.take_along_axis(q_all, acts[:, None], 1).squeeze(1)
-        avg_q, max_q, min_q = jnp.mean(q_all), jnp.max(q_all), jnp.min(q_all)
-        avg_sa, max_sa, min_sa = jnp.mean(q_sa), jnp.max(q_sa), jnp.min(q_sa)
-        mse  = jnp.mean((q_sa - rets) ** 2)
+        mse = jnp.mean((q_sa - rets) ** 2)
         corr = jnp.corrcoef(jnp.stack([q_sa, rets]))[0, 1]
-        return avg_q, max_q, min_q, avg_sa, max_sa, min_sa, mse, corr
+        return mse, corr
 
     @jax.jit
-    def pretrain_step(params, opt_state, obs_all, acts, rets, key):
-        p, o, loss, key = epoch_train(params, opt_state, obs_all, acts, rets, key)
-        stats = q_stats(p, obs_all, acts, rets)
+    def pretrain_step(params, opt_state, obs_all, mask_all, acts, rets, key):
+        p, o, loss, key = epoch_train(params, opt_state, obs_all, mask_all, acts, rets, key)
+        stats = q_stats(p, obs_all, mask_all, acts, rets)
         return p, o, loss, stats, key
 
-    # Supervised pretraining loop
+    # training loop
     print("Starting supervised pretraining...")
     for epoch in range(1, args.epochs + 1):
         params, opt_state, loss, stats, rng = pretrain_step(
-            params, opt_state, obs_all, acts, true_returns, rng
+            params, opt_state, obs_all, mask_all, acts, returns, rng
         )
-        avg_q, max_q, min_q, avg_sa, max_sa, min_sa, mse, corr = stats
-        # print(f"Epoch {epoch}/{args.epochs} — loss {loss:.4f} — "
-        #       f"Q=[avg {avg_q:.2f}, min {min_q:.2f}, max {max_q:.2f}] — "
-        #       f"Q_sa=[avg {avg_sa:.2f}, min {min_sa:.2f}, max {max_sa:.2f}] — "
-        #       f"mse {mse:.4f}, corr {corr:.4f}")
+        loss_history.append(float(loss))
+        if epoch % 1000 == 0:
+            mse, corr = stats
+            print(f"Epoch {epoch}/{args.epochs} loss={loss:.4f} mse={mse:.4f} corr={corr:.4f}")
 
-    # Save parameters
+    # plot loss
+    plt.plot(loss_history)
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE')
+    plt.tight_layout()
+    plt.show()
+
+    # save params
     with open(args.output, 'wb') as f:
         pickle.dump(params, f)
     print(f"Saved pretrained parameters to {args.output}")
-
 
 if __name__ == '__main__':
     main()

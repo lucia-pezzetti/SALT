@@ -10,53 +10,20 @@ import equinox as eqx
 import geopandas as gpd
 import matplotlib.pyplot as plt
 
-from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn, build_traffic_params
+from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn
 from taxi_env import JAXRideEnv, init_env, TaxiState
 from dqn_trainer import train, QNetwork
-from utils import load_graph, fixed_starts_pickups, load_simple_graph
+from utils import build_env
 from evaluation_utils import BaselineEvaluator
 import argparse
-
-# --- Load and preprocess graph ---
-def build_env(args):
-    """
-    Build graph G, node_to_idx mapping, fixed start/pickup indices.
-    Returns: G, node_to_idx, fixed_starts_idx, fixed_pickups_idx
-    """
-    if args.env_type == 'manhattan':
-        # --- Load and preprocess Manhattan graph ---
-        G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp)
-
-        fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
-            G, nodes_gdf, node_to_zone, zone_to_nodes, all = True
-        )
-
-    elif args.env_type == 'simple':
-        G = load_simple_graph()
-        # index mappings
-        nodes = list(G.nodes())
-        node_to_idx = {n: i for i, n in enumerate(nodes)}
-        idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
-
-        # only one fixed start (node 0) and one fixed pickup (last one)
-        fixed_starts_idx = [node_to_idx[0]]
-        fixed_pickups_idx = [node_to_idx[nodes[-1]]]
-
-    else:
-        raise ValueError(f"Unknown env_type: {args.env_type}")
-    
-    traffic_params = build_traffic_params(G, node_to_idx, seed=42)
-
-    return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
-
 
 parser = argparse.ArgumentParser(description="Ride-sharing Simulator")
 parser.add_argument("--env_type", type=str, choices=["manhattan", "simple"], default="manhattan", help="Type of environment to use")
 parser.add_argument("--place_name", type=str, default="Manhattan, New York City, New York, USA", help="Place name for the graph (used for Manhattan)")
 parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zones.shp", help="Path to the shapefile for zones (used for Manhattan)")
-parser.add_argument("--rows", type=int, default=2, help="Number of rows for grid environment")
-parser.add_argument("--cols", type=int, default=5, help="Number of columns for grid environment")
-parser.add_argument("--diag", action="store_true", help="Allow diagonal connections in grid environment")
+# parser.add_argument("--rows", type=int, default=2, help="Number of rows for grid environment")
+# parser.add_argument("--cols", type=int, default=5, help="Number of columns for grid environment")
+# parser.add_argument("--diag", action="store_true", help="Allow diagonal connections in grid environment")
 parser.add_argument("--base_time", type=float, default=1.0, help="Base travel time for grid environment")
 parser.add_argument("--max_steps", type=int, default=128, help="Maximum number of steps per episode")
 parser.add_argument("--pickup_bonus", type=float, default=10.0, help="Bonus for picking up a passenger")
@@ -64,7 +31,7 @@ parser.add_argument("--timeout_penalty", type=float, default=-5.0, help="Penalty
 parser.add_argument("--n_expert_samples", type=int, default=50000, help="Number of expert samples for pretraining")
 parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512], help="Hidden dimensions for the neural network")
 parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for training")
-parser.add_argument("--epochs", type=int, default=10_000, help="Number of training epochs")
+parser.add_argument("--epochs", type=int, default=100_000, help="Number of training epochs")
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
 parser.add_argument("--num_steps", type=int, default=128, help="Number of steps for training")
 parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for training")
