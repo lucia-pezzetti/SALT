@@ -1,5 +1,6 @@
 import numpy as np
 import jax
+from jax import lax
 import jax.numpy as jnp
 import networkx as nx
 from taxi_env import JAXRideEnv, TaxiState
@@ -15,34 +16,40 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
 
     adj = -np.ones((num_nodes, max_deg), dtype=int)
     times = np.zeros((num_nodes, max_deg), dtype=np.float32)
-    neighbor_mask = np.zeros((num_nodes, max_deg), dtype=np.float32)
+    neighbor_mask = np.zeros((num_nodes, max_deg), dtype=bool)
 
     for i, node in enumerate(node_list):
         neighbors = list(G.successors(node))
         n_neighbors = len(neighbors)
         for j, nbr in enumerate(neighbors[:max_deg]):
             best_k = min(G[node][nbr], key=lambda k: G[node][nbr][k]['travel_time_congested'])
-            time_sec = G[node][nbr][best_k]['travel_time_congested'] * 60.0  # seconds
+            time_min = G[node][nbr][best_k]['travel_time_congested']
+            print(f"Node {node} -> Neighbor {nbr}: {time_min:.2f} sec")
+            time_sec = time_min * 60.0
+            print(f"   Time in seconds: {time_sec:.2f}")
             adj[i, j] = node_to_idx[nbr]
             times[i, j] = time_sec
         if 0 < n_neighbors < max_deg:
             # pad with first neighbor
             adj[i, n_neighbors:] = adj[i, 0]
             times[i, n_neighbors:] = times[i, 0]
-        neighbor_mask[i, :n_neighbors] = 1.0
+        neighbor_mask[i, :n_neighbors] = True
 
     return jnp.array(adj), jnp.array(times), jnp.array(neighbor_mask)
 
-# --- Observation extraction function ---
-def make_obs_fn(env: JAXRideEnv,
-                G: nx.DiGraph,
-                node_to_idx: Dict[int,int],
-                max_steps: int
-               ) -> Callable[[TaxiState], Dict[str, jnp.ndarray]]:
+
+def make_obs_fn(
+    env: JAXRideEnv,
+    G: nx.DiGraph,
+    node_to_idx: Dict[int,int]
+) -> Tuple[
+    Callable[[TaxiState], Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
+    Callable[[TaxiState], Dict[str, jnp.ndarray]]
+]:
     """
-    Returns a batched obs_fn that maps a TaxiState batch to:
-      - state_feats: [B, 7]  (curr_xy, pickup_xy, delta_xy, norm_step)
-      - action_feats: [B, max_deg, 2]  (travel_time, expected_wait)
+    Returns two functions:
+      - single_obs: TaxiState -> (state_feats [6], action_feats [max_deg,2], global_feats [3*N])
+      - obs_fn_batch: batched TaxiState -> dict of trajectories
     """
     # Precompute normalized lat/lon per node
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
@@ -50,42 +57,95 @@ def make_obs_fn(env: JAXRideEnv,
     lons = jnp.array([G.nodes[n]['x'] for n in idx_to_node], dtype=jnp.float32)
     lat_min, lat_max = lats.min(), lats.max()
     lon_min, lon_max = lons.min(), lons.max()
-    latlon = jnp.stack([(lats - lat_min)/(lat_max - lat_min),
-                        (lons - lon_min)/(lon_max - lon_min)], axis=-1)  # [N,2]
+    latlon = jnp.stack([
+        (lats - lat_min) / (lat_max - lat_min),
+        (lons - lon_min) / (lon_max - lon_min)
+    ], axis=-1)  # [N,2]
 
-    max_deg = env.max_deg
+    def single_obs(s: TaxiState) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        # -- State features --
+        xy_c = latlon[s.current_node]   # [2]
+        xy_p = latlon[s.pickup_node]    # [2]
+        delta = xy_p - xy_c             # [2]
+        state_feats = jnp.concatenate([xy_c, xy_p, delta], axis=-1)
 
-    def single_obs(s: TaxiState):
-        # --- State-level features ---
-        curr, drop = s.current_node, s.pickup_node
-        xy_c = latlon[curr]                  # [2]
-        xy_p = latlon[drop]                  # [2]
-        delta = xy_p - xy_c                  # [2]
-        step = jnp.array(s.step_count, dtype=jnp.float32)
-        norm_step = (step / max_steps)[..., None]
-        state_feats = jnp.concatenate([xy_c, xy_p, delta, norm_step], axis=-1)  # [7]
+        # -- Action features --
+        travel = env.travel_times[s.current_node]          # [max_deg]
+        travel_norm = travel / env.max_travel_time
+        arrival = jnp.expand_dims(s.time, -1) + travel     # [max_deg]
+        nbrs = env.adj_list[s.current_node]                # [max_deg]
+        per = env.periods[nbrs]                            # [max_deg]
+        green = env.green_durations[nbrs]                  # [max_deg]
+        offs = env.offsets[nbrs]                           # [max_deg]
+        cycle = jnp.mod(arrival + offs, per)               # [max_deg]
+        wait = jnp.where(cycle < green, 0.0, per - cycle)  # [max_deg]
+        wait_norm = wait / env.max_wait_time               # normalized [0,1]
+        action_feats = jnp.stack([travel_norm, wait_norm], axis=-1)
 
-        # --- Per-action features ---
-        nbrs    = env.adj_list[curr]         # [max_deg]
-        travel  = env.travel_times[curr]     # [max_deg]
-        # broadcast s.time to match [max_deg]
-        time = jnp.array(s.time, dtype=jnp.float32)        # shape=()
-        arrival = time[..., None] + travel
-        per     = env.periods[nbrs]          # [max_deg]
-        green   = env.green_durations[nbrs]  # [max_deg]
-        offset  = env.offsets[nbrs]          # [max_deg]
-        cycle   = (arrival + offset) % per    # [max_deg]
-        wait    = jnp.where(cycle < green, 0.0, per - cycle)  # [max_deg]
-        action_feats = jnp.stack([travel, wait], axis=-1)     # [max_deg,2]
+        # -- Global features --
+        ratio = (env.green_durations / env.periods)  # [N]
+        cycles = jnp.mod(jnp.expand_dims(s.time, -1) + env.offsets, env.periods)          # [N]
+        is_green = (cycles < env.green_durations).astype(jnp.float32)
+        raw_tts = jnp.where(
+            is_green > 0,
+            env.green_durations - cycles,
+            env.periods - cycles
+        )  # [N]
+        tts = raw_tts / env.periods                          # normalized [0,1]
+        if cycles.ndim == 2:
+            ratio = jnp.broadcast_to(ratio[None, :], cycles.shape)
+        global_feats = jnp.stack([ratio, is_green, tts], axis=1)  # [N,3]
 
-        return state_feats, action_feats
+        return state_feats, action_feats, global_feats
+
+    # JIT and batched versions
+    single_obs = jax.jit(single_obs)
+    single_obs_batched = jax.vmap(single_obs)
 
     @jax.jit
-    def obs_fn(batch: TaxiState):
-        sf, af = jax.vmap(single_obs)(batch)
-        return {'state_feats': sf, 'action_feats': af}
+    def obs_fn_batch(batch: TaxiState) -> Dict[str, jnp.ndarray]:
+        sf, af, gf = single_obs_batched(batch)
+        return {
+            'state_feats': sf,
+            'action_feats': af,
+            'global_feats': gf,
+        }
 
-    return single_obs, obs_fn
+    return single_obs, obs_fn_batch
+
+
+
+def get_global_state(env, batch) -> jnp.ndarray:
+
+    t = batch.time  # jnp.ndarray, shape [B]
+    B = t.shape[0]  # batch size
+    N = env.num_nodes
+    
+    global_feats = []
+    periods = jnp.broadcast_to(env.periods, (B, N))
+    green   = jnp.broadcast_to(env.green_durations, (B, N))
+    green_ratios = green / periods
+    offs    = jnp.broadcast_to(env.offsets, (B, N))
+
+    # compute time within current cycle
+    cycle_pos = jnp.mod(t[:, None] + offs, periods)
+    # determine if currently in green phase
+    is_green = (cycle_pos < green).astype(jnp.float32)
+
+    # compute time until next switch
+    time_to_switch = jnp.where(
+        is_green,
+        green - cycle_pos,
+        periods - cycle_pos
+    ) 
+
+    global_feats = jnp.concatenate([
+        green_ratios,
+        is_green,
+        time_to_switch
+    ], axis=1)
+
+    return global_feats
 
 # --- Example init_state_fn ---
 def make_init_state_fn(env: JAXRideEnv, num_envs: int, rng_key):
@@ -125,7 +185,6 @@ def build_traffic_params(G: nx.DiGraph,
         # For a MultiDiGraph:
         for u, v, key, data in G.edges(node, keys=True, data=True):
             hw = data.get("highway", "unclassified")
-            # OSM sometimes gives a list of types
             if isinstance(hw, list):
                 types.extend(hw)
             else:
@@ -134,15 +193,15 @@ def build_traffic_params(G: nx.DiGraph,
         if any(t in ("motorway", "trunk") for t in types):
             cycle, green = 1.0, 1.0    # effectively always green
         elif any(t == "primary" for t in types):
-            cycle, green = 60.0, 30.0
+            cycle, green = 600.0, 500.0
         elif any(t == "secondary" for t in types):
-            cycle, green = 60.0, 25.0
+            cycle, green = 600.0, 400.0
         elif any(t == "tertiary" for t in types):
-            cycle, green = 50.0, 20.0
+            cycle, green = 600.0, 200.0
         else:
-            cycle, green = 40.0, 20.0
+            cycle, green = 600.0, 250.0
 
-        # random phase offset so lights aren’t synced
+        # random phase offset
         offset = float(rng.uniform(0, cycle))
         # --- VALIDITY CHECKS ---
         assert cycle > 0, f"Cycle length for node {node} must be positive, got {cycle}"
@@ -156,7 +215,6 @@ def build_traffic_params(G: nx.DiGraph,
 
         traffic_params[node_to_idx[node]] = (cycle, green, offset)
 
-    # ensure coverage
     missing = set(node_to_idx.values()) - set(traffic_params.keys())
     assert not missing, f"Missing params for node indices: {sorted(missing)}"
 

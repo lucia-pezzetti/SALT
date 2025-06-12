@@ -7,7 +7,7 @@ from typing import Callable, Sequence
 class BaselineEvaluator:
     def __init__(self, G: nx.DiGraph, node_to_idx: dict,
                  init_state_fn: Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], TaxiState],
-                 idx_to_node: Sequence[int]):  # new argument
+                 idx_to_node: Sequence[int]):
         self.G = G
         self.node_to_idx = node_to_idx
         self.init_state_fn = init_state_fn  # function(key, starts, pickups) -> TaxiState
@@ -20,14 +20,6 @@ class BaselineEvaluator:
         # compute shortest path on OSM node IDs
         path = nx.shortest_path(self.G, start_node, goal_node, weight='travel_time_congested')
         return path
-
-    def path_travel_time(self, path: list) -> float:
-        t = 0.0
-        for u, v in zip(path[:-1], path[1:]):
-            data = self.G.get_edge_data(u, v)
-            edge = data[next(iter(data))]
-            t += float(edge.get('travel_time', 0.0))
-        return t
 
     def evaluate(
         self,
@@ -91,7 +83,7 @@ class BaselineEvaluator:
             # for each node in the path
             count = 0
             print(f"SP: {i}, start: {state_sp.current_node}, pickup: {state_sp.pickup_node}")
-            for u in shortest_path[:-1]:  # Exclude the last node
+            for u in shortest_path[1:]:
                 count += 1
                 # find the index of the node in the adjacency list
                 u_idx = self.node_to_idx[u]
@@ -104,7 +96,7 @@ class BaselineEvaluator:
 
                 # step and accumulate true (travel + wait)
                 state_sp, _, _, info_sp = env.step(state_sp, action)
-                print(f"SP Step {count}: node; {state_sp.current_node}, action {action}, travel {info_sp['travel']}, wait {info_sp['wait']}")
+                print(f"SP Step {count}: next node; {state_sp.current_node}, action {action}, travel {info_sp['travel']}, wait {info_sp['wait']}")
                 total_sp += float(info_sp['travel'] + info_sp['wait'])
             print(f"SP count: {count}, total_sp: {total_sp}")
             sp_times.append(total_sp)

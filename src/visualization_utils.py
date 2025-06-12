@@ -4,12 +4,9 @@ from typing import List
 
 class TrainingLogger:
     def __init__(self):
-        # existing buffers
         self.episode_rewards: List[float] = []
         self.episode_waits:    List[List[float]] = []
-        # new metric buffers
         self.loss_history:     List[float] = []
-        # additional metric buffers for DQN convergence
         self.update_norm_history:  List[float] = []
         self.q_stability_history:  List[float] = []
 
@@ -36,13 +33,13 @@ class TrainingLogger:
         if q_stabilities is not None:
             self.q_stability_history = q_stabilities
 
-    def save_plots(self, out_dir: str = "plots"):
+    def save_plots(self, out_dir: str = "plots/grid_clipping_pen_wait"):
         """
         Save reward and wait-time plots, plus any metric plots if logged.
         """
         os.makedirs(out_dir, exist_ok=True)
 
-        # 1) Reward per episode
+        # Reward per episode
         plt.figure()
         plt.plot(self.episode_rewards)
         plt.xlabel('Episode')
@@ -52,7 +49,7 @@ class TrainingLogger:
         plt.savefig(os.path.join(out_dir, 'reward_per_episode.png'))
         plt.close()
 
-        # 2) Average wait per episode
+        # Average wait per episode
         avg_waits = [sum(w)/len(w) if w else 0.0 for w in self.episode_waits]
         plt.figure()
         plt.plot(avg_waits)
@@ -63,7 +60,7 @@ class TrainingLogger:
         plt.savefig(os.path.join(out_dir, 'avg_wait_per_episode.png'))
         plt.close()
 
-        # 3) Training metrics, if available
+        # Training metrics, if available
         if self.loss_history:
             plt.figure()
             plt.plot(self.loss_history, label='Loss')
@@ -75,7 +72,7 @@ class TrainingLogger:
             plt.savefig(os.path.join(out_dir, 'loss.png'))
             plt.close()
 
-        # 4) DQN convergence metrics
+        # DQN convergence metrics
         if self.update_norm_history:
             plt.figure()
             plt.plot(self.update_norm_history, label='Update Norm')
