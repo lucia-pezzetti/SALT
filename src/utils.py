@@ -4,9 +4,16 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 from shapely.geometry import Point
+from typing import Callable, Dict, Tuple
+
+import jax
+from jax import numpy as jnp
+from flax import linen as nn
+from flax import struct
 
 from taxi_env_utils import build_traffic_params
-
+from taxi_env import TaxiEnv, TaxiState
+from timing_decorator import timeit
 
 # --- Load and preprocess graph ---
 def build_env(args):
@@ -21,22 +28,24 @@ def build_env(args):
         fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
             G, nodes_gdf, node_to_zone, zone_to_nodes, all = True
         )
+        fixed_starts_idx  = jnp.array(fixed_starts_idx, dtype=jnp.int32)
+        fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
 
     elif args.env_type == 'simple':
-        G = load_simple_graph()
+        G = load_simple_graph(num_layers=args.num_layers)
         # index mappings
         nodes = list(G.nodes())
         node_to_idx = {n: i for i, n in enumerate(nodes)}
         idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
         # only one fixed start (node 0) and one fixed pickup (last one)
-        fixed_starts_idx = [node_to_idx[0]]
-        fixed_pickups_idx = [node_to_idx[nodes[-1]]]
+        fixed_starts_idx = jnp.array([node_to_idx[n] for n in nodes[:3]], dtype=jnp.int32)
+        fixed_pickups_idx = jnp.array([node_to_idx[n] for n in nodes[-3:]], dtype=jnp.int32)
 
     else:
         raise ValueError(f"Unknown env_type: {args.env_type}")
     
-    traffic_params = build_traffic_params(G, node_to_idx, seed=42)
+    traffic_params = build_traffic_params(G, node_to_idx, args.cycle_length, args.offset, seed=42)
 
     return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
 
@@ -250,7 +259,7 @@ def fixed_starts_pickups(G: nx.DiGraph,
     """
 
     all_nodes = list(G.nodes())
-    print(f"Number of nodes: {len(all_nodes)}")
+    # print(f"Number of nodes: {len(all_nodes)}")
     node_to_idx = {n: i for i, n in enumerate(all_nodes)}
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
@@ -279,73 +288,77 @@ def fixed_starts_pickups(G: nx.DiGraph,
 
 
 # ---- debugging graph ----
-def load_simple_graph():
-    # Fixed coords
+def load_simple_graph(num_layers: int = 2) -> nx.MultiDiGraph:
+    """
+    Build a “simple” layered grid with `num_layers` of 3-node rings:
+      layer 0 = starts, layer 1 = first intermediates, etc.
+
+    Args:
+        num_layers: how many of the predefined 3-node layers to include (max 6)
+
+    Returns:
+        G: a MultiDiGraph containing only those layers, fully connected
+           between consecutive layers, with lengths & highway tags.
+    """
+    # fixed coords for up to 6 layers of 3 nodes each
     coords = {
-        0: (0.0, 1.0),   # start
-        1: (1.0, 0.0),   # inter A.1
-        2: (1.0, 1.0),   # inter B.1
-        3: (1.0, 2.0),   # inter C.1
-        4: (2.0, 0.0),   # inter A.2
-        5: (2.0, 1.0),   # inter B.2
-        6: (2.0, 2.0),   # inter C.2
-        # 7: (3.0, 0.0),   # inter A.3
-        # 8: (3.0, 1.0),   # inter B.3
-        # 9: (3.0, 2.0),   # inter C.3
-        # 10: (4.0, 0.0),  # inter A.4
-        # 11: (4.0, 1.0),  # inter B.4
-        # 12: (4.0, 2.0),  # inter C.4
-        # 13: (5.0, 0.0),  # inter A.5
-        # 14: (5.0, 1.0),  # inter B.5
-        # 15: (5.0, 2.0),   # inter C.5
-        # 16: (6.0, 1.0),  # end
-        7: (3.0, 1.0),  # end
+        0: (0.0, 0.0),   1: (0.0, 1.0),   2: (0.0, 2.0),
+        3: (1.0, 0.0),   4: (1.0, 1.0),   5: (1.0, 2.0),
+        6: (2.0, 0.0),   7: (2.0, 1.0),   8: (2.0, 2.0),
+        9: (3.0, 0.0),  10: (3.0, 1.0),  11: (3.0, 2.0),
+       12: (4.0, 0.0),  13: (4.0, 1.0),  14: (4.0, 2.0),
+       15: (5.0, 0.0),  16: (5.0, 1.0),  17: (5.0, 2.0),
+       18: (6.0, 0.0),  19: (6.0, 1.0),  20: (6.0, 2.0),
+       21: (7.0, 0.0),  22: (7.0, 1.0),  23: (7.0, 2.0),
+       24: (8.0, 0.0),  25: (8.0, 1.0),  26: (8.0, 2.0),
+       27: (9.0, 0.0),  28: (9.0, 1.0),  29: (9.0, 2.0),
+       30: (10.0, 0.0), 31: (10.0, 1.0), 32: (10.0, 2.0),
+
     }
 
-    # “layers” of nodes
-    layers = [
-        [0],           # start
-        [1, 2, 3],     # first intermediates
-        [4, 5, 6],     # second intermediates
-        # [7, 8, 9],     # third intermediates
-        # [10, 11, 12],  # fourth intermediates
-        # [13, 14, 15],  # fifth intermediates
-        # [16]           # end
-        [7],          # end
+    # six hard-coded 3-node layers
+    all_layers = [
+        [0, 1, 2],    # layer 0: starts
+        [3, 4, 5],    # layer 1
+        [6, 7, 8],    # layer 2
+        [9,10,11],    # layer 3
+        [12,13,14],   # layer 4
+        [15,16,17],   # layer 5
+        [18,19,20],   # layer 6
+        [21,22,23],   # layer 7
+        [24,25,26],   # layer 8
+        [27,28,29],   # layer 9
+        [30,31,32],   # layer 10
     ]
 
-    # two special routes to break shortest path
-    primary_edges = {(0, 1), (1, 0), (4, 7), (7, 4)}
-    tertiary_edges = {(0, 2), (2, 0), (5, 7), (7, 5)}
+    # clamp to available layers
+    if num_layers < 1 or num_layers > len(all_layers):
+        raise ValueError(f"num_layers must be in [1..{len(all_layers)}], got {num_layers}")
+    layers = all_layers[:num_layers]
 
+    # clamp to available coords
+    coords = {k: v for k, v in coords.items() if k < num_layers * 3}
 
-    # # build quick lookup sets of directed edges
-    # def make_edge_set(path):
-    #     return {
-    #         (u, v) for u, v in zip(path, path[1:])
-    #     } | {
-    #         (v, u) for u, v in zip(path, path[1:])
-    #     }
+    # (optional) define special highways if you need them
+    primary_edges = {}
+    tertiary_edges = {}
+    highway_edges = {(1,4), (4,7), (7,10), (10,13), (13,16), (16,19), (19,22), (22,25), (25,28), (28,31)}
 
-    # primary_edges  = make_edge_set(primary_route)
-    # tertiary_edges = make_edge_set(tertiary_route)
-
-    def tag_for(u, v):
-        if (u, v) in primary_edges:
-            return "primary"
-        if (u, v) in tertiary_edges:
-            return "tertiary"
-        return "secondary"
+    def tag_for(u: int, v: int) -> str:
+        if (u,v) in primary_edges:   return "primary"
+        if (u,v) in tertiary_edges:  return "tertiary"
+        if (u,v) in highway_edges:   return "motorway"
+        return "tertiary"
 
     G = nx.MultiDiGraph()
-    # add all nodes
+    # add nodes with positions
     for nid, (x,y) in coords.items():
         G.add_node(nid, x=x, y=y)
 
-    def connect_layer(i):
-        if i >= len(layers) - 1:
-            return
-        src, dst = layers[i], layers[i+1]
+    # connect each layer i → i+1
+    for i in range(len(layers)-1):
+        src = layers[i]
+        dst = layers[i+1]
         for u in src:
             for v in dst:
                 dx, dy = coords[v][0] - coords[u][0], coords[v][1] - coords[u][1]
@@ -353,10 +366,124 @@ def load_simple_graph():
                 hw = tag_for(u, v)
                 G.add_edge(u, v, length=length, highway=hw)
                 G.add_edge(v, u, length=length, highway=hw)
-        connect_layer(i+1)
 
-
-    connect_layer(0)
-
+    # apply whatever congestion model you have
     apply_congestion_model(G)
     return G
+
+
+# @timeit
+# def estimate_returns(
+#     env: TaxiEnv,
+#     params,
+#     model: nn.Module,
+#     obs_fn_batch: Callable[[TaxiState], Dict[str, jnp.ndarray]],
+#     init_env_fn: Callable[[jnp.ndarray, jnp.ndarray], Tuple[TaxiState, jnp.ndarray]],
+#     starts: jnp.ndarray,
+#     pickups: jnp.ndarray,
+#     rollout_steps: int = 10,
+#     gamma: float = 0.99
+# ) -> jnp.ndarray:
+#     N = starts.shape[0]
+
+#     # tile out all start–pickup pairs
+#     grid_s, grid_p = jnp.meshgrid(starts, pickups, indexing="ij")
+#     s_rep = grid_s.ravel()
+#     p_rep = grid_p.ravel()
+
+#     # initialize those N*N envs
+#     states, _ = init_env_fn(s_rep, p_rep)
+
+#     # we'll keep ep in the carry so we can still debug-print it
+#     acc_init = jnp.zeros(states.current_node.shape[0])
+#     carry_init = (states, acc_init)
+
+#     def body(carry, t, discount):
+#         st, acc = carry
+#         obs = obs_fn_batch(st)
+#         q   = model.apply(params,
+#                           obs['state_feats'],
+#                           obs['action_feats'],
+#                           st.neighbor_mask,
+#                           obs['global_feats'])
+#         act = jnp.argmax(q, axis=-1)
+#         nxt, r, _, _ = env.step(st, act)
+
+#         new_acc = acc + discount * r
+#         # carry (nxt state, accumulated return, ep stays the same)
+#         return (nxt, new_acc), None
+
+#     # run the scan: scan(fun, init_carry, xs)
+#     discounts = gamma ** jnp.arange(rollout_steps)
+#     (final_state, total_ret) , _ = jax.lax.scan(
+#         lambda carry, t_and_d: body(carry, *t_and_d),
+#         carry_init,
+#         (jnp.arange(rollout_steps), discounts)
+#     )
+#     return total_ret.reshape((N, N))
+
+# estimate_returns_jit = jax.jit(
+#     estimate_returns,
+#     static_argnums=(    # env
+#                     2, 3, 4, # model, obs_fn_batch, init_env_fn
+#                     7, 8)    # rollout_steps, gamma
+#     )
+
+@struct.dataclass
+class EstimateReturnsState:
+    """Pre-computed arrays to avoid recreation"""
+    discounts: jnp.ndarray
+    
+    @classmethod
+    def create(cls, rollout_steps: int, gamma: float):
+        return cls(discounts=gamma ** jnp.arange(rollout_steps))
+
+# @timeit
+def estimate_returns(
+    env: TaxiEnv,
+    params,
+    model: nn.Module,
+    obs_fn_batch: Callable,
+    init_env_fn: Callable,
+    starts: jnp.ndarray,
+    pickups: jnp.ndarray,
+    estimate_state: EstimateReturnsState,  # Pre-computed arrays
+    rollout_steps: int = 10,
+) -> jnp.ndarray:
+    N = starts.shape[0]
+    
+    # Use pre-computed discounts
+    discounts = estimate_state.discounts
+    
+    # Rest of the function remains the same...
+    grid_s, grid_p = jnp.meshgrid(starts, pickups, indexing="ij")
+    s_rep = grid_s.ravel()
+    p_rep = grid_p.ravel()
+    
+    states, _ = init_env_fn(s_rep, p_rep)
+    acc_init = jnp.zeros(states.current_node.shape[0])
+    carry_init = (states, acc_init)
+    
+    def body(carry, t_and_discount):
+        t, discount = t_and_discount
+        st, acc = carry
+        obs = obs_fn_batch(st)
+        q = model.apply(params, obs['state_feats'], obs['action_feats'], 
+                       st.neighbor_mask, obs['global_feats'])
+        act = jnp.argmax(q, axis=-1)
+        nxt, r, _, _ = env.step(st, act)
+        new_acc = acc + discount * r
+        return (nxt, new_acc), None
+    
+    (final_state, total_ret), _ = jax.lax.scan(
+        body,
+        carry_init,
+        (jnp.arange(rollout_steps), discounts)
+    )
+    return total_ret.reshape((N, N))
+
+# JIT with fixed static args
+estimate_returns_jit = jax.jit(
+    estimate_returns,
+    static_argnums=(2, 3, 4, 8)  # model, obs_fn_batch, init_env_fn, rollout_steps
+)

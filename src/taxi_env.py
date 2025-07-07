@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import jax.random as jrandom  
 import equinox as eqx
 from typing import NamedTuple, Sequence, Tuple, Dict
+import gymnasium as gym
 
 # ----- State -----
 class TaxiState(NamedTuple):
@@ -13,40 +14,84 @@ class TaxiState(NamedTuple):
     neighbor_mask: jnp.ndarray     # shape [max_deg]
     time:          float     # global clock in seconds         # global clock
 
+
+class MultiTaxiEnv:
+    def __init__(self, n_agents, env_kwargs):
+        self.n = n_agents
+        self.envs = [TaxiEnv(**env_kwargs) for _ in range(n_agents)]
+        self.observation_space = gym.spaces.Tuple([e.observation_space for e in self.envs])
+        self.action_space = gym.spaces.Tuple([e.action_space for e in self.envs])
+
+    def reset(self):
+        states = [e.reset() for e in self.envs]
+        return jnp.stack(states)
+
+    def step(self, actions):
+        next_states, rewards, dones, infos = [], [], [], []
+        for e, a in zip(self.envs, actions):
+            s2, r, d, i = e.step(a)
+            next_states.append(s2)
+            rewards.append(r)
+            dones.append(d)
+            infos.append(i)
+        return jnp.stack(next_states), jnp.array(rewards), jnp.array(dones), infos
+
 # ----- Reset / Init -----
+# @jax.jit
+# def init_env(
+#     rng_key,
+#     fixed_starts: Sequence[int],
+#     fixed_pickups: Sequence[int],
+#     neighbor_mask_static: jnp.ndarray,
+# ) -> Tuple[TaxiState, jnp.ndarray]:
+#     # sample a start and pickup
+#     starts = jnp.asarray(fixed_starts, dtype=jnp.int32)
+#     pickups = jnp.asarray(fixed_pickups, dtype=jnp.int32)
+#     k1, k2, new_key = jrandom.split(rng_key, 3)
+#     taxi_idx = jrandom.randint(k1, (), 0, starts.shape[0])
+#     pickup_idx = jrandom.randint(k2, (), 0, pickups.shape[0])
+#     curr = starts[taxi_idx]
+#     pickup = pickups[pickup_idx]
+#     nm = neighbor_mask_static[curr]
+#     done = jnp.where(curr == pickup, True, False)
+
+#     # initial time & empty queues
+#     time0 = jnp.array(0.0, dtype=jnp.float32)
+
+#     state = TaxiState(
+#         current_node=curr,
+#         pickup_node=pickup,
+#         done=done,
+#         step_count=jnp.int32(0),
+#         neighbor_mask=nm,
+#         time=time0
+#     )
+#     return state, new_key
+
 @jax.jit
 def init_env(
-    rng_key,
-    fixed_starts: Sequence[int],
-    fixed_pickups: Sequence[int],
-    neighbor_mask_static: jnp.ndarray,
-) -> Tuple[TaxiState, jnp.ndarray]:
-    # sample a start and pickup
-    starts = jnp.asarray(fixed_starts, dtype=jnp.int32)
-    pickups = jnp.asarray(fixed_pickups, dtype=jnp.int32)
-    k1, k2, new_key = jrandom.split(rng_key, 3)
-    taxi_idx = jrandom.randint(k1, (), 0, starts.shape[0])
-    pickup_idx = jrandom.randint(k2, (), 0, pickups.shape[0])
-    curr = starts[taxi_idx]
-    pickup = pickups[pickup_idx]
-    nm = neighbor_mask_static[curr]
-    done = jnp.where(curr == pickup, True, False)
+    rng_key, 
+    start_idx: int, 
+    pickup_idx: int,
+    neighbor_mask_static: jnp.ndarray 
+    ) -> Tuple[TaxiState, jnp.ndarray]:
+    """Initialize the Taxi environment state. using ot-matched start and pickup indices."""
 
-    # initial time & empty queues
-    time0 = jnp.array(0.0, dtype=jnp.float32)
-
+    nm = neighbor_mask_static[start_idx]
+    done = (start_idx == pickup_idx)
     state = TaxiState(
-        current_node=curr,
-        pickup_node=pickup,
-        done=done,
-        step_count=jnp.int32(0),
-        neighbor_mask=nm,
-        time=time0
+       current_node=jnp.int32(start_idx),
+       pickup_node=jnp.int32(pickup_idx),
+       done=done,
+       step_count=jnp.int32(0),
+       neighbor_mask=nm,
+       time=jnp.array(0.0, dtype=jnp.float32)
     )
-    return state, new_key
+    # no new random key needed (we’re driving it from outside)
+    return state, rng_key
 
 # ----- Environment -----
-class JAXRideEnv(eqx.Module):
+class TaxiEnv(eqx.Module):
     # Graph and base dynamics
     adj_list: jnp.ndarray         # [num_nodes, max_deg]
     travel_times: jnp.ndarray     # [num_nodes, max_deg]
@@ -119,8 +164,8 @@ class JAXRideEnv(eqx.Module):
         self.green_durations = zeros.at[nodes].set(green_vals)
         self.offsets = zeros.at[nodes].set(offset_vals)
 
-        # global traffic params shape [3, num_nodes] (green/period rate, is green, time to next switch)
-        self.global_state_dim = 3 * self.num_nodes
+        # global traffic params shape [num_nodes, 3] (green/period rate, is green, time to next switch)
+        self.global_state_dim = 3 * self.num_nodes  # [N,3] -> [3*N]
 
         # runtime sanity checks
         assert self.periods.shape[0] == self.num_nodes, (
@@ -139,9 +184,13 @@ class JAXRideEnv(eqx.Module):
     @jax.jit
     def reset(self, rng_key) -> Tuple[TaxiState, jnp.ndarray]:
         # resets global time via init_env
+        key1, subkey = jrandom.split(rng_key)
+        key2, rng_key = jrandom.split(subkey)
+        start = jrandom.choice(key1, self.fixed_starts)
+        pickup = jrandom.choice(key2, self.fixed_pickups)
         return init_env(rng_key,
-                        self.fixed_starts,
-                        self.fixed_pickups,
+                        start,
+                        pickup,
                         self.neighbor_mask_static)
 
     @jax.jit
@@ -165,6 +214,7 @@ class JAXRideEnv(eqx.Module):
         cycle    = (t1 + self.offsets[nxt]) % self.periods[nxt]
         wait     = jnp.where(cycle < self.green_durations[nxt], 0.0, self.periods[nxt] - cycle)
         t2       = t1 + wait
+        norm_time = t2 / 600.0
 
         total_delay = travel + wait
         dist_c = self.distances[curr, state.pickup_node]
@@ -182,6 +232,33 @@ class JAXRideEnv(eqx.Module):
         #     jax.debug.print("0: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
         #             step_n[0], done[0], curr[0], nxt[0], state.pickup_node[0], action[0],
         #             travel[0]/60.0, wait[0]/60.0, shaping[0], reward[0])
+        #     jax.debug.print("1: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[1], done[1], curr[1], nxt[1], state.pickup_node[1], action[1],
+        #             travel[1]/60.0, wait[1]/60.0, shaping[1], reward[1])
+        #     jax.debug.print("2: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[2], done[2], curr[2], nxt[2], state.pickup_node[2], action[2],
+        #             travel[2]/60.0, wait[2]/60.0, shaping[2], reward[2])
+        #     jax.debug.print("3: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[3], done[3], curr[3], nxt[3], state.pickup_node[3], action[3],
+        #             travel[3]/60.0, wait[3]/60.0, shaping[3], reward[3])
+        #     jax.debug.print("4: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[4], done[4], curr[4], nxt[4], state.pickup_node[4], action[4],
+        #             travel[4]/60.0, wait[4]/60.0, shaping[4], reward[4])
+        #     jax.debug.print("5: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[5], done[5], curr[5], nxt[5], state.pickup_node[5], action[5],
+        #             travel[5]/60.0, wait[5]/60.0, shaping[5], reward[5])
+        #     jax.debug.print("6: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[6], done[6], curr[6], nxt[6], state.pickup_node[6], action[6],
+        #             travel[6]/60.0, wait[6]/60.0, shaping[6], reward[6])
+        #     jax.debug.print("7: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[7], done[7], curr[7], nxt[7], state.pickup_node[7], action[7],
+        #             travel[7]/60.0, wait[7]/60.0, shaping[7], reward[7])
+        #     jax.debug.print("8: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[8], done[8], curr[8], nxt[8], state.pickup_node[8], action[8],
+        #             travel[8]/60.0, wait[8]/60.0, shaping[8], reward[8])
+        #     jax.debug.print("9: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
+        #             step_n[9], done[9], curr[9], nxt[9], state.pickup_node[9], action[9],
+        #             travel[9]/60.0, wait[9]/60.0, shaping[9], reward[9])
             
         # 7) New neighbor mask
         nm = self.neighbor_mask_static[nxt]
@@ -193,6 +270,6 @@ class JAXRideEnv(eqx.Module):
             done=done,
             step_count=jnp.where(done, jnp.int32(0), step_n),
             neighbor_mask=nm,
-            time=t2,
+            time=norm_time,
         )
         return new_state, reward, reach, {"wait": wait, "travel": travel}

@@ -1,5 +1,5 @@
 import pickle
-import time
+from timing_decorator import timeit
 from typing import NamedTuple, Callable, Sequence, Dict, Tuple
 import numpy as np
 
@@ -9,239 +9,188 @@ import jax.random as random
 from jax import lax, tree_util
 import optax
 from flax import linen as nn
-from flax.training import checkpoints
+from flax import struct
 from flax.core.frozen_dict import freeze, unfreeze
 from functools import partial
 
-from taxi_env import init_env, TaxiState, JAXRideEnv
+from taxi_env import init_env, TaxiState, TaxiEnv
 from visualization_utils import TrainingLogger
+from utils import estimate_returns_jit, EstimateReturnsState
+from ot import emd
+from scipy.optimize import linear_sum_assignment
 
-class QNetwork(nn.Module):
-    ctx_dim: int
-    node_hidden: int = 64
-    pool: str = "mean"
-    num_actions: int = None # max degree of the graph
-
-    def setup(self):
-        # Encoders for state and action features
-        self.state_enc  = nn.Dense(self.ctx_dim)
-        self.action_enc = nn.Dense(self.ctx_dim)
-        # Shared MLP to embed individual nodes (actions)
-        self.node_enc = nn.Sequential([
-            nn.Dense(self.node_hidden),
-            nn.relu,
-            nn.Dense(self.node_hidden),
-            nn.relu,
-        ])
-        # Projection from pooled node embeddings to global context dimension
-        self.global_proj = nn.Dense(self.ctx_dim)
-        # Untied heads: one weight vector and bias per action
-        self.q_head_w = self.param(
-            'q_head_w',
-            nn.initializers.lecun_normal(),
-            (self.num_actions, self.ctx_dim)
-        )
-        self.q_head_b = self.param(
-            'q_head_b',
-            nn.initializers.zeros,
-            (self.num_actions,)
-        )
-
-    def __call__(self, s_feats, a_feats, mask, g_feats=None):
-        """
-        Args:
-            s_feats: [B, state_feat_dim]  State feature vectors
-            a_feats: [B, max_deg, action_feat_dim]  Action feature vectors per slot
-            mask:    [B, max_deg] boolean mask of valid actions
-            g_feats: (unused) Optional global features
-        Returns:
-            q: [B, max_deg]  Q-values per action slot
-        """
-        # Encode state and actions
-        s_ctx = self.state_enc(s_feats)                   # [B, ctx_dim]
-        a_ctx = self.action_enc(a_feats)                  # [B, max_deg, ctx_dim]
-
-        # Embed nodes via shared MLP
-        B, max_deg, _ = a_feats.shape
-        flat_a = a_feats.reshape(B * max_deg, -1)
-        node_emb = self.node_enc(flat_a)                  # [B*max_deg, node_hidden]
-        node_emb = node_emb.reshape(B, max_deg, self.node_hidden)
-
-        # Pool across nodes
-        if self.pool == "mean":
-            pooled = node_emb.mean(axis=1)                # [B, node_hidden]
-        elif self.pool == "max":
-            pooled = node_emb.max(axis=1)                 # [B, node_hidden]
-        else:
-            raise ValueError(f"Unknown pool type: {self.pool}")
-
-        # Global context projection
-        g_ctx = self.global_proj(pooled)                  # [B, ctx_dim]
-        g_ctx = jnp.expand_dims(g_ctx, axis=1)            # [B, 1, ctx_dim]
-
-        # Combine contexts and nonlinearity
-        x = s_ctx[:, None, :] + a_ctx + g_ctx             # [B, max_deg, ctx_dim]
-        x = nn.relu(x)                                    # [B, max_deg, ctx_dim]
-
-        # Compute untied Q-heads (one per action index)
-        q_raw = jnp.einsum('bkc,kc->bk', x, self.q_head_w) + self.q_head_b  # [B, max_deg]
-
-        # Mask invalid actions
-        q = jnp.where(mask, q_raw, -1e9)
-        return q
-
+from models.q_network import adapt_pretrained_zeroinit, mask_grads
+from models.q_network import QNetwork
     
 
+@struct.dataclass
 class ReplayBuffer:
-    def __init__(self, max_size, state_dim, max_deg, action_dim, global_dim):
-        self.max_size = max_size
-        self.ptr = 0
-        self.size = 0
-        # preallocate host (numpy) arrays
-        self.sf   = np.zeros((max_size, state_dim),       dtype=np.float32)
-        self.af   = np.zeros((max_size, max_deg, action_dim), dtype=np.float32)
-        self.mask = np.zeros((max_size, max_deg),           dtype=bool)
-        self.gf   = np.zeros((max_size, global_dim),      dtype=np.float32)
-        self.act  = np.zeros((max_size,), dtype=np.int32)
-        self.rew  = np.zeros((max_size,), dtype=np.float32)
-        self.sf2   = np.zeros((max_size, state_dim),       dtype=np.float32)
-        self.af2   = np.zeros((max_size, max_deg, action_dim), dtype=np.float32)
-        self.mask2 = np.zeros((max_size, max_deg),           dtype=bool)
-        self.gf2   = np.zeros((max_size, global_dim),      dtype=np.float32)
-        self.done = np.zeros((max_size,), dtype=np.float32)
+    """
+    JAX-compatible, fully jit-compiled replay buffer.
 
-    def add(self, sf, af, mask, gf, act, rew, sf2, af2, mask2, gf2, done):
-        i = self.ptr
-        self.sf[i]   = np.asarray(sf)
-        self.af[i]   = np.asarray(af)
-        self.mask[i] = np.asarray(mask)
-        self.gf[i]   = np.asarray(gf)
-        self.act[i]  = int(act)
-        self.rew[i]  = float(rew)
-        self.sf2[i]   = np.asarray(sf2)
-        self.af2[i]   = np.asarray(af2)
-        self.mask2[i] = np.asarray(mask2)
-        self.gf2[i]   = np.asarray(gf2)
-        self.done[i]  = float(done)
+    Usage:
+        buffer = ReplayBuffer.create(max_size, state_dim, max_deg, action_dim, global_dim)
+        buffer = buffer.add(sf, af, mask, gf, act, rew, sf2, af2, mask2, gf2, done)
+        batch = buffer.sample(key, batch_size)
+    """
+    max_size: int
+    ptr: int
+    size: int
+    sf: jnp.ndarray
+    af: jnp.ndarray
+    mask: jnp.ndarray
+    gf: jnp.ndarray
+    act: jnp.ndarray
+    rew: jnp.ndarray
+    sf2: jnp.ndarray
+    af2: jnp.ndarray
+    mask2: jnp.ndarray
+    gf2: jnp.ndarray
+    done: jnp.ndarray
 
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-
-    def sample(self, batch_size):
-        idx = np.random.choice(self.size, batch_size, replace=False)
-        return dict(
-            sf   = jnp.array(self.sf  [idx]),
-            af   = jnp.array(self.af  [idx]),
-            mask = jnp.array(self.mask[idx]),
-            gf   = jnp.array(self.gf  [idx]),
-            act  = jnp.array(self.act [idx]),
-            rew  = jnp.array(self.rew [idx]),
-            sf2   = jnp.array(self.sf2  [idx]),
-            af2   = jnp.array(self.af2  [idx]),
-            mask2 = jnp.array(self.mask2[idx]),
-            gf2   = jnp.array(self.gf2  [idx]),
-            done  = jnp.array(self.done[idx]),
+    @classmethod
+    def create(
+        cls,
+        max_size: int,
+        state_dim: int,
+        max_deg: int,
+        action_dim: int,
+        global_dim: int
+    ):  # -> ReplayBuffer
+        return cls(
+            max_size=max_size,
+            ptr=0,
+            size=0,
+            sf=jnp.zeros((max_size, state_dim), jnp.float32),
+            af=jnp.zeros((max_size, max_deg, action_dim), jnp.float32),
+            mask=jnp.zeros((max_size, max_deg), jnp.bool_),
+            gf=jnp.zeros((max_size, global_dim), jnp.float32),
+            act=jnp.zeros((max_size,), jnp.int32),
+            rew=jnp.zeros((max_size,), jnp.float32),
+            sf2=jnp.zeros((max_size, state_dim), jnp.float32),
+            af2=jnp.zeros((max_size, max_deg, action_dim), jnp.float32),
+            mask2=jnp.zeros((max_size, max_deg), jnp.bool_),
+            gf2=jnp.zeros((max_size, global_dim), jnp.float32),
+            done=jnp.zeros((max_size,), jnp.float32),
+        )
+    
+    @jax.jit
+    def add_batch(
+        self,
+        sf_batch: jnp.ndarray,      # [N, D_state]
+        af_batch: jnp.ndarray,      # [N, max_deg, D_action]
+        mask_batch: jnp.ndarray,    # [N, max_deg]
+        gf_batch: jnp.ndarray,      # [N, D_global]
+        act_batch: jnp.ndarray,     # [N]
+        rew_batch: jnp.ndarray,     # [N]
+        sf2_batch: jnp.ndarray,     # [N, D_state]
+        af2_batch: jnp.ndarray,     # [N, max_deg, D_action]
+        mask2_batch: jnp.ndarray,   # [N, max_deg]
+        gf2_batch: jnp.ndarray,     # [N, D_global]
+        done_batch: jnp.ndarray,    # [N]
+    ) -> "ReplayBuffer":
+        batch_size = sf_batch.shape[0]
+        
+        # Calculate indices for circular buffer
+        indices = (jnp.arange(batch_size) + self.ptr) % self.max_size
+        
+        # Update all arrays at once using advanced indexing
+        new_sf = self.sf.at[indices].set(sf_batch)
+        new_af = self.af.at[indices].set(af_batch)
+        new_mask = self.mask.at[indices].set(mask_batch)
+        new_gf = self.gf.at[indices].set(gf_batch)
+        new_act = self.act.at[indices].set(act_batch)
+        new_rew = self.rew.at[indices].set(rew_batch)
+        new_sf2 = self.sf2.at[indices].set(sf2_batch)
+        new_af2 = self.af2.at[indices].set(af2_batch)
+        new_mask2 = self.mask2.at[indices].set(mask2_batch)
+        new_gf2 = self.gf2.at[indices].set(gf2_batch)
+        new_done = self.done.at[indices].set(done_batch)
+        
+        # Update pointer and size
+        new_ptr = (self.ptr + batch_size) % self.max_size
+        new_size = jnp.minimum(self.size + batch_size, self.max_size)
+        
+        return self.replace(
+            ptr=new_ptr,
+            size=new_size,
+            sf=new_sf, af=new_af, mask=new_mask, gf=new_gf,
+            act=new_act, rew=new_rew,
+            sf2=new_sf2, af2=new_af2, mask2=new_mask2, gf2=new_gf2,
+            done=new_done,
         )
 
+    @jax.jit
+    def add(
+        self,
+        sf: jnp.ndarray,
+        af: jnp.ndarray,
+        mask: jnp.ndarray,
+        gf: jnp.ndarray,
+        act: jnp.ndarray,
+        rew: jnp.ndarray,
+        sf2: jnp.ndarray,
+        af2: jnp.ndarray,
+        mask2: jnp.ndarray,
+        gf2: jnp.ndarray,
+        done: jnp.ndarray,
+    ) -> "ReplayBuffer":
+        idx = self.ptr
+        # Insert new elements
+        new_sf    = self.sf.at[idx].set(sf)
+        new_af    = self.af.at[idx].set(af)
+        new_mask  = self.mask.at[idx].set(mask)
+        new_gf    = self.gf.at[idx].set(gf)
+        new_act   = self.act.at[idx].set(act)
+        new_rew   = self.rew.at[idx].set(rew)
+        new_sf2   = self.sf2.at[idx].set(sf2)
+        new_af2   = self.af2.at[idx].set(af2)
+        new_mask2 = self.mask2.at[idx].set(mask2)
+        new_gf2   = self.gf2.at[idx].set(gf2)
+        new_done  = self.done.at[idx].set(done)
+        # Update pointer and size
+        ptr = (idx + 1) % self.max_size
+        size = jnp.minimum(self.size + 1, self.max_size)
+        # Return new buffer state
+        return self.replace(
+            ptr=ptr,
+            size=size,
+            sf=new_sf,
+            af=new_af,
+            mask=new_mask,
+            gf=new_gf,
+            act=new_act,
+            rew=new_rew,
+            sf2=new_sf2,
+            af2=new_af2,
+            mask2=new_mask2,
+            gf2=new_gf2,
+            done=new_done,
+        )
 
-def adapt_pretrained_zeroinit(params, pretrained, init_params):
-    """
-    Copy over old weights, zero‑initialize extra rows when input dims have grown,
-    remapping pretrained Dense layers to the new network layout.
-    """
-    params = unfreeze(params)
-    pretrained = unfreeze(pretrained)
-    init_params = unfreeze(init_params)
+    @partial(jax.jit, static_argnums=(2,))
+    def sample_fixed(self, key: jnp.ndarray, batch_size: int) -> dict:
+        # Sample with replacement to avoid shape issues
+        indices = jax.random.randint(key, (batch_size,), 0, self.size)
+        
+        # Sample from each buffer component
+        batch_sample = {
+            'sf': self.sf[indices],
+            'af': self.af[indices],
+            'mask': self.mask[indices],
+            'gf': self.gf[indices],
+            'act': self.act[indices],
+            'rew': self.rew[indices],
+            'sf2': self.sf2[indices],
+            'af2': self.af2[indices],
+            'mask2': self.mask2[indices],
+            'gf2': self.gf2[indices],
+            'done': self.done[indices],
+        }
+        
+        return batch_sample
 
-    # --- Dense_0: state embedding ---
-    if 'Dense_0' in pretrained['params']:
-        ker_pre0 = pretrained['params']['Dense_0']['kernel']
-        bias_pre0 = pretrained['params']['Dense_0'].get('bias')
-        ker_init0 = init_params['params']['Dense_0']['kernel']
-        old_in0, dim_ctx = ker_pre0.shape
-        new_in0, _ = ker_init0.shape
-        if new_in0 > old_in0:
-            pad = jnp.zeros((new_in0 - old_in0, dim_ctx), dtype=ker_pre0.dtype)
-            new_ker0 = jnp.vstack([ker_pre0, pad])
-        else:
-            new_ker0 = ker_pre0[:new_in0]
-        params['params']['Dense_0']['kernel'] = new_ker0
-        if bias_pre0 is not None:
-            params['params']['Dense_0']['bias'] = bias_pre0
-
-    # --- Dense_2: action embedding (from pretrained Dense_1) ---
-    if 'Dense_1' in pretrained['params'] and 'Dense_2' in init_params['params']:
-        ker_pre1 = pretrained['params']['Dense_1']['kernel']
-        bias_pre1 = pretrained['params']['Dense_1'].get('bias')
-        ker_init2 = init_params['params']['Dense_2']['kernel']
-        old_in1, out = ker_pre1.shape
-        new_in1, _ = ker_init2.shape
-        if new_in1 > old_in1:
-            pad = jnp.zeros((new_in1 - old_in1, out), dtype=ker_pre1.dtype)
-            new_ker1 = jnp.vstack([ker_pre1, pad])
-        else:
-            new_ker1 = ker_pre1[:new_in1]
-        params['params']['Dense_2']['kernel'] = new_ker1
-        if bias_pre1 is not None:
-            params['params']['Dense_2']['bias'] = bias_pre1
-
-    # --- Dense_3: final output layer (from pretrained Dense_2) ---
-    if 'Dense_2' in pretrained['params'] and 'Dense_3' in init_params['params']:
-        ker_pre2 = pretrained['params']['Dense_2']['kernel']
-        bias_pre2 = pretrained['params']['Dense_2'].get('bias')
-        ker_init3 = init_params['params']['Dense_3']['kernel']
-        # ensure shape match
-        if ker_pre2.shape == ker_init3.shape:
-            params['params']['Dense_3']['kernel'] = ker_pre2
-            if bias_pre2 is not None:
-                params['params']['Dense_3']['bias'] = bias_pre2
-
-    return freeze(params)
-
-
-def mask_grads(grads, freeze_layers):
-    """
-    Zero out gradients for specified Dense layers, 
-    but for Dense_1 only freeze the pretrained rows.
-    """
-    grads = unfreeze(grads)
-    for layer in freeze_layers:
-        if layer not in grads['params']:
-            continue
-
-        # for Dense_1: only freeze the old rows
-        if layer == 'Dense_1':
-            ker = grads['params'][layer]['kernel']   # shape [new_in1, out]
-            n_rows, n_out = ker.shape
-
-            # assume exactly 1 “new” row was added at the bottom
-            n_pretrained = n_rows - 1
-            # build a mask: zeros for pretrained rows, ones for the new row
-            mask_kernel = jnp.vstack([
-                jnp.zeros((n_pretrained, n_out), dtype=ker.dtype),
-                jnp.ones ((1,          n_out), dtype=ker.dtype),
-            ])
-
-            # apply mask to kernel grads
-            grads['params'][layer]['kernel'] = ker * mask_kernel
-
-            # continue to freeze the bias entirely (no new bias entries)
-            if 'bias' in grads['params'][layer]:
-                grads['params'][layer]['bias'] = jnp.zeros_like(
-                    grads['params'][layer]['bias']
-                )
-
-        # --- DEFAULT: freeze entire layer ---
-        else:
-            grads['params'][layer] = {
-                name: jnp.zeros_like(val)
-                for name, val in grads['params'][layer].items()
-            }
-
-    return freeze(grads)
-
-
-# --- Batch definition ---
+# --- Batch definition: trajectories of N agents ---
 class Batch(NamedTuple):
     state: TaxiState        # [T, B]
     action: jnp.ndarray     # [T, B]
@@ -252,15 +201,38 @@ class Batch(NamedTuple):
     wait: jnp.ndarray       # [T, B]
     travel: jnp.ndarray     # [T, B]
 
+def emd_assignment_optimized(R_jax, B):
+    """
+    Optimized EMD assignment with minimal conversions
+    """
+    # Single conversion to NumPy for EMD computation
+    R_np = np.asarray(R_jax)
+    
+    # Prepare EMD inputs (NumPy)
+    a = np.ones(B) / B  # uniform distribution over sources
+    b = np.ones(B) / B  # uniform distribution over targets
+    M = -R_np  # cost matrix (negative rewards)
+    
+    # Compute EMD transport plan
+    F = emd(a, b, M, numItermax=1000)
+    
+    # Extract assignment from transport plan
+    col_idx = np.argmax(F, axis=1)
+    
+    # Single conversion back to JAX
+    return jnp.array(col_idx)
+
 
 # --- Training loop ---
 def train(
-    env: JAXRideEnv,
+    env: TaxiEnv,
     init_state_fn: Callable[[], TaxiState],
     obs_fn_batch: Callable[[TaxiState], Dict[str, jnp.ndarray]],
     key: jnp.ndarray,
     fixed_starts: Sequence[int],
     fixed_pickups: Sequence[int],
+    estimate_state: EstimateReturnsState,
+    # init_states: TaxiState = None,
     pretrain_ckpt: str = None,
     num_steps: int = 128,
     epochs: int = 20,
@@ -275,34 +247,56 @@ def train(
     # --- State reset helper ---
     # Precompile a batched init to reset B environments in one go
     neighbor_mask_static = env.neighbor_mask_static 
-    batched_init = jax.jit(
-            jax.vmap(
+    batched_init = jax.vmap(
                 partial(init_env, neighbor_mask_static=neighbor_mask_static),
-                in_axes=(0, None, None),
+                in_axes=(0, 0, 0),     # split keys, start_idxs, pickup_idxs
                 out_axes=(0, 0),
             )
-        )
+    
+    def make_init_env_fn(batched_init, base_key):
+        """Factory function that pre-splits keys"""
+        def init_env_fn(starts: jnp.ndarray, pickups: jnp.ndarray):
+            # Use a deterministic key split based on input size
+            num_envs = starts.shape[0]
+            rng_keys = jax.random.split(base_key, num_envs)
+            return batched_init(rng_keys, starts, pickups)
+        return init_env_fn
+
+    # Create once outside training loop
+    base_key = jax.random.PRNGKey(42)
+    init_env_fn = make_init_env_fn(batched_init, base_key)
+
     @jax.jit
+    # @timeit
     def maybe_reset(
         state: TaxiState,
         key: jnp.ndarray,
-        fixed_starts: jnp.ndarray,
-        fixed_pickups: jnp.ndarray
+        init_state: TaxiState = None
     ) -> Tuple[TaxiState, jnp.ndarray]:
         """
         Vectorized reset: for each instance in the batch, if state.done is True,
         replace it with a freshly initialized state, otherwise keep the existing one.
         Returns the new batch-state and an updated PRNGKey.
         """
-        B = state.current_node.shape[0]
+        B = state.current_node.shape[0]     # num_agents
         keys = random.split(key, B + 1)
         new_key, subkeys = keys[0], keys[1:]
 
         # Batch-init B new states (states and new keys)
-        resets, _ = batched_init(
-            subkeys,
-            fixed_starts,
-            fixed_pickups
+        def do_reset(_):
+            resets, _ = batched_init(
+                subkeys,
+                init_state.current_node,
+                init_state.pickup_node
+            )
+            return resets
+        
+        use_init = init_state is not None
+        resets  = jax.lax.cond(
+            use_init,
+            do_reset,
+            lambda _: state,  # identity case
+            operand=None
         )
 
         # Helper that broadcasts `state.done` to match old/new shapes
@@ -322,24 +316,27 @@ def train(
         )
         return new_state, new_key
     
+
+    
     # --- Rollout function ---
     def get_batched_rollout_q(
         model: nn.Module,
         obs_fn_batch: Callable[[TaxiState], Dict[str, jnp.ndarray]],
-        fixed_starts: jnp.ndarray,
-        fixed_pickups: jnp.ndarray,
         *, num_steps: int = 128
     ):
         @jax.jit
-        def rollout(env: JAXRideEnv,
+        # @timeit
+        def rollout(env: TaxiEnv,
                     init_states: TaxiState,
                     key: jnp.ndarray,
                     params: dict,
                     epsilon: float
                 ):
             keys = random.split(key, num_steps + 1)
+            carry0 = (init_states, init_states)
 
-            def step_fn(state: TaxiState, k):
+            def step_fn(carry: Tuple[TaxiState, TaxiState], k):
+                state, orig_states = carry
                 k1, k2, k3 = random.split(k, 3)
                 # Compute obs
                 obs = obs_fn_batch(state)
@@ -366,10 +363,11 @@ def train(
                 travel = info['travel']           # [B]
                 done = next_s.done
                 # reset finished
-                next_s, _ = maybe_reset(next_s, k3, fixed_starts, fixed_pickups)
-                return next_s, (state, action, rew, next_s, done, pickup, wait, travel)
+                next_s, _ = maybe_reset(next_s, k3, orig_states)
+                new_carry = (next_s, orig_states)
+                return new_carry, (state, action, rew, next_s, done, pickup, wait, travel)
 
-            final_state, traj = jax.lax.scan(step_fn, init_states, keys)
+            (final_state, _), traj = jax.lax.scan(step_fn, carry0, keys)
             s, a, r, s2, d, p, waits, travels = traj
             batch = Batch(s, a, r, s2, d, p, waits, travels)
             return batch, final_state
@@ -381,13 +379,10 @@ def train(
     max_deg = env.max_deg
     global_dim = env.global_state_dim
     freeze_epochs = 0.1 * epochs if pretrain_ckpt is not None else 0
-    # D_state = 2(curr_xy)+2(pick_xy)+2(delta_xy) = 6
-    D_state  = 6
-    # D_action = 2 (travel_time, wait_time)
-    D_action = 2
-    # D_global = 64
-    # model = QNetwork(dim_ctx=128, dim_action=D_action, dim_global=D_global)
-    # model = QNetwork(ctx_dim=128, node_hidden=64, pool="mean")
+    
+    D_state  = 6        # 2(curr_xy)+2(pick_xy)+2(delta_xy)
+    D_action = 2        # (travel_time, wait_time)
+    
     model = QNetwork(ctx_dim=128, node_hidden=64, pool="mean", num_actions=max_deg)
 
     dummy_sf   = jnp.zeros((1, D_state), dtype=jnp.float32)
@@ -413,12 +408,7 @@ def train(
     opt_state = opt.init(params)
 
 
-    # For percentage of pickups
-    # pickup_count = 0
-    # done_count = 0
-
     rollout = get_batched_rollout_q(model, obs_fn_batch,
-                                    jnp.array(fixed_starts), jnp.array(fixed_pickups),
                                     num_steps=num_steps)
     
     # Set up logger and fixed validation batch
@@ -441,6 +431,8 @@ def train(
     q_stabilities = []
     q_prev_val = None
 
+    @partial(jax.jit, static_argnames=('freeze_mask',))
+    # @timeit
     def train_step(params, target_params, opt_state,
                    sf, af, mask, gf,
                    act, rew, sf2, af2, mask2, gf2, 
@@ -468,9 +460,9 @@ def train(
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss
     
-    train_step = jax.jit(train_step, static_argnames=('freeze_mask',))
+    # train_step = jax.jit(train_step, static_argnames=('freeze_mask',))
 
-    buffer = ReplayBuffer(
+    buffer = ReplayBuffer.create(
         max_size=100_000,
         state_dim=D_state,
         max_deg=max_deg,
@@ -481,8 +473,6 @@ def train(
     # Training epochs
     states = init_state_fn()
     for ep in range(1, epochs+1):
-        freeze_mask = (ep <= freeze_epochs)
-        # t0 = time.time()
         eps = epsilon_start + (epsilon_end - epsilon_start) * (ep/epochs)
         key, subkey = random.split(key)
         batch, states = rollout(env, states, subkey, params, eps)
@@ -516,32 +506,28 @@ def train(
         gf2 = gf2.reshape((N, global_dim))
         done = batch.done.reshape((N,))
         waits   = batch.wait.reshape((T * B,)).tolist()
+
         # Removed unused variable "travels"
         logger.log(float(jnp.sum(rew)), waits)
 
         # Clone params before epoch updates
         params_before = params
 
-        sf_np, af_np, mask_np, gf_np = map(np.asarray, (sf, af, mask, gf))
-        act_np, rew_np      = map(np.asarray, (act, rew))
-        sf2_np, af2_np, mask2_np, gf2_np = map(np.asarray, (sf2, af2, mask2, gf2))
-        done_np = np.asarray(done)
-
-        for i in range(sf_np.shape[0]):
-            buffer.add(
-                sf_np[i],  af_np[i],  mask_np[i],  gf_np[i],
-                act_np[i], rew_np[i],
-                sf2_np[i], af2_np[i], mask2_np[i], gf2_np[i],
-                done_np[i]
-            )
+        buffer = buffer.add_batch(
+            sf, af, mask, gf,        # Keep as JAX arrays
+            act, rew,
+            sf2, af2, mask2, gf2,
+            done
+        )
 
         # — sample & train from buffer —
         if buffer.size >= batch_size:
-            for _ in range(4):   # you can increase this to e.g. 4 updates per rollout
-                batch_sample = buffer.sample(batch_size)
+            for _ in range(4):
+                key, subkey = jax.random.split(key)
+                batch_sample = buffer.sample_fixed(subkey, batch_size)  # Returns JAX arrays
                 params, opt_state, loss = train_step(
                     params, target_params, opt_state,
-                    **batch_sample,
+                    **batch_sample,  # No conversion needed
                     freeze_mask=(ep <= freeze_epochs)
                 )
                 # Update target network parameters via Polyak averaging 
@@ -581,25 +567,58 @@ def train(
             q_stabilities=q_stabilities
         )
 
-        # # Count pickups
-        # per_env_picked  = jnp.any(batch.pickup,  axis=0)
-        # per_env_done = jnp.any(batch.done, axis=0)
-        # n_picked  = int(jnp.sum(per_env_picked))
-        # n_done   = int(jnp.sum(per_env_done))
-        # pickup_count  += n_picked
-        # done_count   += n_done
+        # --- OT assignment ---
+        # split one key for sampling
+        key, subkey = random.split(key)
+        # generate 2*num_agents subkeys
+        all_subkeys = random.split(subkey, 2 * B)
+        start_keys, pickup_keys = jnp.split(all_subkeys, 2)
 
-        # pickup_rate = 100.0 * pickup_count / done_count
-        # epoch_rate = n_picked / n_done
+        # sample uniformly from the pool
+        new_starts  = jnp.array([random.choice(k, fixed_starts, ())
+                                for k in start_keys])    # shape [B]
+        new_pickups = jnp.array([random.choice(k, fixed_pickups, ())
+                         for k in pickup_keys])   # shape [B]
 
-        # dt = time.time() - t0
-        # print(f"Ep {ep}/{epochs} loss={loss:.4f} t={dt:.2f}s - Pickup Rate: {pickup_rate:.2f}% - Epoch Rate: {epoch_rate:.2f}%")
+        R = estimate_returns_jit(
+            env,
+            params,
+            model,
+            obs_fn_batch,
+            init_env_fn,
+            new_starts,
+            new_pickups,
+            estimate_state,
+            rollout_steps=10
+        )
+        # Assign new starts and pickups to the batch using optimal transport
+        # a = np.ones((B,)) / B  # uniform distribution over starts
+        # b = np.ones((B,)) / B  # uniform distribution over pickups    
+        # M = -np.asarray(R)
 
-    logger.save_plots(out_dir="plots/1layer_paramtuning")   # writes reward_per_episode.png and avg_wait_per_episode.png
+        # F = emd(a, b, M, numItermax=1000)
+        # col_idx = np.argmax(F, axis=1)
+        # _, col_idx = linear_sum_assignment(-R)
+        col_idx = emd_assignment_optimized(R, B)
+        # col_idx is a 1D array of indices that maps each start to a pickup
+        pickups = new_pickups[col_idx]
+        # jax.debug.print("Epoch {}: new starts={}, new_pickups={}, pickups={}", ep, new_starts, new_pickups, pickups)
+
+
+        # Assign new starts and pickups to the batch
+        states, _ = batched_init(start_keys, new_starts, pickups)
+
+        # if ep > 19000:
+        #     jax.debug.print("Epoch {}: new starts={}, pickups={}", ep, new_starts, pickups)
+        if ep % 100 == 0:
+            jax.clear_caches()
+
+    logger.save_plots(out_dir="plots/6layers_100offset")   # writes reward_per_episode.png and avg_wait_per_episode.png
 
 
     # Save final params
+    # jax.debug.print("Saving final parameters to 'trained_q_params.pkl'...")
     with open('trained_q_params.pkl','wb') as f:
         pickle.dump(params, f)
-    print("Saved trained Q-network parameters.")
+    # print("Saved trained Q-network parameters.")
     return params

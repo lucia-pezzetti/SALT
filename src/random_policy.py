@@ -4,7 +4,6 @@ import jax.numpy as jnp
 # --- Random policy for comparisons ---
 def run_random_policy(env, num_episodes=100, seed=0):
     key = jax.random.PRNGKey(seed)
-
     episode_returns = []
     episode_lengths = []
 

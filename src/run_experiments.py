@@ -7,10 +7,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # 1) How many layers you want to sweep over
-LAYERS_TO_TEST = [3, 4, 5, 6, 7, 8, 9, 10]  # adjust as needed
+LAYERS_TO_TEST = [6, 7, 8, 9, 10]  # adjust as needed
 
 # 2) How many offsets your simple env supports (0 through N-1)
-OFFSETS = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]  # seconds into the cycle
+OFFSETS = [0.0, 50.0, 100.0, 150.0]  # seconds into the cycle
 
 # 3) Regex patterns to pull out the two numbers we need from main’s stdout
 _rlrl_matching = re.compile(r"RL matching \+ RL policy avg time: ([0-9]+\.[0-9]+)")
@@ -24,15 +24,31 @@ def run_main_for(layer_count, offset):
     captures stdout, and returns (matching_time, policy_time) as floats.
     """
     print(f"Running main() for layers={layer_count}, offset={offset}...")
+    if layer_count == 3:
+        epochs = "10_000"  # shorter for 3 layers
+    elif layer_count == 4:
+        epochs = "15_000"
+    elif layer_count == 5:
+        epochs = "30_000"
+    elif layer_count == 6:
+        epochs = "50_000"
+    elif layer_count == 7:
+        epochs = "100_000"
+    elif layer_count == 8:
+        epochs = "150_000"
+    elif layer_count == 9:
+        epochs = "200_000"
+    elif layer_count == 10:
+        epochs = "250_000"
     cmd = [
-        "python", "nagents_main.py",
+        "python", "main.py",
         "--env_type",    "simple",
         "--num_layers",  str(layer_count),
         # "--cycle_length", "200",
         "--offset",      str(offset),
-        # "--epochs", "50_000",
+        "--epochs", epochs,
         # you can pass through any other flags you need, e.g.
-        # "--num_agents", "10",
+        "--num_agents", "5",
         # "--max_steps",  "128",
     ]
     completed = subprocess.run(cmd, capture_output=True, text=True)
@@ -92,7 +108,7 @@ def plot_results(layers, rlrl, rlsp, sprl, spsp):
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("simple_env_matching_vs_policy.png")
+    plt.savefig("simple_env_matching_vs_policy.pdf")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import networkx as nx
-from taxi_env import JAXRideEnv, TaxiState
+from taxi_env import TaxiEnv, TaxiState
 from typing import Callable, Dict, Tuple
 
 # --- Graph conversion utilities ---
@@ -37,7 +37,7 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
 
 
 def make_obs_fn(
-    env: JAXRideEnv,
+    env: TaxiEnv,
     G: nx.DiGraph,
     node_to_idx: Dict[int,int]
 ) -> Tuple[
@@ -103,6 +103,7 @@ def make_obs_fn(
     @jax.jit
     def obs_fn_batch(batch: TaxiState) -> Dict[str, jnp.ndarray]:
         sf, af, gf = single_obs_batched(batch)
+        gf = gf.reshape((gf.shape[0], -1))  # ensure global feats are 2D [B, 3*N]
         return {
             'state_feats': sf,
             'action_feats': af,
@@ -146,7 +147,7 @@ def get_global_state(env, batch) -> jnp.ndarray:
     return global_feats
 
 # --- Example init_state_fn ---
-def make_init_state_fn(env: JAXRideEnv, num_envs: int, rng_key):
+def make_init_state_fn(env: TaxiEnv, num_envs: int, rng_key):
     """
     Returns a batched initial TaxiState array and new rng_key.
     """
@@ -163,17 +164,19 @@ def make_init_state_fn(env: JAXRideEnv, num_envs: int, rng_key):
 
 def build_traffic_params(G: nx.DiGraph,
                          node_to_idx: Dict[int,int],
-                         seed: int = 0
+                         cycle_length: float = 60.0,
+                         offset: float = 0.0,
+                         seed: int = 0,
                         ) -> Dict[int, Tuple[float,float,float]]:
     """
     For each intersection (node), look at the highway‐types of
     all incident edges and pick a cycle/green split:
       • Motorway/Trunk: always green (no light)
-      • Primary:         60s cycle, 30s green
-      • Secondary:       60s cycle, 25s green
-      • Tertiary:        50s cycle, 20s green
-      • Otherwise:       40s cycle, 20s green
-    We then pick a random offset in [0, cycle) so lights aren’t all in lock‐step.
+      • Primary:         cycle/green = 5/6
+      • Secondary:       cycle/green = 2/3
+      • Tertiary:        cycle/green = 1/6
+      • Otherwise:       cycle/green = 1/2
+    We then pick a fixed offset per each node.
     """
     rng = np.random.default_rng(seed)
     traffic_params = {}
@@ -189,18 +192,18 @@ def build_traffic_params(G: nx.DiGraph,
                 types.append(hw)
         # decide cycle & green based on priority
         if any(t in ("motorway", "trunk") for t in types):
-            cycle, green = 1.0, 1.0    # effectively always green
+            cycle, green = cycle_length, cycle_length    # effectively always green
         elif any(t == "primary" for t in types):
-            cycle, green = 600.0, 500.0
+            cycle, green = cycle_length, 5.0/6.0 * cycle_length
         elif any(t == "secondary" for t in types):
-            cycle, green = 600.0, 400.0
+            cycle, green = cycle_length, 2.0/3.0 * cycle_length
         elif any(t == "tertiary" for t in types):
-            cycle, green = 600.0, 200.0
+            cycle, green = cycle_length, 1.0/6.0 * cycle_length
         else:
-            cycle, green = 600.0, 250.0
+            cycle, green = cycle_length, 1.0/2.0 * cycle_length
 
         # random phase offset
-        offset = float(rng.uniform(0, cycle))
+        offset = offset
         # --- VALIDITY CHECKS ---
         assert cycle > 0, f"Cycle length for node {node} must be positive, got {cycle}"
         assert green > 0, f"Green duration must be positive, got {green}"
