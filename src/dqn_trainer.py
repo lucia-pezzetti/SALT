@@ -475,6 +475,8 @@ def train(
     for ep in range(1, epochs+1):
         eps = epsilon_start + (epsilon_end - epsilon_start) * (ep/epochs)
         key, subkey = random.split(key)
+        # if ep > 150_000:
+        #     jax.debug.print("Epoch {}: epsilon={}", ep, eps)
         batch, states = rollout(env, states, subkey, params, eps)
 
         # Compute observations
@@ -505,7 +507,7 @@ def train(
         mask2 = mask2.reshape((N,max_deg))
         gf2 = gf2.reshape((N, global_dim))
         done = batch.done.reshape((N,))
-        waits   = batch.wait.reshape((T * B,)).tolist()
+        waits = batch.wait.reshape((T * B,)).tolist()
 
         # Removed unused variable "travels"
         logger.log(float(jnp.sum(rew)), waits)
@@ -520,9 +522,12 @@ def train(
             done
         )
 
+        
+        # jax.debug.print("Epoch {}: buffer size={}", ep, buffer.size)
+
         # — sample & train from buffer —
         if buffer.size >= batch_size:
-            for _ in range(4):
+            for _ in range(2):
                 key, subkey = jax.random.split(key)
                 batch_sample = buffer.sample_fixed(subkey, batch_size)  # Returns JAX arrays
                 params, opt_state, loss = train_step(
@@ -537,6 +542,9 @@ def train(
                     params, target_params
                 )
             loss_history.append(loss.item())
+
+       
+        # jax.debug.print("Epoch {}: loss={}", ep, loss)
 
         # ---- metrics ----
         # Compute validation Q-values for metrics
@@ -575,10 +583,11 @@ def train(
         start_keys, pickup_keys = jnp.split(all_subkeys, 2)
 
         # sample uniformly from the pool
-        new_starts  = jnp.array([random.choice(k, fixed_starts, ())
-                                for k in start_keys])    # shape [B]
-        new_pickups = jnp.array([random.choice(k, fixed_pickups, ())
-                         for k in pickup_keys])   # shape [B]
+        new_starts  = jax.vmap(lambda k: random.choice(k, fixed_starts, shape=()))(start_keys)    # shape [B]
+        new_pickups = jax.vmap(lambda k: random.choice(k, fixed_pickups, shape=()))(pickup_keys)     # shape [B]
+        
+        
+        # jax.debug.print("Epoch {}: new starts={}, new_pickups={}", ep, new_starts, new_pickups)
 
         R = estimate_returns_jit(
             env,
@@ -591,16 +600,10 @@ def train(
             estimate_state,
             rollout_steps=10
         )
+        
+        # jax.debug.print("Epoch {}: R={}", ep, R)
         # Assign new starts and pickups to the batch using optimal transport
-        # a = np.ones((B,)) / B  # uniform distribution over starts
-        # b = np.ones((B,)) / B  # uniform distribution over pickups    
-        # M = -np.asarray(R)
-
-        # F = emd(a, b, M, numItermax=1000)
-        # col_idx = np.argmax(F, axis=1)
-        # _, col_idx = linear_sum_assignment(-R)
-        col_idx = emd_assignment_optimized(R, B)
-        # col_idx is a 1D array of indices that maps each start to a pickup
+        _, col_idx = optax.assignment.hungarian_algorithm(-R)
         pickups = new_pickups[col_idx]
         # jax.debug.print("Epoch {}: new starts={}, new_pickups={}, pickups={}", ep, new_starts, new_pickups, pickups)
 
@@ -608,12 +611,12 @@ def train(
         # Assign new starts and pickups to the batch
         states, _ = batched_init(start_keys, new_starts, pickups)
 
-        # if ep > 19000:
-        #     jax.debug.print("Epoch {}: new starts={}, pickups={}", ep, new_starts, pickups)
-        if ep % 100 == 0:
-            jax.clear_caches()
+        
+        # jax.debug.print("Epoch {}: new starts={}, pickups={}", ep, new_starts, pickups)
+        # if ep % 100 == 0:
+        #     jax.clear_caches()
 
-    logger.save_plots(out_dir="plots/6layers_100offset")   # writes reward_per_episode.png and avg_wait_per_episode.png
+    logger.save_plots(out_dir="plots/manhattan")   # writes reward_per_episode.png and avg_wait_per_episode.png
 
 
     # Save final params

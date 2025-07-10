@@ -340,13 +340,13 @@ def load_simple_graph(num_layers: int = 2) -> nx.MultiDiGraph:
     coords = {k: v for k, v in coords.items() if k < num_layers * 3}
 
     # (optional) define special highways if you need them
-    primary_edges = {}
-    tertiary_edges = {}
-    highway_edges = {(1,4), (4,7), (7,10), (10,13), (13,16), (16,19), (19,22), (22,25), (25,28), (28,31)}
+    primary_edges = {(1,4), (4,7), (7,10), (10,13), (13,16), (16,19), (19,22), (22,25), (25,28), (28,31)}
+    secondary_edges = {}
+    highway_edges = {}
 
     def tag_for(u: int, v: int) -> str:
         if (u,v) in primary_edges:   return "primary"
-        if (u,v) in tertiary_edges:  return "tertiary"
+        if (u,v) in secondary_edges:  return "secondary"
         if (u,v) in highway_edges:   return "motorway"
         return "tertiary"
 
@@ -370,64 +370,6 @@ def load_simple_graph(num_layers: int = 2) -> nx.MultiDiGraph:
     # apply whatever congestion model you have
     apply_congestion_model(G)
     return G
-
-
-# @timeit
-# def estimate_returns(
-#     env: TaxiEnv,
-#     params,
-#     model: nn.Module,
-#     obs_fn_batch: Callable[[TaxiState], Dict[str, jnp.ndarray]],
-#     init_env_fn: Callable[[jnp.ndarray, jnp.ndarray], Tuple[TaxiState, jnp.ndarray]],
-#     starts: jnp.ndarray,
-#     pickups: jnp.ndarray,
-#     rollout_steps: int = 10,
-#     gamma: float = 0.99
-# ) -> jnp.ndarray:
-#     N = starts.shape[0]
-
-#     # tile out all start–pickup pairs
-#     grid_s, grid_p = jnp.meshgrid(starts, pickups, indexing="ij")
-#     s_rep = grid_s.ravel()
-#     p_rep = grid_p.ravel()
-
-#     # initialize those N*N envs
-#     states, _ = init_env_fn(s_rep, p_rep)
-
-#     # we'll keep ep in the carry so we can still debug-print it
-#     acc_init = jnp.zeros(states.current_node.shape[0])
-#     carry_init = (states, acc_init)
-
-#     def body(carry, t, discount):
-#         st, acc = carry
-#         obs = obs_fn_batch(st)
-#         q   = model.apply(params,
-#                           obs['state_feats'],
-#                           obs['action_feats'],
-#                           st.neighbor_mask,
-#                           obs['global_feats'])
-#         act = jnp.argmax(q, axis=-1)
-#         nxt, r, _, _ = env.step(st, act)
-
-#         new_acc = acc + discount * r
-#         # carry (nxt state, accumulated return, ep stays the same)
-#         return (nxt, new_acc), None
-
-#     # run the scan: scan(fun, init_carry, xs)
-#     discounts = gamma ** jnp.arange(rollout_steps)
-#     (final_state, total_ret) , _ = jax.lax.scan(
-#         lambda carry, t_and_d: body(carry, *t_and_d),
-#         carry_init,
-#         (jnp.arange(rollout_steps), discounts)
-#     )
-#     return total_ret.reshape((N, N))
-
-# estimate_returns_jit = jax.jit(
-#     estimate_returns,
-#     static_argnums=(    # env
-#                     2, 3, 4, # model, obs_fn_batch, init_env_fn
-#                     7, 8)    # rollout_steps, gamma
-#     )
 
 @struct.dataclass
 class EstimateReturnsState:
@@ -480,7 +422,7 @@ def estimate_returns(
         carry_init,
         (jnp.arange(rollout_steps), discounts)
     )
-    return total_ret.reshape((N, N))
+    return total_ret.reshape((N, N)).astype(jnp.float32)
 
 # JIT with fixed static args
 estimate_returns_jit = jax.jit(

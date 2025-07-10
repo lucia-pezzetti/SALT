@@ -103,7 +103,7 @@ def make_obs_fn(
     @jax.jit
     def obs_fn_batch(batch: TaxiState) -> Dict[str, jnp.ndarray]:
         sf, af, gf = single_obs_batched(batch)
-        gf = gf.reshape((gf.shape[0], -1))  # ensure global feats are 2D [B, 3*N]
+        # gf = gf.reshape((gf.shape[0], -1))  # ensure global feats are 2D [B, 3*N]
         return {
             'state_feats': sf,
             'action_feats': af,
