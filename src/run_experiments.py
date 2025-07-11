@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # 1) How many layers you want to sweep over
-LAYERS_TO_TEST = [9, 10]  # adjust as needed
+LAYERS_TO_TEST = [9]  # adjust as needed
 
 # 2) How many offsets your simple env supports (0 through N-1)
 OFFSETS = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0]  # seconds into the cycle
@@ -32,13 +32,13 @@ def run_main_for(layer_count, offset):
     elif layer_count == 6:
         epochs = "30_000"
     elif layer_count == 7:
-        epochs = "50_000"
+        epochs = "40_000"
     elif layer_count == 8:
-        epochs = "100_000"
+        epochs = "50_000"
     elif layer_count == 9:
-        epochs = "100_000"
+        epochs = "60_000"
     elif layer_count == 10:
-        epochs = "100_000"
+        epochs = "70_000"
     cmd = [
         "python", "main.py",
         "--env_type",    "simple",
@@ -106,4 +106,4 @@ def plot_results(layers, rlrl, spsp, bfbf):
 
 if __name__ == "__main__":
     rlrl_curve, spsp_curve, bfbf_curve = evaluate_over_layers(LAYERS_TO_TEST, OFFSETS)
-    plot_results(LAYERS_TO_TEST, rlrl_curve, spsp_curve)
+    plot_results(LAYERS_TO_TEST, rlrl_curve, spsp_curve, bfbf_curve)

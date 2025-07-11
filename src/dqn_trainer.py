@@ -16,8 +16,6 @@ from functools import partial
 from taxi_env import init_env, TaxiState, TaxiEnv
 from visualization_utils import TrainingLogger
 from utils import estimate_returns_jit, EstimateReturnsState
-from ot import emd
-from scipy.optimize import linear_sum_assignment
 
 from models.q_network import adapt_pretrained_zeroinit, mask_grads
 from models.q_network import QNetwork
@@ -200,27 +198,6 @@ class Batch(NamedTuple):
     pickup: jnp.ndarray     # [T, B]
     wait: jnp.ndarray       # [T, B]
     travel: jnp.ndarray     # [T, B]
-
-def emd_assignment_optimized(R_jax, B):
-    """
-    Optimized EMD assignment with minimal conversions
-    """
-    # Single conversion to NumPy for EMD computation
-    R_np = np.asarray(R_jax)
-    
-    # Prepare EMD inputs (NumPy)
-    a = np.ones(B) / B  # uniform distribution over sources
-    b = np.ones(B) / B  # uniform distribution over targets
-    M = -R_np  # cost matrix (negative rewards)
-    
-    # Compute EMD transport plan
-    F = emd(a, b, M, numItermax=1000)
-    
-    # Extract assignment from transport plan
-    col_idx = np.argmax(F, axis=1)
-    
-    # Single conversion back to JAX
-    return jnp.array(col_idx)
 
 
 # --- Training loop ---
@@ -412,7 +389,7 @@ def train(
                                     num_steps=num_steps)
     
     # Set up logger and fixed validation batch
-    logger = TrainingLogger()
+    # logger = TrainingLogger()
     key, vkey = random.split(key)
     init_states_val = init_state_fn()
     batch_val, _  = rollout(env, init_states_val, vkey, params, 0.0)
@@ -426,10 +403,10 @@ def train(
     act_val = batch_val.action.reshape((N_val,))
 
     # Metrics buffers
-    loss_history = []
-    update_norms = []
-    q_stabilities = []
-    q_prev_val = None
+    # loss_history = []
+    # update_norms = []
+    # q_stabilities = []
+    # q_prev_val = None
 
     @partial(jax.jit, static_argnames=('freeze_mask',))
     # @timeit
@@ -507,10 +484,10 @@ def train(
         mask2 = mask2.reshape((N,max_deg))
         gf2 = gf2.reshape((N, global_dim))
         done = batch.done.reshape((N,))
-        waits = batch.wait.reshape((T * B,)).tolist()
+        # waits = batch.wait.reshape((T * B,)).tolist()
 
         # Removed unused variable "travels"
-        logger.log(float(jnp.sum(rew)), waits)
+        # logger.log(float(jnp.sum(rew)), waits)
 
         # Clone params before epoch updates
         params_before = params
@@ -541,39 +518,39 @@ def train(
                     lambda p, tp: τ*p + (1-τ)*tp,
                     params, target_params
                 )
-            loss_history.append(loss.item())
+            # loss_history.append(loss.item())
 
        
         # jax.debug.print("Epoch {}: loss={}", ep, loss)
 
         # ---- metrics ----
         # Compute validation Q-values for metrics
-        q_vals_val = model.apply(params, sf_val, af_val, mask_val, gf_val)  # [N_val, max_deg]
+        # q_vals_val = model.apply(params, sf_val, af_val, mask_val, gf_val)  # [N_val, max_deg]
 
         # Update norm: ||params - params_before||_2
-        leaves_new, _ = tree_util.tree_flatten(params)
-        leaves_old, _ = tree_util.tree_flatten(params_before)
-        total_sq = 0.0
-        for p_new, p_old in zip(leaves_new, leaves_old):
-            diff = (p_new - p_old).ravel()
-            total_sq += jnp.sum(diff * diff)
-        update_norms.append(jnp.sqrt(total_sq).item())
+        # leaves_new, _ = tree_util.tree_flatten(params)
+        # leaves_old, _ = tree_util.tree_flatten(params_before)
+        # total_sq = 0.0
+        # for p_new, p_old in zip(leaves_new, leaves_old):
+        #     diff = (p_new - p_old).ravel()
+        #     total_sq += jnp.sum(diff * diff)
+        # update_norms.append(jnp.sqrt(total_sq).item())
 
         # Q-value stability
-        q_sel_val = jnp.take_along_axis(q_vals_val, act_val[:,None], axis=1).squeeze()
-        if q_prev_val is None:
-            q_prev_val = q_sel_val
-            q_stabilities.append(0.0)
-        else:
-            stab = jnp.mean(jnp.abs(q_sel_val - q_prev_val)).item()
-            q_stabilities.append(stab)
-            q_prev_val = q_sel_val
+        # q_sel_val = jnp.take_along_axis(q_vals_val, act_val[:,None], axis=1).squeeze()
+        # if q_prev_val is None:
+        #     q_prev_val = q_sel_val
+        #     q_stabilities.append(0.0)
+        # else:
+        #     stab = jnp.mean(jnp.abs(q_sel_val - q_prev_val)).item()
+        #     q_stabilities.append(stab)
+        #     q_prev_val = q_sel_val
 
-        logger.log_metrics(
-            losses=loss_history,
-            update_norms=update_norms,
-            q_stabilities=q_stabilities
-        )
+        # logger.log_metrics(
+        #     losses=loss_history,
+        #     update_norms=update_norms,
+        #     q_stabilities=q_stabilities
+        # )
 
         # --- OT assignment ---
         # split one key for sampling
@@ -613,10 +590,10 @@ def train(
 
         
         # jax.debug.print("Epoch {}: new starts={}, pickups={}", ep, new_starts, pickups)
-        # if ep % 100 == 0:
-        #     jax.clear_caches()
+        if ep % 100 == 0:
+            jax.clear_caches()
 
-    logger.save_plots(out_dir="plots/manhattan")   # writes reward_per_episode.png and avg_wait_per_episode.png
+    # logger.save_plots(out_dir="plots/manhattan")   # writes reward_per_episode.png and avg_wait_per_episode.png
 
 
     # Save final params

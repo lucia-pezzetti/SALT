@@ -161,7 +161,7 @@ class TaxiEnv(eqx.Module):
         cycle    = (t1 + self.offsets[nxt]) % self.periods[nxt]
         wait     = jnp.where(cycle < self.green_durations[nxt], 0.0, self.periods[nxt] - cycle)
         t2       = t1 + wait
-        norm_time = t2 / 600.0
+        norm_time = t2 % self.periods[nxt]  # normalize to [0, period)
 
         total_delay = travel + wait
         dist_c = self.distances[curr, state.pickup_node]
@@ -190,6 +190,6 @@ class TaxiEnv(eqx.Module):
             done=done,
             step_count=jnp.where(done, jnp.int32(0), step_n),
             neighbor_mask=nm,
-            time=jnp.float32(norm_time),
+            time=jnp.float32(norm_time)
         )
         return new_state, reward, reach, {"wait": wait, "travel": travel}

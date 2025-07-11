@@ -20,8 +20,8 @@ import optax
 
 parser = argparse.ArgumentParser(description="Ride-sharing Simulator")
 parser.add_argument("--env_type", type=str, choices=["manhattan", "simple"], default="manhattan", help="Type of environment to use")
-parser.add_argument("--num_layers", type=int, default=4, help="Number of layers in the customised grid environment")
-parser.add_argument("--offset", type=float, default=0.0, help="Offset for the customised grid environment")
+parser.add_argument("--num_layers", type=int, default=3, help="Number of layers in the customised grid environment")
+parser.add_argument("--offset", type=float, default=100.0, help="Offset for the customised grid environment")
 parser.add_argument("--cycle_length", type=int, default=200, help="Cycle length for the customised grid environment")
 parser.add_argument("--place_name", type=str, default="Manhattan, New York City, New York, USA", help="Place name for the graph (used for Manhattan)")
 parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zones.shp", help="Path to the shapefile for zones (used for Manhattan)")
@@ -33,7 +33,7 @@ parser.add_argument("--timeout_penalty", type=float, default=-5.0, help="Penalty
 parser.add_argument("--n_expert_samples", type=int, default=50000, help="Number of expert samples for pretraining")
 parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512], help="Hidden dimensions for the neural network")
 parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for training")
-parser.add_argument("--epochs", type=int, default=1_000_000, help="Number of training epochs")
+parser.add_argument("--epochs", type=int, default=60_000, help="Number of training epochs")
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
 parser.add_argument("--num_steps", type=int, default=128, help="Number of steps for training")
 parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for training")
@@ -349,6 +349,8 @@ if args.env_type == "simple":
     # print(f"Brute-force matching: starts - {starts}, pickups - {bf_pickups}")
     avg_bf_time = 0
     for i, (s, p) in enumerate(zip(onp.array(starts), onp.array(bf_pickups))):
+        # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}")
         avg_bf_time += best_routes[(int(s), int(p))]["travel_time"]
+        # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}, travel time: {best_routes[(int(s), int(p))]['travel_time']}")
     avg_bf_time /= len(starts)
     print(f"Brute-force matching + SP policy avg time: {avg_bf_time:.2f}")

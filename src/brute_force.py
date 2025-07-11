@@ -1,7 +1,6 @@
 import numpy as np
 from typing import Dict, Tuple, List, Any
 from taxi_env import TaxiEnv
-import networkx as nx
 from itertools import product
 from jax import numpy as jnp
 
@@ -23,10 +22,11 @@ def brute_force_shortest_path(env: TaxiEnv, num_layers: int) -> List[Tuple[int, 
             poss = jnp.where(nbrs == a_idx, size=1)[0]
             action = int(poss[0])
             travel = float(env.travel_times[curr, action])
+            total += travel
             nxt = int(env.adj_list[curr, action])
             cycle    = (total + env.offsets[nxt]) % env.periods[nxt]
             wait     = float(jnp.where(cycle < env.green_durations[nxt], 0.0, env.periods[nxt] - cycle))
-            total += travel + wait
+            total += wait
             path[i+1] = nxt
         start, pickup = path[0], path[-1]
         key = (int(start), int(pickup))
