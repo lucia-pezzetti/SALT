@@ -4,19 +4,19 @@ from taxi_env import TaxiEnv
 from itertools import product
 from jax import numpy as jnp
 
-def brute_force_shortest_path(env: TaxiEnv, num_layers: int) -> List[Tuple[int, int]]:
+def brute_force_shortest_path(env: TaxiEnv, num_layers: int, width: int) -> List[Tuple[int, int]]:
     """
     Brute-force search for the shortest path for num_agents agents in the TaxiEnv.
     Returns a list of tuples (start_idx, pickup_idx) for each agent.
     """
     optimal_travel_data = {}
-    paths = product([0, 1, 2], repeat=num_layers)
+    paths = product(np.array(range(width)), repeat=num_layers)
     for path in paths:
         total = 0.0
         path = list(path)
         for i, u in enumerate(path[1:]):
             curr = path[i]
-            a_idx = 3*(i+1) + u
+            a_idx = width*(i+1) + u
             # find the action to take to get to that node
             nbrs = env.adj_list[curr]
             poss = jnp.where(nbrs == a_idx, size=1)[0]

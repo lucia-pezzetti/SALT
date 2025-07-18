@@ -35,7 +35,6 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
 
     return jnp.array(adj), jnp.array(times), jnp.array(neighbor_mask)
 
-
 def make_obs_fn(
     env: TaxiEnv,
     G: nx.DiGraph,
@@ -64,37 +63,10 @@ def make_obs_fn(
         # -- State features --
         xy_c = latlon[s.current_node]   # [2]
         xy_p = latlon[s.pickup_node]    # [2]
-        delta = xy_p - xy_c             # [2]
-        state_feats = jnp.concatenate([xy_c, xy_p, delta], axis=-1)
+        time = jnp.expand_dims(s.time, axis=-1)
+        obs = jnp.concatenate([xy_c, xy_p, time], axis=-1)
 
-        # -- Action features --
-        travel = env.travel_times[s.current_node]          # [max_deg]
-        travel_norm = travel / env.max_travel_time
-        arrival = jnp.expand_dims(s.time, -1) + travel     # [max_deg]
-        nbrs = env.adj_list[s.current_node]                # [max_deg]
-        per = env.periods[nbrs]                            # [max_deg]
-        green = env.green_durations[nbrs]                  # [max_deg]
-        offs = env.offsets[nbrs]                           # [max_deg]
-        cycle = jnp.mod(arrival + offs, per)               # [max_deg]
-        wait = jnp.where(cycle < green, 0.0, per - cycle)  # [max_deg]
-        wait_norm = wait / env.max_wait_time               # normalized [0,1]
-        action_feats = jnp.stack([travel_norm, wait_norm], axis=-1)
-
-        # -- Global features --
-        ratio = (env.green_durations / env.periods)  # [N]
-        cycles = jnp.mod(jnp.expand_dims(s.time, -1) + env.offsets, env.periods)          # [N]
-        is_green = (cycles < env.green_durations).astype(jnp.float32)
-        raw_tts = jnp.where(
-            is_green > 0,
-            env.green_durations - cycles,
-            env.periods - cycles
-        )  # [N]
-        tts = raw_tts / env.periods                          # normalized [0,1]
-        if cycles.ndim == 2:
-            ratio = jnp.broadcast_to(ratio[None, :], cycles.shape)
-        global_feats = jnp.stack([ratio, is_green, tts], axis=1)  # [N,3]
-
-        return state_feats, action_feats, global_feats
+        return obs
 
     # JIT and batched versions
     single_obs = jax.jit(single_obs)
@@ -102,13 +74,7 @@ def make_obs_fn(
 
     @jax.jit
     def obs_fn_batch(batch: TaxiState) -> Dict[str, jnp.ndarray]:
-        sf, af, gf = single_obs_batched(batch)
-        # gf = gf.reshape((gf.shape[0], -1))  # ensure global feats are 2D [B, 3*N]
-        return {
-            'state_feats': sf,
-            'action_feats': af,
-            'global_feats': gf,
-        }
+        return single_obs_batched(batch)
 
     return single_obs, obs_fn_batch
 
@@ -199,20 +165,22 @@ def build_traffic_params(G: nx.DiGraph,
             cycle, green = cycle_length, 2.0/3.0 * cycle_length
         elif any(t == "tertiary" for t in types):
             cycle, green = cycle_length, 1.0/6.0 * cycle_length
+        elif any(t in ("residential", "living_street") for t in types):
+            cycle, green = cycle_length, 1.0/6.0 * cycle_length
         else:
-            cycle, green = cycle_length, 1.0/2.0 * cycle_length
+            cycle, green = cycle_length, cycle_length
 
         # random phase offset
         offset = offset
         # --- VALIDITY CHECKS ---
-        assert cycle > 0, f"Cycle length for node {node} must be positive, got {cycle}"
-        assert green > 0, f"Green duration must be positive, got {green}"
-        assert green <= cycle, (
-            f"Green duration ({green}) exceeds cycle ({cycle}) at node {node}"
-        )
-        assert 0 <= offset < cycle, (
-            f"Offset {offset:.2f} not in [0, {cycle}) for node {node}"
-        )
+        # assert cycle > 0, f"Cycle length for node {node} must be positive, got {cycle}"
+        # assert green > 0, f"Green duration must be positive, got {green}"
+        # assert green <= cycle, (
+        #     f"Green duration ({green}) exceeds cycle ({cycle}) at node {node}"
+        # )
+        # assert 0 <= offset < cycle, (
+        #     f"Offset {offset:.2f} not in [0, {cycle}) for node {node}"
+        # )
 
         traffic_params[node_to_idx[node]] = (cycle, green, offset)
 

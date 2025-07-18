@@ -1,24 +1,23 @@
 import pickle
-from timing_decorator import timeit
 from typing import NamedTuple, Callable, Sequence, Dict, Tuple
 import numpy as np
+import wandb
 
 import jax
 import jax.numpy as jnp
 import jax.random as random
-from jax import lax, tree_util
+from jax import lax
 import optax
 from flax import linen as nn
 from flax import struct
-from flax.core.frozen_dict import freeze, unfreeze
+from flax.core.frozen_dict import freeze
 from functools import partial
 
 from taxi_env import init_env, TaxiState, TaxiEnv
-from visualization_utils import TrainingLogger
 from utils import estimate_returns_jit, EstimateReturnsState
 
 from models.q_network import adapt_pretrained_zeroinit, mask_grads
-from models.q_network import QNetwork
+from models.q_network import QNetworkSimple, QNetworkUntied
     
 
 @struct.dataclass
@@ -35,15 +34,11 @@ class ReplayBuffer:
     ptr: int
     size: int
     sf: jnp.ndarray
-    af: jnp.ndarray
     mask: jnp.ndarray
-    gf: jnp.ndarray
     act: jnp.ndarray
     rew: jnp.ndarray
     sf2: jnp.ndarray
-    af2: jnp.ndarray
     mask2: jnp.ndarray
-    gf2: jnp.ndarray
     done: jnp.ndarray
 
     @classmethod
@@ -52,23 +47,17 @@ class ReplayBuffer:
         max_size: int,
         state_dim: int,
         max_deg: int,
-        action_dim: int,
-        global_dim: int
     ):  # -> ReplayBuffer
         return cls(
             max_size=max_size,
             ptr=0,
             size=0,
             sf=jnp.zeros((max_size, state_dim), jnp.float32),
-            af=jnp.zeros((max_size, max_deg, action_dim), jnp.float32),
             mask=jnp.zeros((max_size, max_deg), jnp.bool_),
-            gf=jnp.zeros((max_size, global_dim), jnp.float32),
             act=jnp.zeros((max_size,), jnp.int32),
             rew=jnp.zeros((max_size,), jnp.float32),
             sf2=jnp.zeros((max_size, state_dim), jnp.float32),
-            af2=jnp.zeros((max_size, max_deg, action_dim), jnp.float32),
             mask2=jnp.zeros((max_size, max_deg), jnp.bool_),
-            gf2=jnp.zeros((max_size, global_dim), jnp.float32),
             done=jnp.zeros((max_size,), jnp.float32),
         )
     
@@ -76,15 +65,11 @@ class ReplayBuffer:
     def add_batch(
         self,
         sf_batch: jnp.ndarray,      # [N, D_state]
-        af_batch: jnp.ndarray,      # [N, max_deg, D_action]
         mask_batch: jnp.ndarray,    # [N, max_deg]
-        gf_batch: jnp.ndarray,      # [N, D_global]
         act_batch: jnp.ndarray,     # [N]
         rew_batch: jnp.ndarray,     # [N]
         sf2_batch: jnp.ndarray,     # [N, D_state]
-        af2_batch: jnp.ndarray,     # [N, max_deg, D_action]
         mask2_batch: jnp.ndarray,   # [N, max_deg]
-        gf2_batch: jnp.ndarray,     # [N, D_global]
         done_batch: jnp.ndarray,    # [N]
     ) -> "ReplayBuffer":
         batch_size = sf_batch.shape[0]
@@ -94,15 +79,11 @@ class ReplayBuffer:
         
         # Update all arrays at once using advanced indexing
         new_sf = self.sf.at[indices].set(sf_batch)
-        new_af = self.af.at[indices].set(af_batch)
         new_mask = self.mask.at[indices].set(mask_batch)
-        new_gf = self.gf.at[indices].set(gf_batch)
         new_act = self.act.at[indices].set(act_batch)
         new_rew = self.rew.at[indices].set(rew_batch)
         new_sf2 = self.sf2.at[indices].set(sf2_batch)
-        new_af2 = self.af2.at[indices].set(af2_batch)
         new_mask2 = self.mask2.at[indices].set(mask2_batch)
-        new_gf2 = self.gf2.at[indices].set(gf2_batch)
         new_done = self.done.at[indices].set(done_batch)
         
         # Update pointer and size
@@ -112,9 +93,9 @@ class ReplayBuffer:
         return self.replace(
             ptr=new_ptr,
             size=new_size,
-            sf=new_sf, af=new_af, mask=new_mask, gf=new_gf,
+            sf=new_sf, mask=new_mask,
             act=new_act, rew=new_rew,
-            sf2=new_sf2, af2=new_af2, mask2=new_mask2, gf2=new_gf2,
+            sf2=new_sf2, mask2=new_mask2,
             done=new_done,
         )
 
@@ -122,29 +103,21 @@ class ReplayBuffer:
     def add(
         self,
         sf: jnp.ndarray,
-        af: jnp.ndarray,
         mask: jnp.ndarray,
-        gf: jnp.ndarray,
         act: jnp.ndarray,
         rew: jnp.ndarray,
         sf2: jnp.ndarray,
-        af2: jnp.ndarray,
         mask2: jnp.ndarray,
-        gf2: jnp.ndarray,
         done: jnp.ndarray,
     ) -> "ReplayBuffer":
         idx = self.ptr
         # Insert new elements
         new_sf    = self.sf.at[idx].set(sf)
-        new_af    = self.af.at[idx].set(af)
         new_mask  = self.mask.at[idx].set(mask)
-        new_gf    = self.gf.at[idx].set(gf)
         new_act   = self.act.at[idx].set(act)
         new_rew   = self.rew.at[idx].set(rew)
         new_sf2   = self.sf2.at[idx].set(sf2)
-        new_af2   = self.af2.at[idx].set(af2)
         new_mask2 = self.mask2.at[idx].set(mask2)
-        new_gf2   = self.gf2.at[idx].set(gf2)
         new_done  = self.done.at[idx].set(done)
         # Update pointer and size
         ptr = (idx + 1) % self.max_size
@@ -154,15 +127,11 @@ class ReplayBuffer:
             ptr=ptr,
             size=size,
             sf=new_sf,
-            af=new_af,
             mask=new_mask,
-            gf=new_gf,
             act=new_act,
             rew=new_rew,
             sf2=new_sf2,
-            af2=new_af2,
             mask2=new_mask2,
-            gf2=new_gf2,
             done=new_done,
         )
 
@@ -174,15 +143,11 @@ class ReplayBuffer:
         # Sample from each buffer component
         batch_sample = {
             'sf': self.sf[indices],
-            'af': self.af[indices],
             'mask': self.mask[indices],
-            'gf': self.gf[indices],
             'act': self.act[indices],
             'rew': self.rew[indices],
             'sf2': self.sf2[indices],
-            'af2': self.af2[indices],
             'mask2': self.mask2[indices],
-            'gf2': self.gf2[indices],
             'done': self.done[indices],
         }
         
@@ -218,8 +183,11 @@ def train(
     gamma: float = 0.99,
     epsilon_start: float = 1.0,
     epsilon_end: float = 0.01,
+    logger = None,
+    use_untied: bool = False,
     ) -> dict:
 
+    cum_visits = np.zeros(env.num_nodes, dtype=int)
 
     # --- State reset helper ---
     # Precompile a batched init to reset B environments in one go
@@ -229,7 +197,7 @@ def train(
                 in_axes=(0, 0, 0),     # split keys, start_idxs, pickup_idxs
                 out_axes=(0, 0),
             )
-    
+
     def make_init_env_fn(batched_init, base_key):
         """Factory function that pre-splits keys"""
         def init_env_fn(starts: jnp.ndarray, pickups: jnp.ndarray):
@@ -241,6 +209,7 @@ def train(
 
     # Create once outside training loop
     base_key = jax.random.PRNGKey(42)
+    base_key, subkey = jax.random.split(base_key)
     init_env_fn = make_init_env_fn(batched_init, base_key)
 
     @jax.jit
@@ -302,7 +271,6 @@ def train(
         *, num_steps: int = 128
     ):
         @jax.jit
-        # @timeit
         def rollout(env: TaxiEnv,
                     init_states: TaxiState,
                     key: jnp.ndarray,
@@ -316,14 +284,11 @@ def train(
                 state, orig_states = carry
                 k1, k2, k3 = random.split(k, 3)
                 # Compute obs
-                obs = obs_fn_batch(state)
-                sf = obs['state_feats']         # [B, D_state]
-                af = obs['action_feats']        # [B, max_deg, D_action]
+                sf = obs_fn_batch(state)
                 mask = state.neighbor_mask       # [B, max_deg]
-                gf = obs['global_feats']        # [B, D_global]
 
                 # Q-values and action selection
-                q_vals = model.apply(params, sf, af, mask, gf)  # [B, max_deg]
+                q_vals = model.apply(params, sf, mask)  # [B, max_deg]
                 greedy = jnp.argmax(q_vals, axis=-1)
 
                 # uniform random over valid
@@ -354,19 +319,18 @@ def train(
     
     # Initialize network and parameters
     max_deg = env.max_deg
-    global_dim = env.global_state_dim
     freeze_epochs = 0.1 * epochs if pretrain_ckpt is not None else 0
     
-    D_state  = 6        # 2(curr_xy)+2(pick_xy)+2(delta_xy)
-    D_action = 2        # (travel_time, wait_time)
+    D_state  = 5        # 2(curr_xy)+2(pick_xy)+time
     
-    model = QNetwork(ctx_dim=128, node_hidden=64, pool="mean", num_actions=max_deg)
+    if use_untied:
+        model = QNetworkUntied(hidden_dim=128, num_actions=max_deg)
+    else:
+        model = QNetworkSimple(hidden_dim=128, num_actions=max_deg)
 
     dummy_sf   = jnp.zeros((1, D_state), dtype=jnp.float32)
-    dummy_af   = jnp.zeros((1, max_deg, D_action), dtype=jnp.float32)
     dummy_mask = jnp.ones((1, max_deg), dtype=jnp.bool_)
-    dummy_gf   = jnp.zeros((1, global_dim), dtype=jnp.float32)
-    init_params = model.init(key, dummy_sf, dummy_af, dummy_mask, dummy_gf)
+    init_params = model.init(key, dummy_sf, dummy_mask)
 
     # Merge pretrained if provided
     if pretrain_ckpt:
@@ -388,36 +352,26 @@ def train(
     rollout = get_batched_rollout_q(model, obs_fn_batch,
                                     num_steps=num_steps)
     
-    # Set up logger and fixed validation batch
-    # logger = TrainingLogger()
     key, vkey = random.split(key)
     init_states_val = init_state_fn()
     batch_val, _  = rollout(env, init_states_val, vkey, params, 0.0)
-    obs_val       = obs_fn_batch(batch_val.state)
+    sf_val       = obs_fn_batch(batch_val.state)
     T_val, B_val  = batch_val.action.shape
     N_val         = T_val * B_val
-    sf_val = obs_val['state_feats'].reshape((N_val, -1))
-    af_val = obs_val['action_feats'].reshape((N_val, max_deg, D_action))
+    sf_val = sf_val.reshape((N_val, -1))
     mask_val = batch_val.state.neighbor_mask.reshape((N_val, max_deg))
-    gf_val = obs_val['global_feats'].reshape((N_val, global_dim))
     act_val = batch_val.action.reshape((N_val,))
-
-    # Metrics buffers
-    # loss_history = []
-    # update_norms = []
-    # q_stabilities = []
-    # q_prev_val = None
+    q_prev_val = None
+    
 
     @partial(jax.jit, static_argnames=('freeze_mask',))
-    # @timeit
     def train_step(params, target_params, opt_state,
-                   sf, af, mask, gf,
-                   act, rew, sf2, af2, mask2, gf2, 
+                   sf, mask, act, rew, sf2, mask2, 
                    done, freeze_mask: bool):
         def loss_fn(p, tp):
-            q = model.apply(p, sf, af, mask, gf)               # [N, max_deg]
+            q = model.apply(p, sf, mask)               # [N, max_deg]
             q_taken = jnp.take_along_axis(q, act[:,None], -1).squeeze(-1)
-            qn = model.apply(tp, sf2, af2, mask2, gf2)
+            qn = model.apply(tp, sf2, mask2)
             max_qn = jnp.max(qn, axis=-1)
             td = rew + gamma * max_qn * (1.0 - done)
             td_tgt = jax.lax.stop_gradient(td)
@@ -443,8 +397,6 @@ def train(
         max_size=100_000,
         state_dim=D_state,
         max_deg=max_deg,
-        action_dim=D_action,
-        global_dim=global_dim
     )
 
     # Training epochs
@@ -456,47 +408,33 @@ def train(
         #     jax.debug.print("Epoch {}: epsilon={}", ep, eps)
         batch, states = rollout(env, states, subkey, params, eps)
 
-        # Compute observations
-        obs = obs_fn_batch(batch.state)
-        obs2 = obs_fn_batch(batch.next_state)
-        sf = obs['state_feats']         # [T,B,D_state]
-        af = obs['action_feats']        # [T,B,max_deg,3]
-        mask = batch.state.neighbor_mask
-        gf = obs['global_feats']
+        params_before = params  # old params
 
-        sf2 = obs2['state_feats']
-        af2 = obs2['action_feats']
+        avg_reward = jnp.mean(batch.reward).item()
+        avg_wait   = jnp.mean(batch.wait).item()
+        avg_travel = jnp.mean(batch.travel).item()
+
+        # Compute observations
+        sf = obs_fn_batch(batch.state)
+        sf2 = obs_fn_batch(batch.next_state)
+        mask = batch.state.neighbor_mask
         mask2 = batch.next_state.neighbor_mask
-        gf2 = obs2['global_feats']
 
         # Flatten
         T,B = batch.action.shape
         N   = T*B
-        sf = sf.reshape((N,-1));    
-        af  = af.reshape((N, max_deg, D_action))
-        mask = mask.reshape((N,max_deg))
-        gf = gf.reshape((N, global_dim))
 
+        sf = sf.reshape((N,-1));    
+        mask = mask.reshape((N,max_deg))
         act = batch.action.reshape((N,))
         rew = batch.reward.reshape((N,))
         sf2 = sf2.reshape((N,-1))  
-        af2 = af2.reshape((N,max_deg,D_action))
         mask2 = mask2.reshape((N,max_deg))
-        gf2 = gf2.reshape((N, global_dim))
         done = batch.done.reshape((N,))
-        # waits = batch.wait.reshape((T * B,)).tolist()
-
-        # Removed unused variable "travels"
-        # logger.log(float(jnp.sum(rew)), waits)
-
-        # Clone params before epoch updates
-        params_before = params
 
         buffer = buffer.add_batch(
-            sf, af, mask, gf,        # Keep as JAX arrays
-            act, rew,
-            sf2, af2, mask2, gf2,
-            done
+            sf, mask, act, rew,
+            sf2, mask2, done
         )
 
         
@@ -520,41 +458,51 @@ def train(
                 )
             # loss_history.append(loss.item())
 
-       
-        # jax.debug.print("Epoch {}: loss={}", ep, loss)
+        # --- 3) COMPUTE AND LOG YOUR METRICS ---
+        # Q‐values on validation set
+        q_vals_val = model.apply(params, sf_val, mask_val)  # [N_val, max_deg]
 
-        # ---- metrics ----
-        # Compute validation Q-values for metrics
-        # q_vals_val = model.apply(params, sf_val, af_val, mask_val, gf_val)  # [N_val, max_deg]
+        # 3a) Parameter‐update norm ||params_new – params_old||₂
+        leaves_new, _ = jax.tree_util.tree_flatten(params)
+        leaves_old, _ = jax.tree_util.tree_flatten(params_before)
+        total_sq = 0.0
+        for p_new, p_old in zip(leaves_new, leaves_old):
+            diff = (p_new - p_old).ravel()
+            total_sq += jnp.sum(diff * diff)
+        update_norm = jnp.sqrt(total_sq).item()
 
-        # Update norm: ||params - params_before||_2
-        # leaves_new, _ = tree_util.tree_flatten(params)
-        # leaves_old, _ = tree_util.tree_flatten(params_before)
-        # total_sq = 0.0
-        # for p_new, p_old in zip(leaves_new, leaves_old):
-        #     diff = (p_new - p_old).ravel()
-        #     total_sq += jnp.sum(diff * diff)
-        # update_norms.append(jnp.sqrt(total_sq).item())
+        # 3b) Q‐value stability on the actions you’d take
+        q_sel_val = jnp.take_along_axis(q_vals_val, act_val[:,None], axis=1).squeeze()
+        if q_prev_val is None:
+            q_prev_val = q_sel_val
+            q_stability = 0.0
+        else:
+            stab = jnp.mean(jnp.abs(q_sel_val - q_prev_val)).item()
+            q_stability = stab
+            q_prev_val = q_sel_val
 
-        # Q-value stability
-        # q_sel_val = jnp.take_along_axis(q_vals_val, act_val[:,None], axis=1).squeeze()
-        # if q_prev_val is None:
-        #     q_prev_val = q_sel_val
-        #     q_stabilities.append(0.0)
-        # else:
-        #     stab = jnp.mean(jnp.abs(q_sel_val - q_prev_val)).item()
-        #     q_stabilities.append(stab)
-        #     q_prev_val = q_sel_val
 
-        # logger.log_metrics(
-        #     losses=loss_history,
-        #     update_norms=update_norms,
-        #     q_stabilities=q_stabilities
-        # )
+        flat_nodes = batch.state.current_node.reshape(-1)
+        visits = jnp.bincount(flat_nodes, minlength=env.num_nodes)
+        visits = np.array(visits)   # convert to host for wandb
+        cum_visits += visits
+
+        logger.log({
+            "loss":              loss.item(),
+            "avg_episode_reward": avg_reward,
+            "avg_wait":          avg_wait,
+            "avg_travel":        avg_travel,
+            "update_norm":      update_norm,
+            "q_stability":      q_stability,
+            "visitation_counts": wandb.Histogram(visits.tolist()),
+            "cumulative_visits": wandb.Histogram(cum_visits.tolist()),
+        })
 
         # --- OT assignment ---
-        # split one key for sampling
-        key, subkey = random.split(key)
+        eps_ot = 0.1 * (1 - ep / epochs)  # decay epsilon for epsilon-greedy matching
+
+        # split one key for sampling and one for epsilon test
+        key, eps_key, perm_key = random.split(key, 3)
         # generate 2*num_agents subkeys
         all_subkeys = random.split(subkey, 2 * B)
         start_keys, pickup_keys = jnp.split(all_subkeys, 2)
@@ -563,7 +511,8 @@ def train(
         new_starts  = jax.vmap(lambda k: random.choice(k, fixed_starts, shape=()))(start_keys)    # shape [B]
         new_pickups = jax.vmap(lambda k: random.choice(k, fixed_pickups, shape=()))(pickup_keys)     # shape [B]
         
-        
+        do_random = random.uniform(eps_key, shape=()) < eps_ot
+
         # jax.debug.print("Epoch {}: new starts={}, new_pickups={}", ep, new_starts, new_pickups)
 
         R = estimate_returns_jit(
@@ -581,24 +530,14 @@ def train(
         # jax.debug.print("Epoch {}: R={}", ep, R)
         # Assign new starts and pickups to the batch using optimal transport
         _, col_idx = optax.assignment.hungarian_algorithm(-R)
-        pickups = new_pickups[col_idx]
-        # jax.debug.print("Epoch {}: new starts={}, new_pickups={}, pickups={}", ep, new_starts, new_pickups, pickups)
-
+        pickups = jnp.where(do_random, new_pickups, new_pickups[col_idx])
 
         # Assign new starts and pickups to the batch
         states, _ = batched_init(start_keys, new_starts, pickups)
 
-        
         # jax.debug.print("Epoch {}: new starts={}, pickups={}", ep, new_starts, pickups)
-        if ep % 100 == 0:
-            jax.clear_caches()
+        # if ep % 100 == 0:
+        #     jax.clear_caches()
 
     # logger.save_plots(out_dir="plots/manhattan")   # writes reward_per_episode.png and avg_wait_per_episode.png
-
-
-    # Save final params
-    # jax.debug.print("Saving final parameters to 'trained_q_params.pkl'...")
-    with open('trained_q_params.pkl','wb') as f:
-        pickle.dump(params, f)
-    # print("Saved trained Q-network parameters.")
     return params

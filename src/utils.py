@@ -12,8 +12,7 @@ from flax import linen as nn
 from flax import struct
 
 from taxi_env_utils import build_traffic_params
-from taxi_env import TaxiEnv, TaxiState
-from timing_decorator import timeit
+from taxi_env import TaxiEnv
 
 # --- Load and preprocess graph ---
 def build_env(args):
@@ -23,7 +22,7 @@ def build_env(args):
     """
     if args.env_type == 'manhattan':
         # --- Load and preprocess Manhattan graph ---
-        G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp)
+        G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp, no_congestion= args.no_congestion)
 
         fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
             G, nodes_gdf, node_to_zone, zone_to_nodes, all = True
@@ -32,15 +31,15 @@ def build_env(args):
         fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
 
     elif args.env_type == 'simple':
-        G = load_simple_graph(num_layers=args.num_layers)
+        G = load_simple_graph(num_layers=args.num_layers, width=args.layer_width, no_congestion=args.no_congestion)
         # index mappings
         nodes = list(G.nodes())
         node_to_idx = {n: i for i, n in enumerate(nodes)}
         idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
         # only one fixed start (node 0) and one fixed pickup (last one)
-        fixed_starts_idx = jnp.array([node_to_idx[n] for n in nodes[:3]], dtype=jnp.int32)
-        fixed_pickups_idx = jnp.array([node_to_idx[n] for n in nodes[-3:]], dtype=jnp.int32)
+        fixed_starts_idx = jnp.array([node_to_idx[n] for n in nodes[:args.layer_width]], dtype=jnp.int32)
+        fixed_pickups_idx = jnp.array([node_to_idx[n] for n in nodes[-args.layer_width:]], dtype=jnp.int32)
 
     else:
         raise ValueError(f"Unknown env_type: {args.env_type}")
@@ -50,7 +49,7 @@ def build_env(args):
     return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
 
 
-def load_graph(place_name: str, zone_shp: str, network_type: str = "drive") -> nx.DiGraph:
+def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_congestion: bool = False) -> nx.DiGraph:
     """
     Download and preprocess the OSMnx graph for a place, keeping only the
     largest strongly-connected component and adding 'congested_time'.
@@ -76,11 +75,24 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive") -> n
     for u, v, k, data in G_scc.edges(keys=True, data=True):
         data['congested_time'] = data.get('travel_time', data.get('length', 0) / 10)
 
-    apply_congestion_model(G_scc)
+    if no_congestion:
+        multipliers = {
+            'motorway': 1, 'trunk': 1, 'primary': 1,
+            'secondary': 1, 'tertiary': 1, 'residential': 1,
+            'service': 1, 'living_street': 1, 'default': 1
+        }
+    else:
+        multipliers = {
+            'motorway': 1.2, 'trunk': 1.3, 'primary': 1.5,
+            'secondary': 1.7, 'tertiary': 1.9, 'residential': 2.0,
+            'service': 2.2, 'living_street': 2.5, 'default': 2.0
+        }
+    apply_congestion_model(G_scc, multipliers)
 
     # Map zones to nodes, then filter to Financial District
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
-    zone_names = ["Financial District South", "Financial District North", "Battery Park"]
+    # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
+    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill East"]  
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
     loc_ids = filtered_zones["LocationID"].tolist()
@@ -288,7 +300,13 @@ def fixed_starts_pickups(G: nx.DiGraph,
 
 
 # ---- debugging graph ----
-def load_simple_graph(num_layers: int = 2) -> nx.MultiDiGraph:
+def load_simple_graph(
+        num_layers: int = 2, 
+        width: int =3, 
+        layer_spacing: float = 1.0, 
+        node_spacing: float = 1.0, 
+        no_congestion: bool = False
+    ) -> nx.MultiDiGraph:
     """
     Build a “simple” layered grid with `num_layers` of 3-node rings:
       layer 0 = starts, layer 1 = first intermediates, etc.
@@ -301,54 +319,85 @@ def load_simple_graph(num_layers: int = 2) -> nx.MultiDiGraph:
            between consecutive layers, with lengths & highway tags.
     """
     # fixed coords for up to 6 layers of 3 nodes each
-    coords = {
-        0: (0.0, 0.0),   1: (0.0, 1.0),   2: (0.0, 2.0),
-        3: (1.0, 0.0),   4: (1.0, 1.0),   5: (1.0, 2.0),
-        6: (2.0, 0.0),   7: (2.0, 1.0),   8: (2.0, 2.0),
-        9: (3.0, 0.0),  10: (3.0, 1.0),  11: (3.0, 2.0),
-       12: (4.0, 0.0),  13: (4.0, 1.0),  14: (4.0, 2.0),
-       15: (5.0, 0.0),  16: (5.0, 1.0),  17: (5.0, 2.0),
-       18: (6.0, 0.0),  19: (6.0, 1.0),  20: (6.0, 2.0),
-       21: (7.0, 0.0),  22: (7.0, 1.0),  23: (7.0, 2.0),
-       24: (8.0, 0.0),  25: (8.0, 1.0),  26: (8.0, 2.0),
-       27: (9.0, 0.0),  28: (9.0, 1.0),  29: (9.0, 2.0),
-       30: (10.0, 0.0), 31: (10.0, 1.0), 32: (10.0, 2.0),
+    # coords = {
+    #     0: (0.0, 0.0),   1: (0.0, 1.0),   2: (0.0, 2.0),
+    #     3: (1.0, 0.0),   4: (1.0, 1.0),   5: (1.0, 2.0),
+    #     6: (2.0, 0.0),   7: (2.0, 1.0),   8: (2.0, 2.0),
+    #     9: (3.0, 0.0),  10: (3.0, 1.0),  11: (3.0, 2.0),
+    #    12: (4.0, 0.0),  13: (4.0, 1.0),  14: (4.0, 2.0),
+    #    15: (5.0, 0.0),  16: (5.0, 1.0),  17: (5.0, 2.0),
+    #    18: (6.0, 0.0),  19: (6.0, 1.0),  20: (6.0, 2.0),
+    #    21: (7.0, 0.0),  22: (7.0, 1.0),  23: (7.0, 2.0),
+    #    24: (8.0, 0.0),  25: (8.0, 1.0),  26: (8.0, 2.0),
+    #    27: (9.0, 0.0),  28: (9.0, 1.0),  29: (9.0, 2.0),
+    #    30: (10.0, 0.0), 31: (10.0, 1.0), 32: (10.0, 2.0),
 
-    }
+    # }
 
-    # six hard-coded 3-node layers
-    all_layers = [
-        [0, 1, 2],    # layer 0: starts
-        [3, 4, 5],    # layer 1
-        [6, 7, 8],    # layer 2
-        [9,10,11],    # layer 3
-        [12,13,14],   # layer 4
-        [15,16,17],   # layer 5
-        [18,19,20],   # layer 6
-        [21,22,23],   # layer 7
-        [24,25,26],   # layer 8
-        [27,28,29],   # layer 9
-        [30,31,32],   # layer 10
-    ]
+    # # six hard-coded 3-node layers
+    # all_layers = [
+    #     [0, 1, 2],    # layer 0: starts
+    #     [3, 4, 5],    # layer 1
+    #     [6, 7, 8],    # layer 2
+    #     [9,10,11],    # layer 3
+    #     [12,13,14],   # layer 4
+    #     [15,16,17],   # layer 5
+    #     [18,19,20],   # layer 6
+    #     [21,22,23],   # layer 7
+    #     [24,25,26],   # layer 8
+    #     [27,28,29],   # layer 9
+    #     [30,31,32],   # layer 10
+    # ]
 
-    # clamp to available layers
-    if num_layers < 1 or num_layers > len(all_layers):
-        raise ValueError(f"num_layers must be in [1..{len(all_layers)}], got {num_layers}")
-    layers = all_layers[:num_layers]
+    # 1) build coords & layer lists
+    coords = {}
+    layers = []
+    node_id = 0
+    for i in range(num_layers):
+        ys = np.arange(width) * node_spacing
+        xs = np.full(width, i * layer_spacing)
+        layer = []
+        for x, y in zip(xs, ys):
+            coords[node_id] = (x, y)
+            layer.append(node_id)
+            node_id += 1
+        layers.append(layer)
+
+    # # clamp to available layers
+    # if num_layers < 1 or num_layers > len(all_layers):
+    #     raise ValueError(f"num_layers must be in [1..{len(all_layers)}], got {num_layers}")
+    # layers = all_layers[:num_layers]
 
     # clamp to available coords
-    coords = {k: v for k, v in coords.items() if k < num_layers * 3}
+    # coords = {k: v for k, v in coords.items() if k < num_layers * 3}
 
     # (optional) define special highways if you need them
-    primary_edges = {(1,4), (4,7), (7,10), (10,13), (13,16), (16,19), (19,22), (22,25), (25,28), (28,31)}
-    secondary_edges = {}
-    highway_edges = {}
+    # primary_edges = {(1,4), (4,7), (7,10), (10,13), (13,16), (16,19), (19,22), (22,25), (25,28), (28,31)}
+    # secondary_edges = {}
+    # tertiary_edges = {(0,3), (3,6), (6,9), (9,12), (12,15), (15,18), (18,21), (21,24), (24,27), (27,30), 
+    #                   (2,5), (5,8), (8,11), (11,14), (14,17), (17,20), (20,23), (23,26), (26,29), (29,32)}
+    # highway_edges = {}
+    # residential_edges = {}
+
+    mid = width // 2
+    primary_edges   = {(layers[i][mid],   layers[i+1][mid])   for i in range(num_layers-1)}
+    secondary_edges = set()
+    tertiary_edges  = set()
+    for w in range(width):
+        if w == mid:
+            continue
+        tertiary_edges |= {(layers[i][w],    layers[i+1][w])    for i in range(num_layers-1)}
+    highway_edges = set()
+    residential_edges = set()
+
 
     def tag_for(u: int, v: int) -> str:
         if (u,v) in primary_edges:   return "primary"
         if (u,v) in secondary_edges:  return "secondary"
+        if (u,v) in tertiary_edges:    return "tertiary"
         if (u,v) in highway_edges:   return "motorway"
-        return "tertiary"
+        if (u,v) in residential_edges: return "residential"
+        return "residential"
 
     G = nx.MultiDiGraph()
     # add nodes with positions
@@ -368,7 +417,19 @@ def load_simple_graph(num_layers: int = 2) -> nx.MultiDiGraph:
                 G.add_edge(v, u, length=length, highway=hw)
 
     # apply whatever congestion model you have
-    apply_congestion_model(G)
+    if no_congestion:
+        multipliers = {
+            'motorway': 1, 'trunk': 1, 'primary': 1,
+            'secondary': 1, 'tertiary': 1, 'residential': 1,
+            'service': 1, 'living_street': 1, 'default': 1
+        }
+    else:
+        multipliers = {
+            'motorway': 1.2, 'trunk': 1.3, 'primary': 1.5,
+            'secondary': 1.7, 'tertiary': 1.9, 'residential': 2.0,
+            'service': 2.2, 'living_street': 2.5, 'default': 2.0
+        }
+    apply_congestion_model(G, multipliers)
     return G
 
 @struct.dataclass
@@ -380,7 +441,6 @@ class EstimateReturnsState:
     def create(cls, rollout_steps: int, gamma: float):
         return cls(discounts=gamma ** jnp.arange(rollout_steps))
 
-# @timeit
 def estimate_returns(
     env: TaxiEnv,
     params,
@@ -410,8 +470,9 @@ def estimate_returns(
         t, discount = t_and_discount
         st, acc = carry
         obs = obs_fn_batch(st)
-        q = model.apply(params, obs['state_feats'], obs['action_feats'], 
-                       st.neighbor_mask, obs['global_feats'])
+        # q = model.apply(params, obs['state_feats'], obs['action_feats'], 
+        #                st.neighbor_mask, obs['global_feats'])
+        q = model.apply(params, obs, st.neighbor_mask)
         act = jnp.argmax(q, axis=-1)
         nxt, r, _, _ = env.step(st, act)
         new_acc = acc + discount * r

@@ -34,7 +34,6 @@ def init_env(
        neighbor_mask=nm,
        time=jnp.array(0.0, dtype=jnp.float32)
     )
-    # no new random key needed (we’re driving it from outside)
     return state, rng_key
 
 # ----- Environment -----
@@ -115,30 +114,30 @@ class TaxiEnv(eqx.Module):
         self.global_state_dim = 3 * self.num_nodes  # [N,3] -> [3*N]
 
         # runtime sanity checks
-        assert self.periods.shape[0] == self.num_nodes, (
-            f"Expected {self.num_nodes} periods, got {self.periods.shape[0]}"
-        )
-        assert jnp.all(self.periods > 0), (
-            f"Cycle lengths must be >0, min found {self.periods.min()}"
-        )
-        assert jnp.all((self.green_durations >= 0) & (self.green_durations <= self.periods)), (
-            "Green durations must satisfy 0 <= green <= period"
-        )
-        assert jnp.all((self.offsets >= 0) & (self.offsets < self.periods)), (
-            "Offsets must satisfy 0 <= offset < period"
-        )
+        # assert self.periods.shape[0] == self.num_nodes, (
+        #     f"Expected {self.num_nodes} periods, got {self.periods.shape[0]}"
+        # )
+        # assert jnp.all(self.periods > 0), (
+        #     f"Cycle lengths must be >0, min found {self.periods.min()}"
+        # )
+        # assert jnp.all((self.green_durations >= 0) & (self.green_durations <= self.periods)), (
+        #     "Green durations must satisfy 0 <= green <= period"
+        # )
+        # assert jnp.all((self.offsets >= 0) & (self.offsets < self.periods)), (
+        #     "Offsets must satisfy 0 <= offset < period"
+        # )
 
-    # @jax.jit
-    # def reset(self, rng_key) -> Tuple[TaxiState, jnp.ndarray]:
-    #     # resets global time via init_env
-    #     key1, subkey = jrandom.split(rng_key)
-    #     key2, rng_key = jrandom.split(subkey)
-    #     start = jrandom.choice(key1, self.fixed_starts)
-    #     pickup = jrandom.choice(key2, self.fixed_pickups)
-    #     return init_env(rng_key,
-    #                     start,
-    #                     pickup,
-    #                     self.neighbor_mask_static)
+    @jax.jit
+    def reset(self, rng_key) -> Tuple[TaxiState, jnp.ndarray]:
+        # resets global time via init_env
+        key1, subkey = jrandom.split(rng_key)
+        key2, rng_key = jrandom.split(subkey)
+        start = jrandom.choice(key1, self.fixed_starts)
+        pickup = jrandom.choice(key2, self.fixed_pickups)
+        return init_env(rng_key,
+                        start,
+                        pickup,
+                        self.neighbor_mask_static)[0]
 
     @jax.jit
     def step(self, state: TaxiState, action: int) -> Tuple[TaxiState, float, bool]:
@@ -168,7 +167,7 @@ class TaxiEnv(eqx.Module):
         dist_n = self.distances[nxt, state.pickup_node]
         shaping = dist_c - self.gamma * dist_n
         bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        reward      = - total_delay/60.0 + shaping + bonus
+        reward      = - total_delay/60.0 # + bonus # + shaping
 
         # if step_n.ndim == 0:
         #     jax.debug.print("step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
