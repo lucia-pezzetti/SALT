@@ -499,7 +499,7 @@ def train(
         })
 
         # --- OT assignment ---
-        eps_ot = 0.1 * (1 - ep / epochs)  # decay epsilon for epsilon-greedy matching
+        eps_ot = 0.3 * (1 - ep / epochs)  # decay epsilon for epsilon-greedy matching
 
         # split one key for sampling and one for epsilon test
         key, eps_key, perm_key = random.split(key, 3)

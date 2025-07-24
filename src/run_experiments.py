@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 # 1) How many layers you want to sweep over
 LAYERS_TO_TEST = [10]  # adjust as needed
 
-WIDTHS = [5, 6, 7, 8, 9, 10]  # width of each layer
+WIDTHS = [3, 4, 5, 6, 7, 8, 9, 10]  # width of each layer
 
 # 2) How many offsets your simple env supports (0 through N-1)
 OFFSETS = [0.0, 40.0, 80.0, 120.0, 160.0]  # seconds into the cycle

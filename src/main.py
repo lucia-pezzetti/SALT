@@ -24,14 +24,14 @@ import pickle
 
 parser = argparse.ArgumentParser(description="Ride-sharing Simulator")
 parser.add_argument("--env_type", type=str, choices=["manhattan", "simple"], default="manhattan", help="Type of environment to use")
-parser.add_argument("--num_layers", type=int, default=3, help="Number of layers in the customised grid environment")
+parser.add_argument("--num_layers", type=int, default=4, help="Number of layers in the customised grid environment")
 parser.add_argument("--layer_width", type=int, default=3, help="Width of each layer in the customised grid environment")
 parser.add_argument("--offset", type=float, default=0.0, help="Offset for the customised grid environment")
 parser.add_argument("--cycle_length", type=int, default=200, help="Cycle length for the customised grid environment")
 parser.add_argument("--no_congestion", type=bool, default=False, help="different types of roads have different congestion levels")
 parser.add_argument("--place_name", type=str, default="Manhattan, New York City, New York, USA", help="Place name for the graph (used for Manhattan)")
 parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zones.shp", help="Path to the shapefile for zones (used for Manhattan)")
-parser.add_argument("--num_agents", type=int, default=5, help="Number of agents in the environment")
+parser.add_argument("--num_agents", type=int, default=1, help="Number of agents in the environment")
 parser.add_argument("--base_time", type=float, default=1.0, help="Base travel time for grid environment")
 parser.add_argument("--max_steps", type=int, default=128, help="Maximum number of steps per episode")
 parser.add_argument("--pickup_bonus", type=float, default=10.0, help="Bonus for picking up a passenger")
@@ -39,18 +39,18 @@ parser.add_argument("--timeout_penalty", type=float, default=-5.0, help="Penalty
 parser.add_argument("--n_expert_samples", type=int, default=50000, help="Number of expert samples for pretraining")
 parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512], help="Hidden dimensions for the neural network")
 parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for training")
-parser.add_argument("--epochs", type=int, default=5_000, help="Number of training epochs")
+parser.add_argument("--epochs", type=int, default=1_000, help="Number of training epochs")
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
 parser.add_argument("--num_steps", type=int, default=128, help="Number of steps for training")
-parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for training")
+parser.add_argument("--gamma", type=float, default=1.0, help="Discount factor for training")
 parser.add_argument("--epsilon_start", type=float, default=0.5, help="Initial epsilon for epsilon-greedy policy")
 parser.add_argument("--epsilon_end", type=float, default=0.1, help="Final epsilon for epsilon-greedy policy")
 parser.add_argument("--params_dir", type=str, default=None, help="Output file for pretrained parameters")
 parser.add_argument("--pretrain_ckpt", type=str, default="pretrained_params.pkl", help="Checkpoint file for pretrained parameters")
-parser.add_argument("--model", type=str, default="dqn", choices=["dqn", "pi"])
+parser.add_argument("--model", type=str, default="pi", choices=["dqn", "pi"])
 parser.add_argument("--pi_config", "-c", type=str, default="config.json", help="Path to pi configuration file")
-parser.add_argument("--wandb_project", type=str, default="taxi-dqn", help="WandB project name")
-parser.add_argument("--use_untied", type=bool, default=False, help="untied heads for Q-network")
+parser.add_argument("--wandb_project", type=str, default="taxi-pi", help="WandB project name")
+parser.add_argument("--use_untied", type=bool, default=True, help="untied heads for Q-network")
 
 args = parser.parse_args()
 
@@ -113,7 +113,7 @@ obs_fn_single, obs_fn_batch = make_obs_fn(env, G, node_to_idx)
 
 # --- Initialize batched environment states for metrics logging and evaluation ---
 num_envs = args.num_agents
-key = jax_random.PRNGKey(0)
+key = jax_random.PRNGKey(1)
 key1, key2 = jax_random.split(key)
 all_keys = jax_random.split(key2, 2 * num_envs)
 start_keys, pickup_keys = all_keys[:num_envs], all_keys[num_envs:]
@@ -143,8 +143,8 @@ batched_states = init_env_batch(
 estimate_state = EstimateReturnsState.create(rollout_steps=10, gamma=args.gamma)
 
 logger = wandb.init(
-        project="taxi-dqn",
-        name=f"taxi-dqn_run-{args.model}_{args.num_layers}_{args.layer_width}_{args.offset}",
+        project="taxi_pi",
+        name=f"taxi-pi_run-{args.model}_100layers_200sim_{args.offset}",
         config={
             "num_steps": args.num_steps,
             "epochs": args.epochs,
@@ -171,7 +171,7 @@ if args.model == "dqn":
         fixed_starts      = fixed_starts_idx,
         fixed_pickups     = fixed_pickups_idx,
         estimate_state    = estimate_state,
-        pretrain_ckpt     = args.pretrain_ckpt,
+        # pretrain_ckpt     = args.pretrain_ckpt,
         num_steps         = args.num_steps,
         epochs            = args.epochs,
         batch_size        = args.batch_size,
@@ -312,27 +312,27 @@ if args.model == "dqn":
     print(f"RL matching + RL policy avg time: {rl_on_rl_times.mean():.2f}")
     print(f"SP matching + SP policy avg time: {sp_on_sp_times.mean():.2f}")
 
-    if args.env_type == "simple":
-        best_routes = brute_force_shortest_path(env, args.num_layers, args.layer_width)
-        C = build_cost_matrix(
-            best_routes,
-            starts=starts.tolist(),
-            pickups=pickups.tolist()
-        )
-        _, bf_col = linear_sum_assignment(C)
-        bf_pickups = pickups[bf_col]
-        # print(f"Brute-force matching: starts - {starts}, pickups - {bf_pickups}")
-        avg_bf_time = 0
-        for i, (s, p) in enumerate(zip(onp.array(starts), onp.array(bf_pickups))):
-            # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}")
-            avg_bf_time += best_routes[(int(s), int(p))]["travel_time"]
-            # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}, travel time: {best_routes[(int(s), int(p))]['travel_time']}")
-        avg_bf_time /= len(starts)
-        print(f"Brute-force matching + SP policy avg time: {avg_bf_time:.2f}")
+    # brute force for small environments
+    # if args.env_type == "simple":
+    #     best_routes = brute_force_shortest_path(env, args.num_layers, args.layer_width)
+    #     C = build_cost_matrix(
+    #         best_routes,
+    #         starts=starts.tolist(),
+    #         pickups=pickups.tolist()
+    #     )
+    #     _, bf_col = linear_sum_assignment(C)
+    #     bf_pickups = pickups[bf_col]
+    #     # print(f"Brute-force matching: starts - {starts}, pickups - {bf_pickups}")
+    #     avg_bf_time = 0
+    #     for i, (s, p) in enumerate(zip(onp.array(starts), onp.array(bf_pickups))):
+    #         # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}")
+    #         avg_bf_time += best_routes[(int(s), int(p))]["travel_time"]
+    #         # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}, travel time: {best_routes[(int(s), int(p))]['travel_time']}")
+    #     avg_bf_time /= len(starts)
+    #     print(f"Brute-force matching + SP policy avg time: {avg_bf_time:.2f}")
 
 
 
-# --- Policy Improvement ---
 # --- Policy Improvement ---
 elif args.model == "pi":
     obs_fn_single, obs_fn_batch = make_obs_fn(env, G, node_to_idx)
@@ -344,14 +344,23 @@ elif args.model == "pi":
 
     # batch_size = num_agents
     config['batch_size'] = args.num_agents
+    config['num_steps'] = args.epochs * config['eval_frequency']
 
     init_fn = get_init_fn(env, config, obs_fn_single)
-    # Fixed: unpack all returned values from init_fn
-    key, env_states, V_apply, pi_func, V_opt_state, pi_opt_state, V_opt_update, pi_opt_update, get_V_params, V_target_params, get_pi_params, pi_params = init_fn(key)
+    key, env_states, V_apply, V_opt_state, V_opt_update, get_V_params, V_target_params = init_fn(key)
+
+    def linear_epsilon_decay(initial_eps=0.9, final_eps=0.1, decay_steps=10000):
+        """Linear decay from initial_eps to final_eps over decay_steps"""
+        def schedule(step):
+            progress = jnp.clip(step / decay_steps, 0.0, 1.0)
+            return initial_eps * (1.0 - progress) + final_eps * progress
+        return schedule
     
     # build rec fn & agent loop
-    recurrent_fn = get_recurrent_fn(env, V_apply, pi_func, obs_fn_batch)
-    agent_loop = get_agent_loop(env, config, obs_fn_batch, V_apply, pi_func, recurrent_fn, V_opt_update, pi_opt_update, get_V_params, get_pi_params)
+    key, subkey = jax_random.split(key)
+    epsilon_schedule = linear_epsilon_decay(initial_eps=0.9, final_eps=0.05, decay_steps= config['num_steps'])
+    recurrent_fn = get_recurrent_fn(env, V_apply, obs_fn_batch, epsilon_schedule)
+    agent_loop = get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_update, get_V_params, epsilon_schedule)
 
     # initialize stats
     state_dict = {
@@ -359,15 +368,14 @@ elif args.model == "pi":
         'env_states': env_states,
         'last_start': env_states.current_node,
         'V_opt_state': V_opt_state,
-        'pi_opt_state': pi_opt_state,  # Added missing pi_opt_state
         'V_params': V_target_params,
         'V_target_params': V_target_params,
-        'pi_params': pi_params,
         'opt_t': 0,
         'avg_return': jnp.zeros(config['batch_size']),
         'episode_return': jnp.zeros(config['batch_size']),
         'num_episodes': jnp.zeros(config['batch_size']),
-        'visit_counts': jnp.zeros(env.num_nodes, dtype=jnp.int32),  # Added visitation counts
+        'visit_counts': jnp.zeros(env.num_nodes, dtype=jnp.int32), 
+        'cumulative_visits': jnp.zeros(env.num_nodes, dtype=jnp.int32),
         'loss': jnp.array(0.0),  # Added loss tracking
         'episode_travel': jnp.zeros(config['batch_size']),
         'episode_wait': jnp.zeros(config['batch_size']),
@@ -378,38 +386,37 @@ elif args.model == "pi":
     avg_returns, times = [], []
     for i in tqdm(range(config['num_steps'] // config['eval_frequency'])):
         state_dict, metrics = agent_loop(state_dict)
-        valid_avg_returns = state_dict["avg_return"][state_dict["num_episodes"] > 0]
-        
-        if len(valid_avg_returns) > 0:
-            valid_num_episodes = state_dict["num_episodes"][state_dict["num_episodes"] > 0]
-            avg = jnp.mean(valid_avg_returns / (1 - config['avg_return_smoothing'] ** valid_num_episodes))
-            avg_returns.append(avg)
-            times.append((i + 1) * config['eval_frequency'])
             
         logger.log({
-            "avg_return": avg_returns[-1] if avg_returns else 0.0,
-            "visit_counts": state_dict['visit_counts'],
-            "loss": state_dict['loss'],
-            "avg_wait": jnp.mean(metrics['avg_wait']),
-            "avg_travel": jnp.mean(metrics['avg_travel']),
+            "avg_return": state_dict['avg_return'].mean(),
+            "visit_counts": wandb.Histogram(state_dict['visit_counts'].tolist()),
+            "cumulative_visits": wandb.Histogram(state_dict['cumulative_visits'].tolist()),
+            "loss": state_dict['loss']/config['eval_frequency'],
+            "avg_wait": state_dict['avg_wait'].mean(),
+            "avg_travel": state_dict['avg_travel'].mean(),
+        })
+        state_dict.update({
+            'episode_return': jnp.zeros(config['batch_size']),
+            'avg_travel': jnp.zeros(config['batch_size']),
+            'avg_wait': jnp.zeros(config['batch_size']),
+            'avg_return': jnp.zeros(config['batch_size']),
+            'num_episodes': jnp.zeros(config['batch_size']),
+            'episode_travel': jnp.zeros(config['batch_size']),
+            'episode_wait': jnp.zeros(config['batch_size']),
+            'visit_counts': jnp.zeros(env.num_nodes, dtype=jnp.int32),
+            'loss': jnp.array(0.0),
         })
             
 
     # Get final parameters
     final_V_params = state_dict['V_target_params']
-    final_pi_params = state_dict['pi_params']
+    # final_pi_params = state_dict['pi_params']
 
     # save
     with open(args.params_dir + '.out', 'wb') as f:
         pickle.dump({'config': config, 'avg_returns': avg_returns, 'times': times}, f)
     with open(args.params_dir + '.params', 'wb') as f:
-        pickle.dump({'V': final_V_params, 'pi': final_pi_params}, f)
-
-    def greedy_pi_policy(state: TaxiState) -> int:
-        """Use the learned policy to select actions greedily"""
-        obs = obs_fn_single(state)
-        pi_logits = pi_func(final_pi_params, obs.astype(float), state.neighbor_mask)
-        return int(jnp.argmax(pi_logits))
+        pickle.dump({'V': final_V_params}, f)
 
     def greedy_V_policy(state: TaxiState) -> int:
         """Use the learned value function to select actions greedily"""
@@ -468,66 +475,62 @@ elif args.model == "pi":
         
         return onp.array(times)
 
-
-    B = args.num_agents  # number of agents
-    key, eval_key = jax.random.split(key)
-    
-    # Sample evaluation start and pickup points
-    eval_keys = jax.random.split(eval_key, 2*B+1)
-    start_keys, pickup_keys, base_key = eval_keys[:B], eval_keys[B:2*B], eval_keys[-1]
-    init_keys  = jax.random.split(base_key, B**2)
-    eval_starts = jnp.array([jax.random.choice(k, env.fixed_starts) for k in start_keys])
-    eval_pickups = jnp.array([jax.random.choice(k, env.fixed_pickups) for k in pickup_keys])
-    
-    batch_init = jax.vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
-    
-    returns_matrix = estimate_returns_batch(
-        init_keys, V_apply, obs_fn_batch, batch_init,
-        final_V_params,
-        eval_starts, eval_pickups
-    )
-
-    print("returns_matrix:", returns_matrix)
-    
-    # Solve optimal transport problem
-    _, rl_assignment = optax.assignment.hungarian_algorithm(-returns_matrix)
-    rl_pickups = eval_pickups[rl_assignment]
-    print(f"Learned Policy: starts - {eval_starts}, pickups - {rl_pickups}")
-
-    pi_time = evaluate_policy(greedy_pi_policy, eval_starts, rl_pickups)
-
-    print(f"Value Policy: starts - {eval_starts}, pickups - {rl_pickups}")
-
-    v_time = evaluate_policy(greedy_V_policy, eval_starts, rl_pickups)
-
-    dist_np = onp.array(distances)  # to numpy for indexing
-    D = dist_np[onp.array(eval_starts), :][:, onp.array(eval_pickups)]
-    D = jnp.array(D, dtype=jnp.float32)
-    _, sp_col = optax.assignment.hungarian_algorithm(D)
-    sp_pickups = eval_pickups[sp_col]
-    print(f"SP Policy: starts - {eval_starts}, pickups - {sp_pickups}")
-
-    sp_time = evaluate_policy(sp_policy, eval_starts, sp_pickups)
-
-    print(f"  Learned Policy avg time: {pi_time.mean():.2f} s")
-    print(f"  Value Policy avg time:   {v_time.mean():.2f} s")
-    print(f"  SP Policy avg time:      {sp_time.mean():.2f} s")
-
-    if args.env_type == "simple":
-        best_routes = brute_force_shortest_path(env, args.num_layers, args.layer_width)
-        C = build_cost_matrix(
-            best_routes,
-            starts=eval_starts.tolist(),
-            pickups=eval_pickups.tolist()
+    for _ in range(1):
+        B = args.num_agents  # number of agents
+        key, eval_key = jax.random.split(key)
+        
+        # Sample evaluation start and pickup points
+        eval_keys = jax.random.split(eval_key, 2*B+1)
+        start_keys, pickup_keys, base_key = eval_keys[:B], eval_keys[B:2*B], eval_keys[-1]
+        init_keys  = jax.random.split(base_key, B**2)
+        eval_starts = jnp.array([jax.random.choice(k, env.fixed_starts) for k in start_keys])
+        eval_pickups = jnp.array([jax.random.choice(k, env.fixed_pickups) for k in pickup_keys])
+        
+        batch_init = jax.vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
+        
+        returns_matrix = estimate_returns_batch(
+            init_keys, V_apply, obs_fn_batch, batch_init,
+            final_V_params,
+            eval_starts, eval_pickups
         )
-        _, bf_col = linear_sum_assignment(C)
-        bf_pickups = eval_pickups[bf_col]
-        # print(f"Brute-force matching: starts - {starts}, pickups - {bf_pickups}")
-        avg_bf_time = 0
-        for i, (s, p) in enumerate(zip(onp.array(eval_starts), onp.array(bf_pickups))):
-            # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}")
-            avg_bf_time += best_routes[(int(s), int(p))]["travel_time"]
-            print("Brute force path:", best_routes[(int(s), int(p))]["path"])
-            # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}, travel time: {best_routes[(int(s), int(p))]['travel_time']}")
-        avg_bf_time /= len(eval_starts)
-        print(f"Brute-force avg time: {avg_bf_time:.2f} s")
+        
+        # Solve optimal transport problem
+        _, rl_assignment = optax.assignment.hungarian_algorithm(-returns_matrix)
+        rl_pickups = eval_pickups[rl_assignment]
+        # print(f"Learned Policy: starts - {eval_starts}, pickups - {rl_pickups}")
+
+        print(f"Value Policy: starts - {eval_starts}, pickups - {rl_pickups}")
+
+        v_time = evaluate_policy(greedy_V_policy, eval_starts, rl_pickups)
+
+        dist_np = onp.array(distances)  # to numpy for indexing
+        D = dist_np[onp.array(eval_starts), :][:, onp.array(eval_pickups)]
+        D = jnp.array(D, dtype=jnp.float32)
+        _, sp_col = optax.assignment.hungarian_algorithm(D)
+        sp_pickups = eval_pickups[sp_col]
+        print(f"SP Policy: starts - {eval_starts}, pickups - {sp_pickups}")
+
+        sp_time = evaluate_policy(sp_policy, eval_starts, sp_pickups)
+
+        print(f"Value Policy   avg time: {v_time.mean():.2f}")
+        print(f"SP Policy      avg time: {sp_time.mean():.2f}")
+
+        # Brute force for small environments
+        # if args.env_type == "simple":
+        #     best_routes = brute_force_shortest_path(env, args.num_layers, args.layer_width)
+        #     C = build_cost_matrix(
+        #         best_routes,
+        #         starts=eval_starts.tolist(),
+        #         pickups=eval_pickups.tolist()
+        #     )
+        #     _, bf_col = linear_sum_assignment(C)
+        #     bf_pickups = eval_pickups[bf_col]
+        #     # print(f"Brute-force matching: starts - {starts}, pickups - {bf_pickups}")
+        #     avg_bf_time = 0
+        #     for i, (s, p) in enumerate(zip(onp.array(eval_starts), onp.array(bf_pickups))):
+        #         # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}")
+        #         avg_bf_time += best_routes[(int(s), int(p))]["travel_time"]
+        #         # print("Brute force path:", best_routes[(int(s), int(p))]["path"])
+        #         # print(f"Brute-force matching: {i+1}/{len(starts)}: {s} -> {p}, travel time: {best_routes[(int(s), int(p))]['travel_time']}")
+        #     avg_bf_time /= len(eval_starts)
+        #     print(f"Brute-force    avg time: {avg_bf_time:.2f}")

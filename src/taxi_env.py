@@ -167,7 +167,9 @@ class TaxiEnv(eqx.Module):
         dist_n = self.distances[nxt, state.pickup_node]
         shaping = dist_c - self.gamma * dist_n
         bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        reward      = - total_delay/60.0 # + bonus # + shaping
+        reward      = - total_delay/60.0 #+ bonus # + shaping
+
+        # reward = jnp.where(reach, 0.0, reward)  # no reward if reached pickup
 
         # if step_n.ndim == 0:
         #     jax.debug.print("step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",

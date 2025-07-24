@@ -61,8 +61,10 @@ def make_obs_fn(
 
     def single_obs(s: TaxiState) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # -- State features --
-        xy_c = latlon[s.current_node]   # [2]
-        xy_p = latlon[s.pickup_node]    # [2]
+        # xy_c = latlon[s.current_node]   # [2]
+        # xy_p = latlon[s.pickup_node]    # [2]
+        xy_c = jnp.expand_dims(s.current_node, axis=-1)
+        xy_p = jnp.expand_dims(s.pickup_node, axis=-1)
         time = jnp.expand_dims(s.time, axis=-1)
         obs = jnp.concatenate([xy_c, xy_p, time], axis=-1)
 
