@@ -46,6 +46,7 @@ class TaxiEnv(eqx.Module):
     max_deg: int
     num_nodes: int
     distances: jnp.ndarray        # [num_nodes, num_nodes]
+    hop_distances: jnp.ndarray    # [num_nodes, num_nodes]
     max_steps: int
     fixed_starts: jnp.ndarray     # [num_starts]
     fixed_pickups: jnp.ndarray    # [num_pickups]
@@ -69,6 +70,7 @@ class TaxiEnv(eqx.Module):
         fixed_starts: Sequence[int],
         fixed_pickups: Sequence[int],
         distances: jnp.ndarray,
+        hop_distances: jnp.ndarray,
         max_steps: int,
         traffic_params: Dict[int, Tuple[float, float, float]],
         # alpha: float = 1.0,
@@ -81,7 +83,8 @@ class TaxiEnv(eqx.Module):
         self.travel_times = travel_times
         self.max_travel_time = travel_times.max()
         self.neighbor_mask_static = neighbor_mask_static
-        self.distances = distances
+        self.distances = distances  # shape [num_nodes, num_nodes]
+        self.hop_distances = hop_distances  # shape [num_nodes, num_nodes]
 
         # sizes
         self.num_nodes, self.max_deg = adj_list.shape
@@ -167,7 +170,7 @@ class TaxiEnv(eqx.Module):
         dist_n = self.distances[nxt, state.pickup_node]
         shaping = dist_c - self.gamma * dist_n
         bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        reward      = - total_delay/60.0 #+ bonus # + shaping
+        reward      = - total_delay/60.0 + bonus + shaping
 
         # reward = jnp.where(reach, 0.0, reward)  # no reward if reached pickup
 
@@ -193,4 +196,4 @@ class TaxiEnv(eqx.Module):
             neighbor_mask=nm,
             time=jnp.float32(norm_time)
         )
-        return new_state, reward, reach, {"wait": wait, "travel": travel}
+        return new_state, reward, done, {"wait": wait, "travel": travel}

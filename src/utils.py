@@ -318,36 +318,6 @@ def load_simple_graph(
         G: a MultiDiGraph containing only those layers, fully connected
            between consecutive layers, with lengths & highway tags.
     """
-    # fixed coords for up to 6 layers of 3 nodes each
-    # coords = {
-    #     0: (0.0, 0.0),   1: (0.0, 1.0),   2: (0.0, 2.0),
-    #     3: (1.0, 0.0),   4: (1.0, 1.0),   5: (1.0, 2.0),
-    #     6: (2.0, 0.0),   7: (2.0, 1.0),   8: (2.0, 2.0),
-    #     9: (3.0, 0.0),  10: (3.0, 1.0),  11: (3.0, 2.0),
-    #    12: (4.0, 0.0),  13: (4.0, 1.0),  14: (4.0, 2.0),
-    #    15: (5.0, 0.0),  16: (5.0, 1.0),  17: (5.0, 2.0),
-    #    18: (6.0, 0.0),  19: (6.0, 1.0),  20: (6.0, 2.0),
-    #    21: (7.0, 0.0),  22: (7.0, 1.0),  23: (7.0, 2.0),
-    #    24: (8.0, 0.0),  25: (8.0, 1.0),  26: (8.0, 2.0),
-    #    27: (9.0, 0.0),  28: (9.0, 1.0),  29: (9.0, 2.0),
-    #    30: (10.0, 0.0), 31: (10.0, 1.0), 32: (10.0, 2.0),
-
-    # }
-
-    # # six hard-coded 3-node layers
-    # all_layers = [
-    #     [0, 1, 2],    # layer 0: starts
-    #     [3, 4, 5],    # layer 1
-    #     [6, 7, 8],    # layer 2
-    #     [9,10,11],    # layer 3
-    #     [12,13,14],   # layer 4
-    #     [15,16,17],   # layer 5
-    #     [18,19,20],   # layer 6
-    #     [21,22,23],   # layer 7
-    #     [24,25,26],   # layer 8
-    #     [27,28,29],   # layer 9
-    #     [30,31,32],   # layer 10
-    # ]
 
     # 1) build coords & layer lists
     coords = {}
@@ -362,22 +332,6 @@ def load_simple_graph(
             layer.append(node_id)
             node_id += 1
         layers.append(layer)
-
-    # # clamp to available layers
-    # if num_layers < 1 or num_layers > len(all_layers):
-    #     raise ValueError(f"num_layers must be in [1..{len(all_layers)}], got {num_layers}")
-    # layers = all_layers[:num_layers]
-
-    # clamp to available coords
-    # coords = {k: v for k, v in coords.items() if k < num_layers * 3}
-
-    # (optional) define special highways if you need them
-    # primary_edges = {(1,4), (4,7), (7,10), (10,13), (13,16), (16,19), (19,22), (22,25), (25,28), (28,31)}
-    # secondary_edges = {}
-    # tertiary_edges = {(0,3), (3,6), (6,9), (9,12), (12,15), (15,18), (18,21), (21,24), (24,27), (27,30), 
-    #                   (2,5), (5,8), (8,11), (11,14), (14,17), (17,20), (20,23), (23,26), (26,29), (29,32)}
-    # highway_edges = {}
-    # residential_edges = {}
 
     mid = width // 2
     primary_edges   = {(layers[i][mid],   layers[i+1][mid])   for i in range(num_layers-1)}

@@ -36,10 +36,10 @@ parser.add_argument("--base_time", type=float, default=1.0, help="Base travel ti
 parser.add_argument("--max_steps", type=int, default=128, help="Maximum number of steps per episode")
 parser.add_argument("--pickup_bonus", type=float, default=10.0, help="Bonus for picking up a passenger")
 parser.add_argument("--timeout_penalty", type=float, default=-5.0, help="Penalty for timeout")
-parser.add_argument("--n_expert_samples", type=int, default=50000, help="Number of expert samples for pretraining")
+parser.add_argument("--n_expert_samples", type=int, default=5000, help="Number of expert samples for pretraining")
 parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512], help="Hidden dimensions for the neural network")
 parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for training")
-parser.add_argument("--epochs", type=int, default=1_000, help="Number of training epochs")
+parser.add_argument("--epochs", type=int, default=5_000, help="Number of training epochs")
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
 parser.add_argument("--num_steps", type=int, default=128, help="Number of steps for training")
 parser.add_argument("--gamma", type=float, default=1.0, help="Discount factor for training")
@@ -84,12 +84,23 @@ all_nodes = list(G.nodes())
 N = len(all_nodes)
 # print(f"Number of nodes in the graph: {N}")
 dist_mat = np.zeros((N, N), dtype=np.float32)
+hop_dist_mat = np.zeros((N,N), dtype=np.float32)
+max_length = 0
 for u, lengths in nx.all_pairs_dijkstra_path_length(G, weight="travel_time_congested"):
     ui = node_to_idx[u]
     for v, d in lengths.items():
         vi = node_to_idx[v]
         dist_mat[ui, vi] = d
+for u, lengths in nx.all_pairs_dijkstra_path_length(G, weight=None):
+    ui = node_to_idx[u]
+    for v, d in lengths.items():
+        vi = node_to_idx[v]
+        hop_dist_mat[ui, vi] = d
+        if d > max_length:
+            max_length = d
 distances = jnp.array(dist_mat)
+hop_distances = jnp.array(hop_dist_mat)
+print(f"Max shortest path: {max_length}")
 
 # --- Create environment ---
 # print("Instantiating environment")
@@ -100,6 +111,7 @@ env = TaxiEnv(
     fixed_starts=fixed_starts_idx,
     fixed_pickups=fixed_pickups_idx,
     distances=distances,
+    hop_distances=hop_distances,
     max_steps=args.max_steps,
     traffic_params= traffic_params,
     pickup_bonus=args.pickup_bonus,
@@ -142,23 +154,23 @@ batched_states = init_env_batch(
 # Pre-compute this once outside the training loop
 estimate_state = EstimateReturnsState.create(rollout_steps=10, gamma=args.gamma)
 
-logger = wandb.init(
-        project="taxi_pi",
-        name=f"taxi-pi_run-{args.model}_100layers_200sim_{args.offset}",
-        config={
-            "num_steps": args.num_steps,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "cycle_length": args.cycle_length,
-            "offset": args.offset,
-            "gamma": args.gamma,
-            "epsilon_start": args.epsilon_start,
-            "epsilon_end": args.epsilon_end,
-            "lr": args.lr,
-            "num_nodes": env.num_nodes,
-            "max_deg": env.max_deg,
-        }
-    )
+# logger = wandb.init(
+#         project="taxi_pi",
+#         name=f"taxi-pi_run-{args.model}_100layers_200sim_{args.offset}",
+#         config={
+#             "num_steps": args.num_steps,
+#             "epochs": args.epochs,
+#             "batch_size": args.batch_size,
+#             "cycle_length": args.cycle_length,
+#             "offset": args.offset,
+#             "gamma": args.gamma,
+#             "epsilon_start": args.epsilon_start,
+#             "epsilon_end": args.epsilon_end,
+#             "lr": args.lr,
+#             "num_nodes": env.num_nodes,
+#             "max_deg": env.max_deg,
+#         }
+#     )
 
 # --- DQN ---
 if args.model == "dqn":
@@ -179,7 +191,7 @@ if args.model == "dqn":
         gamma             = args.gamma,
         epsilon_start     = args.epsilon_start,
         epsilon_end       = args.epsilon_end,
-        logger            = logger,
+        # logger            = logger,
         use_untied        = args.use_untied,
     )
 
@@ -222,7 +234,7 @@ if args.model == "dqn":
 
     B = args.num_agents  # number of simultaneous taxi–passenger pairs
 
-    # 1) Sample one fixed batch of start & pickup indices
+    # Sample one fixed batch of start & pickup indices
     key, subkey = jax.random.split(eval_key)
     all_keys    = jax.random.split(subkey, 2 * B)
     start_keys, pickup_keys = all_keys[:B], all_keys[B:]
@@ -236,7 +248,7 @@ if args.model == "dqn":
         out_axes=(0, 0)
     )
 
-    # 2) Compute the RL‐matching via estimated returns (using your helper)
+    # Compute the RL‐matching via estimated returns (using your helper)
     def init_env_fn(starts: jnp.ndarray, pickups: jnp.ndarray):
             # make one new RNG‐key per trajectory
             rng_keys = jax.random.split(jax.random.PRNGKey(0), starts.shape[0])
@@ -248,7 +260,7 @@ if args.model == "dqn":
         init_env_fn,
         starts, pickups,
         estimate_state=estimate_state,
-        rollout_steps=10  # you can choose this horizon
+        rollout_steps=10
     )  # → shape [B, B]
     R = jnp.array(R, dtype=jnp.float32)
 
@@ -257,8 +269,7 @@ if args.model == "dqn":
     rl_pickups = pickups[rl_col]
     # print(f"RL matching: starts - {starts}, pickups - {rl_pickups}")
 
-    # 3) Compute the SP‐matching via true SP distances
-    #    (distances is your [N,N] JAX array from main)
+    # SP‐matching via pure SP distances
     dist_np = onp.array(distances)  # to numpy for indexing
     D = dist_np[onp.array(starts), :][:, onp.array(pickups)]
     D = jnp.array(D, dtype=jnp.float32)
@@ -266,14 +277,14 @@ if args.model == "dqn":
     sp_pickups = pickups[sp_col]
     # print(f"SP matching: starts - {starts}, pickups - {sp_pickups}")
 
-    # 4) Define a shortest-path greedy policy
+    # shortest-path greedy policy
     def sp_policy(G, state: TaxiState) -> int:
         curr = idx_to_node[int(state.current_node)]
         goal = idx_to_node[int(state.pickup_node)]
         path = nx.shortest_path(G, curr, goal, weight='travel_time_congested')
         return path
 
-    # 5) Rollout helper
+    # Rollout helper
     def eval_matching(starts, pickups, policy, G, node_to_idx) -> onp.ndarray:
         times = []
         for s, p in zip(onp.array(starts), onp.array(pickups)):
@@ -304,7 +315,6 @@ if args.model == "dqn":
             times.append(total)
         return onp.array(times)
 
-    # 6) Evaluate all four combinations
     rl_on_rl_times = eval_matching(starts,   rl_pickups, agent_policy, G, node_to_idx)
     sp_on_sp_times = eval_matching(starts,   sp_pickups, sp_policy, G, node_to_idx)
 
@@ -345,6 +355,8 @@ elif args.model == "pi":
     # batch_size = num_agents
     config['batch_size'] = args.num_agents
     config['num_steps'] = args.epochs * config['eval_frequency']
+    config['num_simulations'] = 2*max_length
+    print(f"Num simulations in tree search: {config['num_simulations']}")
 
     init_fn = get_init_fn(env, config, obs_fn_single)
     key, env_states, V_apply, V_opt_state, V_opt_update, get_V_params, V_target_params = init_fn(key)
@@ -359,7 +371,7 @@ elif args.model == "pi":
     # build rec fn & agent loop
     key, subkey = jax_random.split(key)
     epsilon_schedule = linear_epsilon_decay(initial_eps=0.9, final_eps=0.05, decay_steps= config['num_steps'])
-    recurrent_fn = get_recurrent_fn(env, V_apply, obs_fn_batch, epsilon_schedule)
+    recurrent_fn = get_recurrent_fn(env, V_apply, obs_fn_batch, epsilon_schedule, curriculum_steps=config['num_steps']*0.8)
     agent_loop = get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_update, get_V_params, epsilon_schedule)
 
     # initialize stats
@@ -387,14 +399,14 @@ elif args.model == "pi":
     for i in tqdm(range(config['num_steps'] // config['eval_frequency'])):
         state_dict, metrics = agent_loop(state_dict)
             
-        logger.log({
-            "avg_return": state_dict['avg_return'].mean(),
-            "visit_counts": wandb.Histogram(state_dict['visit_counts'].tolist()),
-            "cumulative_visits": wandb.Histogram(state_dict['cumulative_visits'].tolist()),
-            "loss": state_dict['loss']/config['eval_frequency'],
-            "avg_wait": state_dict['avg_wait'].mean(),
-            "avg_travel": state_dict['avg_travel'].mean(),
-        })
+        # logger.log({
+        #     "avg_return": state_dict['avg_return'].mean(),
+        #     "visit_counts": wandb.Histogram(state_dict['visit_counts'].tolist()),
+        #     "cumulative_visits": wandb.Histogram(state_dict['cumulative_visits'].tolist()),
+        #     "loss": state_dict['loss']/config['eval_frequency'],
+        #     "avg_wait": state_dict['avg_wait'].mean(),
+        #     "avg_travel": state_dict['avg_travel'].mean(),
+        # })
         state_dict.update({
             'episode_return': jnp.zeros(config['batch_size']),
             'avg_travel': jnp.zeros(config['batch_size']),
@@ -475,7 +487,7 @@ elif args.model == "pi":
         
         return onp.array(times)
 
-    for _ in range(1):
+    for _ in range(20):
         B = args.num_agents  # number of agents
         key, eval_key = jax.random.split(key)
         
