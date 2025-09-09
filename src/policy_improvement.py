@@ -128,27 +128,51 @@ class GraphAwareVFunction(hk.Module):
         self.cycle_length = config.get('cycle_length', 200)  # Default cycle length
         
     def __call__(self, obs, adj_list=None, road_types=None):
-        # Node embeddings
-        current_pos = obs[..., 0].astype(jnp.int32)
-        pickup_pos = obs[..., 1].astype(jnp.int32)
+        # # Node embeddings
+        # current_pos = obs[..., 0].astype(jnp.int32)
+        # pickup_pos = obs[..., 1].astype(jnp.int32)
 
-        # Learnable node embeddings
-        node_embeddings = hk.Embed(
-            self.max_nodes, 
-            self.node_embedding_dim,
-            w_init=hk.initializers.TruncatedNormal(stddev=0.02)
-        )
-        current_emb = node_embeddings(current_pos)
-        pickup_emb = node_embeddings(pickup_pos)
+        # # Learnable node embeddings
+        # node_embeddings = hk.Embed(
+        #     self.max_nodes, 
+        #     self.node_embedding_dim,
+        #     w_init=hk.initializers.TruncatedNormal(stddev=0.02)
+        # )
+        # current_emb = node_embeddings(current_pos)
+        # pickup_emb = node_embeddings(pickup_pos)
+
+        """
+        Enhanced value function for lat/lon-based observations.
+        Input: obs [..., 9] = [current_pos(2), pickup_pos(2), relative_pos(2), distance(1), angle(1), time(1)]
+        """
+        # Extract features from the 9-dimensional observation
+        current_pos = obs[..., 0:2]      # [..., 2] - current position (lat/lon)
+        pickup_pos = obs[..., 2:4]       # [..., 2] - pickup position (lat/lon)
+        relative_pos = obs[..., 4:6]     # [..., 2] - direction vector
+        distance = obs[..., 6:7]         # [..., 1] - distance to pickup
+        angle = obs[..., 7:8]            # [..., 1] - direction angle
+        time = obs[..., 8:9]    
         
         # Normalize time feature
-        time = obs[..., -1:]
         time = time / self.cycle_length  # Normalize by typical cycle length
+        
+        # Normalize distance (assuming max distance is around 1.0 for normalized coordinates)
+        distance = distance / 1.0  # Could be made configurable
+        
+        # Normalize angle to [-1, 1] range
+        angle = angle / jnp.pi  # Convert from [-π, π] to [-1, 1]
 
-        # Combine features
+        # Combine all features
         features = jnp.concatenate([
-            current_emb, pickup_emb, time
-        ], axis=-1)
+        #     current_emb, pickup_emb, time
+        # ], axis=-1)
+            current_pos,    # [..., 2] - current position
+            pickup_pos,     # [..., 2] - pickup position
+            relative_pos,   # [..., 2] - direction vector
+            distance,       # [..., 1] - distance
+            angle,          # [..., 1] - angle
+            time            # [..., 1] - time
+        ], axis=-1)  # Total: [..., 9]
         
         # Layer normalization for stability
         features = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(features)
@@ -238,7 +262,7 @@ def epsilon_greedy_qvalue_prior(env, V_apply, V_target_params, obs_fn_batch, sta
     next_obs = obs_fn_batch(next_states)
     
     # Compute values for all next states
-    next_values = vmap(V_apply, in_axes=(None, 0))(V_target_params, next_obs.astype(float))
+    next_values = vmap(V_apply, in_axes=(None, 0))(V_target_params, next_obs)
 
     # Compute Q-values: Q(s,a) = r + gamma * V(s') * (1 - done)
     qvalues = rewards + env.gamma * next_values * (1.0 - dones.astype(float))
@@ -255,7 +279,10 @@ def epsilon_greedy_qvalue_prior(env, V_apply, V_target_params, obs_fn_batch, sta
     uniform_prob = epsilon / jnp.maximum(num_valid, 1.0)  # Avoid division by zero
     greedy_prob = uniform_prob + (1.0 - epsilon)
     
-    # Start with uniform probability for valid actions, -inf for invalid
+    # # Simple uniform prior over valid actions (much faster than Q-value computation)
+    # uniform_prob = 1.0 / jnp.maximum(num_valid, 1.0)
+    
+    # Create logits: uniform for valid actions, -inf for invalid
     logits = jnp.where(mask, jnp.log(uniform_prob + 1e-8), -jnp.inf)
     # Add extra probability to best action
     logits = logits.at[best_action].set(jnp.log(greedy_prob + 1e-8))
@@ -290,7 +317,7 @@ def estimate_returns_batch(keys, V_apply, obs_fn_batch, batch_init,
     
     # Get value estimates directly from the learned value function
     batch_V = vmap(V_apply, in_axes=(None, 0))
-    returns = batch_V(V_params, obs.astype(float))
+    returns = batch_V(V_params, obs)
     
     # Reshape to [num_starts, num_pickups] matrix
     return returns.reshape(N, N)
@@ -317,12 +344,12 @@ def get_init_fn(env, config, obs_fn_single):
         dummy_state, _ = init_env(
             jax_random.PRNGKey(0), starts[0], pickups[0], env.neighbor_mask_static
         )
-        dummy_obs = obs_fn_single(dummy_state).astype(float)
-        dummy_mask = dummy_state.neighbor_mask.astype(float)
+        dummy_obs = obs_fn_single(dummy_state)
+        dummy_mask = dummy_state.neighbor_mask
 
         # build value network
-        V_net = hk.without_apply_rng(hk.transform(lambda obs: V_function(config)(obs.astype(float))))
-        # V_net = hk.without_apply_rng(hk.transform(lambda obs: GraphAwareVFunction(config)(obs.astype(float))))
+        # V_net = hk.without_apply_rng(hk.transform(lambda obs: V_function(config)(obs)))
+        V_net = hk.without_apply_rng(hk.transform(lambda obs: GraphAwareVFunction(config)(obs)))
         key, sk = jax.random.split(key)
         V_params = V_net.init(sk, dummy_obs)
         V_target_params = V_params  # for now, same as online params
@@ -355,8 +382,12 @@ def get_recurrent_fn(
 ):
     # pre‑compute next_hop[src, tgt] - the neighbor of i that lies on some shortest path to j.
     hop_dist = np.array(env.hop_distances)        # shape [N, N]
-    N    = hop_dist.shape[0]
+    N = hop_dist.shape[0]
     next_hop_np = np.zeros((N, N), dtype=int)
+    
+    # # Precompute action lookup table for faster node_to_action conversion
+    # action_lookup_np = np.zeros((N, N), dtype=int)
+    
     for src in range(N):
         # gather all 1‑hop neighbors of `src`
         neighs = np.where(hop_dist[src] == 1)[0]
@@ -371,14 +402,14 @@ def get_recurrent_fn(
             else:
                 # same node ⇒ action can be arbitrary (we'll never call it)
                 next_hop_np[src, tgt] = src
-
-    print(f"next_hop_np: {next_hop_np}")
+        
     next_hop = jnp.array(next_hop_np)  # JAX array, shape [N, N]
 
     # 2) vectorized env.step and V:
     batch_step = vmap(env.step, in_axes=(0, 0))
     batch_V    = vmap(V_apply, in_axes=(None, 0))
 
+    @jax.jit
     def rollout_value_fn(states):
         """
         True discounted return of following the shortest-path policy until pickup.
@@ -402,6 +433,7 @@ def get_recurrent_fn(
 
         def body_fn(carry):
             step, states, R, discount, done = carry
+
 
             # look up shortest-path neighbor for each instance in the batch:
             next_nodes = next_hop[ states.current_node, states.pickup_node ]   # [B] neighbor node ids
@@ -427,6 +459,14 @@ def get_recurrent_fn(
 
         _, _, final_R, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
         return final_R  # [B]
+        
+        # # Use precomputed distances as negative returns (shorter = better)
+        # curr, target = states.current_node, states.pickup_node  # shape [B]
+        # rem_dist = env.distances[curr, target]  # shape [B]
+        
+        # Convert distance to approximate return (negative cost)
+        # Scale by typical travel time to make it comparable to learned values
+        # return -rem_dist / 60.0  # shape [B]
 
     def recurrent_fn(params, key, actions, states):
         V_params   = params["V"]
@@ -515,7 +555,7 @@ def get_recurrent_fn(
 # --- Main training loop builder ---
 def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_update, get_V_params, epsilon_schedule_fn=None):
     batch_loss = lambda V_params, value_targets, obs: \
-        jnp.mean(vmap(lambda vp, vt, o: (V_apply(vp, o.astype(float)) - vt) ** 2, 
+        jnp.mean(vmap(lambda vp, vt, o: (V_apply(vp, o) - vt) ** 2, 
                      in_axes=(None, 0, 0))(V_params, value_targets, obs))
     loss_grad = grad(batch_loss)
     batch_step = vmap(env.step, in_axes=(0, 0))
@@ -531,8 +571,11 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         epsilon = epsilon_schedule_fn(state_dict['opt_t']) if epsilon_schedule_fn else 0.1
         # Generate Q-value based epsilon-greedy prior for root
         batch_size = state_dict['env_states'].current_node.shape[0]
-        state_dict['key'], subkey = jax.random.split(state_dict['key'])
-        keys = jax.random.split(subkey, batch_size)
+        
+        # Optimize random key splitting - split once and reuse
+        state_dict['key'], subkey1, subkey2 = jax.random.split(state_dict['key'], 3)
+        keys = jax.random.split(subkey1, batch_size)
+        
         root_prior = batch_epsilon_greedy_qvalue_prior(
             env, V_apply, V_params, obs_fn_batch, state_dict['env_states'], epsilon, keys)
         
@@ -545,12 +588,13 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
             embedding=state_dict['env_states']
         )
 
-        state_dict['key'], sk = jax.random.split(state_dict['key'])
+        # Use subkey2 for tree search
+        sk = subkey2
         
         # Combine parameters for recurrent function
         params = {"V": V_target_params, "step": state_dict['opt_t']}
 
-        inv_mask = jnp.logical_not(state_dict['env_states'].neighbor_mask).astype(jnp.float32)
+        inv_mask = jnp.logical_not(state_dict['env_states'].neighbor_mask)
         
         po = mctx.muzero_policy(
             params=params,
@@ -568,9 +612,10 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         )
         # extract search targets
         search_val = po.search_tree.node_values[:, po.search_tree.ROOT_INDEX]
+        value_targets = jax.lax.stop_gradient(search_val)
 
-        loss = batch_loss(V_params, search_val, obs)
-        V_grads = loss_grad(V_params, search_val, obs)
+        loss = batch_loss(V_params, value_targets, obs)
+        V_grads = loss_grad(V_params, value_targets, obs)
 
         # Update value function
         V_updates, state_dict['V_opt_state'] = V_opt_update(V_grads, state_dict['V_opt_state'], V_params)

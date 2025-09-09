@@ -143,7 +143,7 @@ class TaxiEnv(eqx.Module):
                         self.neighbor_mask_static)[0]
 
     @jax.jit
-    def step(self, state: TaxiState, action: int) -> Tuple[TaxiState, float, bool]:
+    def step(self, state: TaxiState, action: int) -> Tuple[TaxiState, float, bool, dict]:
         # Base move
         curr = state.current_node
         nxt = self.adj_list[curr, action]

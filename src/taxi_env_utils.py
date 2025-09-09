@@ -40,13 +40,16 @@ def make_obs_fn(
     G: nx.DiGraph,
     node_to_idx: Dict[int,int]
 ) -> Tuple[
-    Callable[[TaxiState], Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
-    Callable[[TaxiState], Dict[str, jnp.ndarray]]
+    Callable[[TaxiState], jnp.ndarray],
+    Callable[[TaxiState], jnp.ndarray]
 ]:
     """
     Returns two functions:
-      - single_obs: TaxiState -> (state_feats [6], action_feats [max_deg,2], global_feats [3*N])
-      - obs_fn_batch: batched TaxiState -> dict of trajectories
+    #   - single_obs: TaxiState -> (state_feats [6], action_feats [max_deg,2], global_feats [3*N])
+    #   - obs_fn_batch: batched TaxiState -> dict of trajectories
+      - single_obs: TaxiState -> observation vector [9] 
+        Features: [current_pos(2), pickup_pos(2), relative_pos(2), distance(1), angle(1), time(1)]
+      - obs_fn_batch: batched TaxiState -> batched observation vectors [B, 9]
     """
     # Precompute normalized lat/lon per node
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
@@ -59,23 +62,84 @@ def make_obs_fn(
         (lons - lon_min) / (lon_max - lon_min)
     ], axis=-1)  # [N,2]
 
-    def single_obs(s: TaxiState) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        # -- State features --
-        # xy_c = latlon[s.current_node]   # [2]
-        # xy_p = latlon[s.pickup_node]    # [2]
-        xy_c = jnp.expand_dims(s.current_node, axis=-1)
-        xy_p = jnp.expand_dims(s.pickup_node, axis=-1)
-        time = jnp.expand_dims(s.time, axis=-1)
-        obs = jnp.concatenate([xy_c, xy_p, time], axis=-1)
+    def single_obs(s: TaxiState) -> jnp.ndarray:
+        """
+        Enhanced observation function using lat/lon coordinates.
+        
+        Benefits over raw node indices:
+        1. Spatial awareness: Network can understand geographic relationships
+        2. Generalization: Can work across different graph structures
+        3. Rich features: Distance, direction, and relative positioning
+        4. Scale invariance: Normalized coordinates work across different map scales
+        """
+        # # -- State features --
+        # # xy_c = latlon[s.current_node]   # [2]
+        # # xy_p = latlon[s.pickup_node]    # [2]
+        # xy_c = jnp.expand_dims(s.current_node, axis=-1)
+        # xy_p = jnp.expand_dims(s.pickup_node, axis=-1)
+        # time = jnp.expand_dims(s.time, axis=-1)
+        # obs = jnp.concatenate([xy_c, xy_p, time], axis=-1)
+        # Use normalized lat/lon coordinates instead of raw node indices
+        xy_c = latlon[s.current_node]   # [2] - normalized lat/lon of current position
+        xy_p = latlon[s.pickup_node]    # [2] - normalized lat/lon of pickup position
+        time = jnp.expand_dims(s.time, axis=-1)  # [1] - current time
+        
+        # Compute relative position (direction vector from current to pickup)
+        relative_pos = xy_p - xy_c  # [2] - direction vector
+        
+        # Compute distance (Euclidean distance in normalized coordinates)
+        distance = jnp.linalg.norm(relative_pos)  # scalar
+        
+        # Compute angle (direction to pickup in radians)
+        angle = jnp.arctan2(relative_pos[1], relative_pos[0])  # scalar
+        
+        # Combine all features
+        obs = jnp.concatenate([
+            xy_c,           # [2] - current position (normalized lat/lon)
+            xy_p,           # [2] - pickup position (normalized lat/lon)
+            relative_pos,   # [2] - direction vector (pickup - current)
+            jnp.expand_dims(distance, axis=-1),  # [1] - straight-line distance
+            jnp.expand_dims(angle, axis=-1),     # [1] - direction angle in radians
+            time            # [1] - current time (for traffic awareness)
+        ], axis=-1)  # Total: [9] features
 
         return obs
+
+    # Alternative approaches for different use cases:
+    
+    # def single_obs_minimal(s: TaxiState) -> jnp.ndarray:
+    #     """Minimal approach: just current and pickup positions"""
+    #     xy_c = latlon[s.current_node]   # [2]
+    #     xy_p = latlon[s.pickup_node]    # [2]
+    #     time = jnp.expand_dims(s.time, axis=-1)  # [1]
+    #     return jnp.concatenate([xy_c, xy_p, time], axis=-1)  # [5]
+    
+    # def single_obs_rich(s: TaxiState) -> jnp.ndarray:
+    #     """Rich approach: includes neighborhood information"""
+    #     xy_c = latlon[s.current_node]   # [2]
+    #     xy_p = latlon[s.pickup_node]    # [2]
+    #     time = jnp.expand_dims(s.time, axis=-1)  # [1]
+    #     
+    #     # Get neighbor positions (for graph-aware features)
+    #     neighbors = env.adj_list[s.current_node]  # [max_deg]
+    #     valid_neighbors = neighbors[s.neighbor_mask]  # [num_valid_neighbors]
+    #     neighbor_positions = latlon[valid_neighbors]  # [num_valid_neighbors, 2]
+    #     
+    #     # Compute features relative to neighbors
+    #     neighbor_distances = jnp.linalg.norm(neighbor_positions - xy_c[None, :], axis=1)
+    #     avg_neighbor_distance = jnp.mean(neighbor_distances)
+    #     
+    #     return jnp.concatenate([
+    #         xy_c, xy_p, time,
+    #         jnp.expand_dims(avg_neighbor_distance, axis=-1)
+    #     ], axis=-1)  # [6]
 
     # JIT and batched versions
     single_obs = jax.jit(single_obs)
     single_obs_batched = jax.vmap(single_obs)
 
     @jax.jit
-    def obs_fn_batch(batch: TaxiState) -> Dict[str, jnp.ndarray]:
+    def obs_fn_batch(batch: TaxiState) -> jnp.ndarray:
         return single_obs_batched(batch)
 
     return single_obs, obs_fn_batch
