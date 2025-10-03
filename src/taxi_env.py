@@ -78,21 +78,21 @@ class TaxiEnv(eqx.Module):
         timeout_penalty: float = -50.0,
         gamma: float = 0.99,
     ):
-        # static graph data
-        self.adj_list = adj_list
-        self.travel_times = travel_times
-        self.max_travel_time = travel_times.max()
-        self.neighbor_mask_static = neighbor_mask_static
-        self.distances = distances  # shape [num_nodes, num_nodes]
-        self.hop_distances = hop_distances  # shape [num_nodes, num_nodes]
+        # static graph data - ensure all arrays are on GPU with proper dtypes
+        self.adj_list = jax.device_put(jnp.array(adj_list, dtype=jnp.int32))
+        self.travel_times = jax.device_put(jnp.array(travel_times, dtype=jnp.float32))
+        self.max_travel_time = float(travel_times.max())
+        self.neighbor_mask_static = jax.device_put(jnp.array(neighbor_mask_static, dtype=bool))
+        self.distances = jax.device_put(jnp.array(distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
+        self.hop_distances = jax.device_put(jnp.array(hop_distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
 
         # sizes
         self.num_nodes, self.max_deg = adj_list.shape
         self.max_steps = max_steps
 
-        # fixed starts/pickups
-        self.fixed_starts = jnp.array(fixed_starts, dtype=jnp.int32)
-        self.fixed_pickups = jnp.array(fixed_pickups, dtype=jnp.int32)
+        # fixed starts/pickups - ensure on GPU
+        self.fixed_starts = jax.device_put(jnp.array(fixed_starts, dtype=jnp.int32))
+        self.fixed_pickups = jax.device_put(jnp.array(fixed_pickups, dtype=jnp.int32))
 
         # congestion params
         self.pickup_bonus = pickup_bonus
@@ -100,35 +100,21 @@ class TaxiEnv(eqx.Module):
         # self.alpha = alpha
         self.gamma = gamma
 
-        # unpack traffic_params
-        nodes = jnp.array(list(traffic_params.keys()), dtype=jnp.int32)
-        params = jnp.array(list(traffic_params.values()), dtype=jnp.float32)  # shape [N,3]
+        # unpack traffic_params - ensure on GPU
+        nodes = jax.device_put(jnp.array(list(traffic_params.keys()), dtype=jnp.int32))
+        params = jax.device_put(jnp.array(list(traffic_params.values()), dtype=jnp.float32))  # shape [N,3]
         periods_vals = params[:, 0]
         green_vals  = params[:, 1]
         offset_vals = params[:, 2]
 
-        zeros = jnp.zeros((self.num_nodes,), dtype=jnp.float32)
+        zeros = jax.device_put(jnp.zeros((self.num_nodes,), dtype=jnp.float32))
         self.periods = zeros.at[nodes].set(periods_vals)
-        self.max_wait_time = self.periods.max()  # max cycle length
+        self.max_wait_time = float(self.periods.max())  # max cycle length - convert to Python float
         self.green_durations = zeros.at[nodes].set(green_vals)
         self.offsets = zeros.at[nodes].set(offset_vals)
 
         # global traffic params shape [num_nodes, 3] (green/period rate, is green, time to next switch)
         self.global_state_dim = 3 * self.num_nodes  # [N,3] -> [3*N]
-
-        # runtime sanity checks
-        # assert self.periods.shape[0] == self.num_nodes, (
-        #     f"Expected {self.num_nodes} periods, got {self.periods.shape[0]}"
-        # )
-        # assert jnp.all(self.periods > 0), (
-        #     f"Cycle lengths must be >0, min found {self.periods.min()}"
-        # )
-        # assert jnp.all((self.green_durations >= 0) & (self.green_durations <= self.periods)), (
-        #     "Green durations must satisfy 0 <= green <= period"
-        # )
-        # assert jnp.all((self.offsets >= 0) & (self.offsets < self.periods)), (
-        #     "Offsets must satisfy 0 <= offset < period"
-        # )
 
     @jax.jit
     def reset(self, rng_key) -> Tuple[TaxiState, jnp.ndarray]:
@@ -170,20 +156,8 @@ class TaxiEnv(eqx.Module):
         dist_n = self.distances[nxt, state.pickup_node]
         shaping = dist_c - self.gamma * dist_n
         bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        reward      = - total_delay/60.0 + bonus + shaping
+        reward      = - total_delay/60.0 #+ bonus + shaping
 
-        # reward = jnp.where(reach, 0.0, reward)  # no reward if reached pickup
-
-        # if step_n.ndim == 0:
-        #     jax.debug.print("step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
-        #                     step_n, done, curr, nxt, state.pickup_node, action,
-        #                     travel/60.0, wait/60.0, shaping, reward)
-        # else:
-        #     jax.debug.print("\n printing batch debug info")
-        #     jax.debug.print("0: step: {}, done: {}, curr: {}, nxt: {}, pickup: {}, action: {}, travel: {:.2f}, wait: {:.2f}, shaping: {:.2f}, reward: {:.2f}",
-        #             step_n[0], done[0], curr[0], nxt[0], state.pickup_node[0], action[0],
-        #             travel[0]/60.0, wait[0]/60.0, shaping[0], reward[0])
-            
         # 7) New neighbor mask
         nm = self.neighbor_mask_static[nxt]
 

@@ -29,6 +29,8 @@ def build_env(args):
         )
         fixed_starts_idx  = jnp.array(fixed_starts_idx, dtype=jnp.int32)
         fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
+        print(f"Fixed starts: {fixed_starts_idx}")
+        print(f"Fixed pickups: {fixed_pickups_idx}")
 
     elif args.env_type == 'simple':
         G = load_simple_graph(num_layers=args.num_layers, width=args.layer_width, no_congestion=args.no_congestion)
@@ -91,7 +93,7 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
 
     # Map zones to nodes, then filter to Financial District
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
-    # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
+    zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
     zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill East"]  
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]

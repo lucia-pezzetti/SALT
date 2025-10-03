@@ -137,8 +137,9 @@ class ReplayBuffer:
 
     @partial(jax.jit, static_argnums=(2,))
     def sample_fixed(self, key: jnp.ndarray, batch_size: int) -> dict:
-        # Sample with replacement to avoid shape issues
-        indices = jax.random.randint(key, (batch_size,), 0, self.size)
+        # FIXED: Add safety check for empty buffer
+        safe_size = jnp.maximum(self.size, 1)
+        indices = jax.random.randint(key, (batch_size,), 0, safe_size)
         
         # Sample from each buffer component
         batch_sample = {
@@ -185,6 +186,8 @@ def train(
     epsilon_end: float = 0.01,
     logger = None,
     use_untied: bool = False,
+    target_update_frequency: int = 1000,  # FIXED: Make configurable
+    min_buffer_size: int = 1000,  # FIXED: Make configurable
     ) -> dict:
 
     cum_visits = np.zeros(env.num_nodes, dtype=int)
@@ -291,9 +294,10 @@ def train(
                 q_vals = model.apply(params, sf, mask)  # [B, max_deg]
                 greedy = jnp.argmax(q_vals, axis=-1)
 
-                # uniform random over valid
-                probs = mask / jnp.sum(mask, axis=-1, keepdims=True)
-                rand = random.categorical(k1, jnp.log(probs))
+                # FIXED: uniform random over valid actions with safety check
+                valid_actions = jnp.any(mask, axis=-1, keepdims=True)
+                probs = jnp.where(valid_actions, mask / jnp.sum(mask, axis=-1, keepdims=True), mask.astype(jnp.float32))
+                rand = random.categorical(k1, jnp.log(probs + 1e-8))
                 explore = random.uniform(k2, (state.current_node.shape[0],)) < epsilon
                 action = jnp.where(explore, rand, greedy)
                 # jax.debug.print("State: {}, mask: {} action: {}, explore: {}, probs: {}, greedy: {}, rand: {}", 
@@ -321,7 +325,8 @@ def train(
     max_deg = env.max_deg
     freeze_epochs = 0.1 * epochs if pretrain_ckpt is not None else 0
     
-    D_state  = 5        # 2(curr_xy)+2(pick_xy)+time
+    # FIXED: Correct state dimension
+    D_state = 9        # 2(curr_xy)+2(pick_xy)+2(relative_pos)+1(distance)+1(angle)+1(time)
     
     if use_untied:
         model = QNetworkUntied(hidden_dim=128, num_actions=max_deg)
@@ -402,7 +407,8 @@ def train(
     # Training epochs
     states = init_state_fn()
     for ep in range(1, epochs+1):
-        eps = epsilon_start + (epsilon_end - epsilon_start) * (ep/epochs)
+        # FIXED: Use exponential epsilon decay
+        eps = epsilon_end + (epsilon_start - epsilon_end) * jnp.exp(-ep / (epochs * 0.3))
         key, subkey = random.split(key)
         # if ep > 150_000:
         #     jax.debug.print("Epoch {}: epsilon={}", ep, eps)
@@ -441,7 +447,9 @@ def train(
         # jax.debug.print("Epoch {}: buffer size={}", ep, buffer.size)
 
         # — sample & train from buffer —
-        if buffer.size >= batch_size:
+        # FIXED: Use minimum buffer size
+        loss = 0.0  # Initialize loss
+        if buffer.size >= min_buffer_size:
             for _ in range(2):
                 key, subkey = jax.random.split(key)
                 batch_sample = buffer.sample_fixed(subkey, batch_size)  # Returns JAX arrays
@@ -450,12 +458,13 @@ def train(
                     **batch_sample,  # No conversion needed
                     freeze_mask=(ep <= freeze_epochs)
                 )
-                # Update target network parameters via Polyak averaging 
-                τ = 0.005
-                target_params = jax.tree_util.tree_map(
-                    lambda p, tp: τ*p + (1-τ)*tp,
-                    params, target_params
-                )
+                # FIXED: Update target network with frequency control
+                if ep % target_update_frequency == 0:
+                    τ = 0.005
+                    target_params = jax.tree_util.tree_map(
+                        lambda p, tp: τ*p + (1-τ)*tp,
+                        params, target_params
+                    )
             # loss_history.append(loss.item())
 
         # --- 3) COMPUTE AND LOG YOUR METRICS ---
@@ -471,7 +480,7 @@ def train(
             total_sq += jnp.sum(diff * diff)
         update_norm = jnp.sqrt(total_sq).item()
 
-        # 3b) Q‐value stability on the actions you’d take
+        # 3b) Q‐value stability on the actions you'd take
         q_sel_val = jnp.take_along_axis(q_vals_val, act_val[:,None], axis=1).squeeze()
         if q_prev_val is None:
             q_prev_val = q_sel_val
@@ -487,16 +496,33 @@ def train(
         visits = np.array(visits)   # convert to host for wandb
         cum_visits += visits
 
-        logger.log({
-            "loss":              loss.item(),
-            "avg_episode_reward": avg_reward,
-            "avg_wait":          avg_wait,
-            "avg_travel":        avg_travel,
-            "update_norm":      update_norm,
-            "q_stability":      q_stability,
-            "visitation_counts": wandb.Histogram(visits.tolist()),
-            "cumulative_visits": wandb.Histogram(cum_visits.tolist()),
-        })
+        # Log metrics to wandb
+        wandb_metrics = {
+            "dqn/training/epoch": ep,
+            "dqn/training/loss": loss.item() if hasattr(loss, 'item') else loss,
+            "dqn/training/avg_episode_reward": avg_reward,
+            "dqn/training/avg_wait": avg_wait,
+            "dqn/training/avg_travel": avg_travel,
+            "dqn/training/update_norm": update_norm,
+            "dqn/training/q_stability": q_stability,
+            "dqn/training/epsilon": eps,
+            "dqn/training/buffer_size": buffer.size,
+            "dqn/training/visitation_counts": wandb.Histogram(visits.tolist()),
+            "dqn/training/cumulative_visits": wandb.Histogram(cum_visits.tolist()),
+        }
+        wandb.log(wandb_metrics, step=ep)
+
+        if logger:
+            logger.log({
+                "loss":              loss.item() if hasattr(loss, 'item') else loss,
+                "avg_episode_reward": avg_reward,
+                "avg_wait":          avg_wait,
+                "avg_travel":        avg_travel,
+                "update_norm":      update_norm,
+                "q_stability":      q_stability,
+                "visitation_counts": wandb.Histogram(visits.tolist()),
+                "cumulative_visits": wandb.Histogram(cum_visits.tolist()),
+            })
 
         # --- OT assignment ---
         eps_ot = 0.3 * (1 - ep / epochs)  # decay epsilon for epsilon-greedy matching

@@ -74,3 +74,19 @@ src/simulation_and_dropoff.py
 src/run_jax_taxi.sh
 
 test/
+
+wandb/
+old/
+tmp/
+training_logs/
+logs/
+src/*.out
+src/*.params
+src/*.pkl
+src/*.txt
+src/*.json
+src/*.log
+src/*.tmp
+src/*.sh
+plot_traveling_times.py
+*.png

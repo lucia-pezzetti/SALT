@@ -9,114 +9,15 @@ from functools import partial
 import numpy as np
 import optax
 import chex
-import pygraphviz
 from typing import Optional, Sequence
 
-# --- Import your Taxi environment ---
 from taxi_env import init_env, TaxiState
 
-def convert_tree_to_graph(
-        tree: mctx.Tree,
-        action_labels: Optional[Sequence[str]] = None,
-        batch_index: int = 0
-    ) -> pygraphviz.AGraph:
-    """Converts a search tree into a Graphviz AGraph, materializing JAX arrays first."""
-
-    if tree.node_values.ndim == 3:
-        # take only the final step
-        tree = tree.replace(
-        node_values         = tree.node_values        [-1],
-        node_visits         = tree.node_visits        [-1],
-        children_index      = tree.children_index     [-1],
-        children_rewards    = tree.children_rewards   [-1],
-        children_discounts  = tree.children_discounts [-1],
-        children_prior_logits = tree.children_prior_logits[-1],
-        )
-
-    chex.assert_rank(tree.node_values, 2)
-    B, N = tree.node_values.shape
-    _, _, A = tree.children_index.shape
-
-    node_values   = np.array(jax.device_get(tree.node_values   [batch_index]))  # shape [num_nodes]
-    node_visits   = np.array(jax.device_get(tree.node_visits   [batch_index]))
-    children_idxs = np.array(jax.device_get(tree.children_index[batch_index]))  # shape [num_nodes, num_actions]
-    orig_ids      = np.array(jax.device_get(tree.embeddings.current_node[batch_index]))
-    children_rew  = np.array(jax.device_get(tree.children_rewards [batch_index]))  # [num_nodes, num_actions]
-    children_dis  = np.array(jax.device_get(tree.children_discounts[batch_index]))
-    prior_logits  = np.array(jax.device_get(tree.children_prior_logits[batch_index]))  # [num_nodes, num_actions]
-
-    if action_labels is None:
-        action_labels = list(range(A))
-    elif len(action_labels) != A:
-        raise ValueError(f"Wrong number of action_labels: got {len(action_labels)}, expected {A}")
-
-    def node_to_str(i: int) -> str:
-        return (
-        f"{i}\n"
-        f"Original ID: {orig_ids[i]}\n"
-        f"Reward: {0.0:.2f}\n" 
-        f"Discount: {1.0:.2f}\n"
-        f"Value: {node_values[i]:.2f}\n"
-        f"Visits: {node_visits[i]}"
-        )
-
-    def edge_to_str(parent, a):
-        q_arr = np.array(jax.device_get(tree.qvalues(jax.numpy.array([parent]))[batch_index]))
-        p_arr = np.array(jax.device_get(jax.nn.softmax(prior_logits[parent])))
-        return f"{action_labels[a]}\nQ: {q_arr[a]:.2f}\np: {p_arr[a]:.2f}"
-
-    graph = pygraphviz.AGraph(directed=True)
-
-    # root
-    graph.add_node(0, label=node_to_str(0), color="green")
-
-    # expand out
-    for parent in range(node_values.shape[0]):
-        for a in range(A):
-            child = int(children_idxs[parent, a])
-            if child >= 0:
-                graph.add_node(
-                child,
-                label=(
-                    f"{child}\n"
-                    f"Original ID: {orig_ids[child]}\n"
-                    f"Reward: {children_rew[parent,a]:.2f}\n"
-                    f"Discount: {children_dis[parent,a]:.2f}\n"
-                    f"Value: {node_values[child]:.2f}\n"
-                    f"Visits: {node_visits[child]}"
-                ),
-                color="red"
-                )
-                graph.add_edge(parent, child, label=edge_to_str(parent, a))
-
-    return graph
-
-# map activation names if you still use a value network
+# map activation names
 activation_dict = {"relu": jax.nn.relu, "silu": jax.nn.silu, "elu": jax.nn.elu}
 
-# --- Value network ---
-class V_function(hk.Module):
-    def __init__(self, config, name=None):
-        super().__init__(name=name)
-        self.num_hidden_units = config['num_hidden_units']
-        self.num_hidden_layers = config['num_hidden_layers']
-        self.activation = activation_dict[config['activation']]
-        
-    def __call__(self, obs):
-        x = jnp.ravel(obs)
-        for _ in range(self.num_hidden_layers):
-            x = self.activation(hk.Linear(
-                self.num_hidden_units,
-                w_init=hk.initializers.VarianceScaling(1.0, "fan_in", "truncated_normal"),
-                b_init=hk.initializers.Constant(0.0)
-            )(x))
-        return hk.Linear(
-            1,
-            w_init=hk.initializers.VarianceScaling(1.0, "fan_in", "truncated_normal"),
-            b_init=hk.initializers.Constant(0.0)
-        )(x)[0]
-
-class GraphAwareVFunction(hk.Module):
+# Value network
+class VFunction(hk.Module):
     
     def __init__(self, config, name=None):
         super().__init__(name=name)
@@ -174,7 +75,7 @@ class GraphAwareVFunction(hk.Module):
             time            # [..., 1] - time
         ], axis=-1)  # Total: [..., 9]
         
-        # Layer normalization for stability
+        # Layer normalization
         features = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(features)
 
         # Process through MLP
@@ -192,7 +93,7 @@ class GraphAwareVFunction(hk.Module):
             if residual is not None:
                 x = x + residual  # Residual connection
                 
-        # Final layer with small initialization for stability
+        # Final layer
         output = hk.Linear(
             1,
             w_init=hk.initializers.VarianceScaling(0.1, "fan_in", "truncated_normal"),
@@ -202,47 +103,6 @@ class GraphAwareVFunction(hk.Module):
         # Clip output
         return jnp.clip(output, -100.0, 100.0)
 
-# class GraphAwareVFunction(hk.Module):
-#     """Value function that understands graph structure and road types"""
-    
-#     def __init__(self, config, name=None):
-#         super().__init__(name=name)
-#         self.hidden_dim = config['num_hidden_units']
-#         self.num_layers = config['num_hidden_layers'] 
-#         self.activation = activation_dict[config['activation']]
-#         self.node_embedding_dim = config.get('node_embedding_dim', 64)
-#         self.max_nodes = config.get('max_nodes', 100)
-        
-#     def __call__(self, obs, adj_list=None, road_types=None):
-#         # Node embeddings
-#         current_pos = obs[..., 0].astype(jnp.int32)
-#         pickup_pos = obs[..., 1].astype(jnp.int32)
-
-#         # Learnable node embeddings
-#         node_embeddings = hk.Embed(self.max_nodes, self.node_embedding_dim)
-#         current_emb = node_embeddings(current_pos)
-#         pickup_emb = node_embeddings(pickup_pos)
-        
-#         # global features: time
-#         time = obs[..., -1:]
-
-#         # Combine features
-#         features = jnp.concatenate([
-#             current_emb, pickup_emb,
-#             time
-#         ], axis=-1)  # [B, 2*node_embedding_dim + 1]
-
-#         # Process through MLP with residual connections
-#         x = features
-#         for i in range(self.num_layers):
-#             residual = x if x.shape[-1] == self.hidden_dim else None
-#             x = hk.Linear(self.hidden_dim)(x)
-#             x = self.activation(x)
-#             if residual is not None:
-#                 x = x + residual  # Residual connection
-                
-#         return hk.Linear(1)(x).squeeze(-1)  # Output value for each state
-    
 
 def epsilon_greedy_qvalue_prior(env, V_apply, V_target_params, obs_fn_batch, state: TaxiState, 
                                          epsilon: float, key: jax.random.PRNGKey) -> jnp.ndarray:
@@ -276,20 +136,15 @@ def epsilon_greedy_qvalue_prior(env, V_apply, V_target_params, obs_fn_batch, sta
     
     # Create epsilon-greedy logits
     num_valid = jnp.sum(mask)
-    uniform_prob = epsilon / jnp.maximum(num_valid, 1.0)  # Avoid division by zero
+    uniform_prob = epsilon / jnp.maximum(num_valid, 1.0)
     greedy_prob = uniform_prob + (1.0 - epsilon)
     
-    # # Simple uniform prior over valid actions (much faster than Q-value computation)
-    # uniform_prob = 1.0 / jnp.maximum(num_valid, 1.0)
-    
-    # Create logits: uniform for valid actions, -inf for invalid
+    # Create logits
     logits = jnp.where(mask, jnp.log(uniform_prob + 1e-8), -jnp.inf)
-    # Add extra probability to best action
     logits = logits.at[best_action].set(jnp.log(greedy_prob + 1e-8))
     
     return logits
 
-# Batch version of the efficient implementation
 def batch_epsilon_greedy_qvalue_prior(env, V_apply, V_params, obs_fn_batch, 
                                                states, epsilon: float, keys):
     """Efficient batch version"""
@@ -302,7 +157,7 @@ def batch_epsilon_greedy_qvalue_prior(env, V_apply, V_params, obs_fn_batch,
 def estimate_returns_batch(keys, V_apply, obs_fn_batch, batch_init, 
                           V_params, starts, pickups):
     
-    N = len(starts) # number of starts == number of pickups
+    N = len(starts)
     
     # Create all combinations of starts and pickups
     start_grid, pickup_grid = jnp.meshgrid(starts, pickups, indexing='ij')
@@ -317,13 +172,13 @@ def estimate_returns_batch(keys, V_apply, obs_fn_batch, batch_init,
     
     # Get value estimates directly from the learned value function
     batch_V = vmap(V_apply, in_axes=(None, 0))
-    returns = batch_V(V_params, obs)
+    returns = batch_V(V_params, obs.astype(float))
     
     # Reshape to [num_starts, num_pickups] matrix
     return returns.reshape(N, N)
 
 
-# --- Init function (vectorized) ---
+# Init function
 def get_init_fn(env, config, obs_fn_single):
     # vmap init_env over (key, start, pickup)
     batch_init = vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
@@ -348,11 +203,10 @@ def get_init_fn(env, config, obs_fn_single):
         dummy_mask = dummy_state.neighbor_mask
 
         # build value network
-        # V_net = hk.without_apply_rng(hk.transform(lambda obs: V_function(config)(obs)))
-        V_net = hk.without_apply_rng(hk.transform(lambda obs: GraphAwareVFunction(config)(obs)))
+        V_net = hk.without_apply_rng(hk.transform(lambda obs: VFunction(config)(obs)))
         key, sk = jax.random.split(key)
         V_params = V_net.init(sk, dummy_obs)
-        V_target_params = V_params  # for now, same as online params
+        V_target_params = V_params
         V_func = V_net.apply
 
         V_opt = optax.adamw(
@@ -372,7 +226,7 @@ def get_init_fn(env, config, obs_fn_single):
 
     return init_fn
 
-# --- Recurrent fn for tree-search ---
+# Recurrent fn for tree-search
 def get_recurrent_fn(
     env,
     V_apply,
@@ -381,31 +235,28 @@ def get_recurrent_fn(
     curriculum_steps: int = 100_000,
 ):
     # pre‑compute next_hop[src, tgt] - the neighbor of i that lies on some shortest path to j.
-    hop_dist = np.array(env.hop_distances)        # shape [N, N]
+    hop_dist = jnp.array(env.hop_distances)
     N = hop_dist.shape[0]
     next_hop_np = np.zeros((N, N), dtype=int)
     
-    # # Precompute action lookup table for faster node_to_action conversion
-    # action_lookup_np = np.zeros((N, N), dtype=int)
-    
     for src in range(N):
-        # gather all 1‑hop neighbors of `src`
-        neighs = np.where(hop_dist[src] == 1)[0]
+        # gather all 1-hop neighbors of `src`
+        neighs = jnp.where(hop_dist[src] == 1)[0]
         for tgt in range(N):
             d = hop_dist[src, tgt]
             if d > 0:
-                # pick the first neighbor whose dist-to-target is d-1
+                # find the first neighbor whose dist-to-target is d-1
                 for nei in neighs:
                     if hop_dist[nei, tgt] == d - 1:
                         next_hop_np[src, tgt] = nei
                         break
             else:
-                # same node ⇒ action can be arbitrary (we'll never call it)
+                # same node ⇒ action can be arbitrary
                 next_hop_np[src, tgt] = src
         
-    next_hop = jnp.array(next_hop_np)  # JAX array, shape [N, N]
+    next_hop = jax.device_put(jnp.array(next_hop_np, dtype=jnp.int32))
 
-    # 2) vectorized env.step and V:
+    # vectorized env.step and V
     batch_step = vmap(env.step, in_axes=(0, 0))
     batch_V    = vmap(V_apply, in_axes=(None, 0))
 
@@ -415,8 +266,8 @@ def get_recurrent_fn(
         True discounted return of following the shortest-path policy until pickup.
         """
         # how many steps max?
-        hop_dists     = env.hop_distances[states.current_node, states.pickup_node]  # [B]
-        max_steps = jnp.max(hop_dists)                                          # scalar
+        hop_dists     = env.hop_distances[states.current_node, states.pickup_node]
+        max_steps = jnp.max(hop_dists)
 
         B = states.current_node.shape[0]
         init_R     = jnp.zeros(B, dtype=jnp.float32)
@@ -428,25 +279,23 @@ def get_recurrent_fn(
 
         def cond_fn(carry):
             step, _, _, _, done = carry
-            # continue while we haven't hit max_steps AND at least one trajectory still alive
+            # continue while we haven't hit max_steps and at least one trajectory still alive
             return jnp.logical_and(step < max_steps, jnp.any(~done))
 
         def body_fn(carry):
             step, states, R, discount, done = carry
 
-
-            # look up shortest-path neighbor for each instance in the batch:
-            next_nodes = next_hop[ states.current_node, states.pickup_node ]   # [B] neighbor node ids
+            # look up shortest-path neighbor for each instance in the batch
+            next_nodes = next_hop[ states.current_node, states.pickup_node ]
 
             # map neighbor node ids to action indices expected by env.step (slot in adj_list)
             def node_to_action(curr_node, target_node):
-                nbrs = env.adj_list[curr_node]  # [max_deg]
+                nbrs = env.adj_list[curr_node]
                 # find index where adj_list[curr_node, j] == target_node
-                # size=1 guarantees a value even if padded; mask ensures only valid are used
                 pos = jnp.where(nbrs == target_node, size=1)[0][0]
                 return jnp.int32(pos)
 
-            actions = jax.vmap(node_to_action)(states.current_node, next_nodes)  # [B]
+            actions = jax.vmap(node_to_action)(states.current_node, next_nodes)
 
             next_s, rew, term, _ = batch_step(states, actions)
 
@@ -458,15 +307,7 @@ def get_recurrent_fn(
             return (step + 1, next_s, R, discount, done)
 
         _, _, final_R, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
-        return final_R  # [B]
-        
-        # # Use precomputed distances as negative returns (shorter = better)
-        # curr, target = states.current_node, states.pickup_node  # shape [B]
-        # rem_dist = env.distances[curr, target]  # shape [B]
-        
-        # Convert distance to approximate return (negative cost)
-        # Scale by typical travel time to make it comparable to learned values
-        # return -rem_dist / 60.0  # shape [B]
+        return final_R
 
     def recurrent_fn(params, key, actions, states):
         V_params   = params["V"]
@@ -474,22 +315,22 @@ def get_recurrent_fn(
         ε          = epsilon_schedule_fn(step_count) if epsilon_schedule_fn else 0.1
         alpha      = jnp.clip(step_count / float(curriculum_steps), 0.0, 1.0)
 
-        # 1) actual environment step
+        # actual environment step
         next_states, rewards, terminals, _ = batch_step(states, actions)
         obs = obs_fn_batch(next_states)
 
-        # 2) rollout return under shortest-path policy
+        # rollout return under shortest-path policy
         rollout_vals = rollout_value_fn(next_states)  # shape [B]
 
-        # 3) your learned V
+        # your learned V
         V_learned = batch_V(V_params, obs)            # [B] or [B,1]
         V_learned = jnp.squeeze(V_learned)            # make sure [B]
         V_learned = jnp.where(terminals, 0.0, V_learned)
 
-        # 4) curriculum mix (optional)
+        # curriculum mix
         value = (1.0 - alpha) * rollout_vals + alpha * V_learned
 
-        # 5) ε‑greedy prior (unchanged)
+        # ε‑greedy prior
         B = next_states.current_node.shape[0]
         keys = jax.random.split(key, B)
         pi_logits = batch_epsilon_greedy_qvalue_prior(
@@ -505,59 +346,13 @@ def get_recurrent_fn(
 
     return recurrent_fn
 
-# def get_recurrent_fn(env, V_apply, obs_fn_batch, epsilon_schedule_fn=None, curriculum_steps: int = 100_000):
-#     batch_step = vmap(env.step, in_axes=(0, 0))
-#     batch_V    = vmap(V_apply,   in_axes=(None, 0))
-
-#     # ------------------------------------------------------------------
-#     # Rollout value via shortest‐path heuristic:
-#     # for each next_state, look up the precomputed distance from
-#     # its current node to its assigned pickup (in env.fixed_pickups),
-#     # then negate to turn a “cost” into a return.
-#     def rollout_value_fn(states):
-#         curr, target = states.current_node, states.pickup_node                # shape [B]
-#         rem_dist = env.distances[curr, target]    # shape [B]
-    
-#         return -rem_dist                          # shape [B]
-#     # ------------------------------------------------------------------
- 
-#     def recurrent_fn(params, key, actions, states):
-#         V_params = params.get("V", None)
- 
-#         current_step = params.get("step", 0)
-#         epsilon = epsilon_schedule_fn(current_step) if epsilon_schedule_fn else 0.1
-#         next_states, rewards, terminals, _ = batch_step(states, actions)
-#         obs = obs_fn_batch(next_states)
-
-#         # compute value via shortest‐path rollout
-#         rollout_vals = rollout_value_fn(next_states)             # [B]
-#         V_learned = batch_V(V_params, obs)            # [B] or [B,1]
-#         alpha = jnp.clip(current_step / float(curriculum_steps), 0.0, 1.0)
-
-#         # 4) curriculum mix (optional)
-#         value = (1.0 - alpha) * rollout_vals + alpha * V_learned
-
-#         # 5) ε‑greedy prior (unchanged)
-#         B = next_states.current_node.shape[0]
-#         keys = jax.random.split(key, B)
-#         pi_logits = batch_epsilon_greedy_qvalue_prior(
-#             env, V_apply, params.get("V"), obs_fn_batch, next_states, epsilon, keys)
-
-#         return mctx.RecurrentFnOutput(
-#             reward      = rewards,
-#             discount    = (1.0 - terminals) * env.gamma,
-#             prior_logits= pi_logits,
-#             value       = value
-#         ), next_states
-    
-#     return recurrent_fn
-
-# --- Main training loop builder ---
+# Main training loop builder
 def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_update, get_V_params, epsilon_schedule_fn=None):
-    batch_loss = lambda V_params, value_targets, obs: \
-        jnp.mean(vmap(lambda vp, vt, o: (V_apply(vp, o) - vt) ** 2, 
+    @jax.jit
+    def batch_loss(V_params, value_targets, obs):
+        return jnp.mean(vmap(lambda vp, vt, o: (V_apply(vp, o) - vt) ** 2, 
                      in_axes=(None, 0, 0))(V_params, value_targets, obs))
-    loss_grad = grad(batch_loss)
+    loss_grad = jax.jit(grad(batch_loss))
     batch_step = vmap(env.step, in_axes=(0, 0))
     batch_V = vmap(V_apply, in_axes=(None, 0))
     batch_reset = vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
@@ -572,7 +367,6 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         # Generate Q-value based epsilon-greedy prior for root
         batch_size = state_dict['env_states'].current_node.shape[0]
         
-        # Optimize random key splitting - split once and reuse
         state_dict['key'], subkey1, subkey2 = jax.random.split(state_dict['key'], 3)
         keys = jax.random.split(subkey1, batch_size)
         
@@ -587,8 +381,6 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
             value=V,
             embedding=state_dict['env_states']
         )
-
-        # Use subkey2 for tree search
         sk = subkey2
         
         # Combine parameters for recurrent function
@@ -651,8 +443,11 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
 
         state_dict['episode_travel'] = state_dict['episode_travel'] + info['travel']
         state_dict['episode_wait'] = state_dict['episode_wait'] + info['wait']
+        # Track total episode time (travel + wait) for completed episodes
+        state_dict['episode_total_time'] = state_dict['episode_travel'] + state_dict['episode_wait']
         episode_total_travel = state_dict['episode_travel']
         episode_total_wait = state_dict['episode_wait']
+        episode_total_time = state_dict['episode_total_time']
 
         # update statistics
         state_dict.update({
@@ -668,6 +463,7 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         state_dict['episode_return'] = jnp.where(terminals, 0, state_dict['episode_return'])
         state_dict['episode_travel'] = jnp.where(terminals, 0, state_dict['episode_travel'])
         state_dict['episode_wait'] = jnp.where(terminals, 0, state_dict['episode_wait'])
+        state_dict['episode_total_time'] = jnp.where(terminals, 0, state_dict['episode_total_time'])
 
         state_dict['avg_travel'] = jnp.where(
             state_dict['num_episodes'] > 0,
@@ -677,6 +473,11 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         state_dict['avg_wait'] = jnp.where(
             state_dict['num_episodes'] > 0,
             episode_total_wait / state_dict['num_episodes'],
+            0.0
+        )
+        state_dict['avg_total_time'] = jnp.where(
+            state_dict['num_episodes'] > 0,
+            episode_total_time / state_dict['num_episodes'],
             0.0
         )
 
@@ -745,6 +546,15 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         state_dict['key'] = key
 
         freq = state_dict['visit_counts'] / state_dict['visit_counts'].sum()
-        return state_dict, {'loss': state_dict['loss'], 'avg_return': state_dict['avg_return'], 'visit_freq': freq, 'avg_wait': jnp.mean(metrics['wait']), 'avg_travel': jnp.mean(metrics['travel'])}
+        return state_dict, {
+            'loss': state_dict['loss'], 
+            'avg_return': state_dict['avg_return'], 
+            'visit_freq': freq, 
+            'avg_wait': jnp.mean(metrics['wait']), 
+            'avg_travel': jnp.mean(metrics['travel']), 
+            'avg_total_time': jnp.mean(state_dict['avg_total_time']),
+            'starts': starts,
+            'pickups': pickups
+        }
 
     return run_loop

@@ -33,7 +33,8 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
             times[i, n_neighbors:] = times[i, 0]
         neighbor_mask[i, :n_neighbors] = True
 
-    return jnp.array(adj), jnp.array(times), jnp.array(neighbor_mask)
+    # Ensure arrays are on GPU with proper dtypes
+    return jax.device_put(jnp.array(adj, dtype=jnp.int32)), jax.device_put(jnp.array(times, dtype=jnp.float32)), jax.device_put(jnp.array(neighbor_mask, dtype=bool))
 
 def make_obs_fn(
     env: TaxiEnv,
@@ -51,16 +52,16 @@ def make_obs_fn(
         Features: [current_pos(2), pickup_pos(2), relative_pos(2), distance(1), angle(1), time(1)]
       - obs_fn_batch: batched TaxiState -> batched observation vectors [B, 9]
     """
-    # Precompute normalized lat/lon per node
+    # Precompute normalized lat/lon per node - ensure on GPU
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
-    lats = jnp.array([G.nodes[n]['y'] for n in idx_to_node], dtype=jnp.float32)
-    lons = jnp.array([G.nodes[n]['x'] for n in idx_to_node], dtype=jnp.float32)
+    lats = jax.device_put(jnp.array([G.nodes[n]['y'] for n in idx_to_node], dtype=jnp.float32))
+    lons = jax.device_put(jnp.array([G.nodes[n]['x'] for n in idx_to_node], dtype=jnp.float32))
     lat_min, lat_max = lats.min(), lats.max()
     lon_min, lon_max = lons.min(), lons.max()
-    latlon = jnp.stack([
+    latlon = jax.device_put(jnp.stack([
         (lats - lat_min) / (lat_max - lat_min),
         (lons - lon_min) / (lon_max - lon_min)
-    ], axis=-1)  # [N,2]
+    ], axis=-1))  # [N,2]
 
     def single_obs(s: TaxiState) -> jnp.ndarray:
         """
@@ -73,12 +74,7 @@ def make_obs_fn(
         4. Scale invariance: Normalized coordinates work across different map scales
         """
         # # -- State features --
-        # # xy_c = latlon[s.current_node]   # [2]
-        # # xy_p = latlon[s.pickup_node]    # [2]
-        # xy_c = jnp.expand_dims(s.current_node, axis=-1)
-        # xy_p = jnp.expand_dims(s.pickup_node, axis=-1)
-        # time = jnp.expand_dims(s.time, axis=-1)
-        # obs = jnp.concatenate([xy_c, xy_p, time], axis=-1)
+
         # Use normalized lat/lon coordinates instead of raw node indices
         xy_c = latlon[s.current_node]   # [2] - normalized lat/lon of current position
         xy_p = latlon[s.pickup_node]    # [2] - normalized lat/lon of pickup position
@@ -88,53 +84,24 @@ def make_obs_fn(
         relative_pos = xy_p - xy_c  # [2] - direction vector
         
         # Compute distance (Euclidean distance in normalized coordinates)
-        distance = jnp.linalg.norm(relative_pos)  # scalar
+        distance = jnp.linalg.norm(relative_pos, axis=-1, keepdims=True)  # [1] - keepdims for batching
         
         # Compute angle (direction to pickup in radians)
-        angle = jnp.arctan2(relative_pos[1], relative_pos[0])  # scalar
+        angle = jnp.arctan2(relative_pos[..., 1:2], relative_pos[..., 0:1])  # [1] - use slicing for batching
         
         # Combine all features
         obs = jnp.concatenate([
             xy_c,           # [2] - current position (normalized lat/lon)
             xy_p,           # [2] - pickup position (normalized lat/lon)
             relative_pos,   # [2] - direction vector (pickup - current)
-            jnp.expand_dims(distance, axis=-1),  # [1] - straight-line distance
-            jnp.expand_dims(angle, axis=-1),     # [1] - direction angle in radians
+            distance,       # [1] - straight-line distance (already has keepdims=True)
+            angle,          # [1] - direction angle in radians (already has correct shape)
             time            # [1] - current time (for traffic awareness)
         ], axis=-1)  # Total: [9] features
 
         return obs
 
-    # Alternative approaches for different use cases:
-    
-    # def single_obs_minimal(s: TaxiState) -> jnp.ndarray:
-    #     """Minimal approach: just current and pickup positions"""
-    #     xy_c = latlon[s.current_node]   # [2]
-    #     xy_p = latlon[s.pickup_node]    # [2]
-    #     time = jnp.expand_dims(s.time, axis=-1)  # [1]
-    #     return jnp.concatenate([xy_c, xy_p, time], axis=-1)  # [5]
-    
-    # def single_obs_rich(s: TaxiState) -> jnp.ndarray:
-    #     """Rich approach: includes neighborhood information"""
-    #     xy_c = latlon[s.current_node]   # [2]
-    #     xy_p = latlon[s.pickup_node]    # [2]
-    #     time = jnp.expand_dims(s.time, axis=-1)  # [1]
-    #     
-    #     # Get neighbor positions (for graph-aware features)
-    #     neighbors = env.adj_list[s.current_node]  # [max_deg]
-    #     valid_neighbors = neighbors[s.neighbor_mask]  # [num_valid_neighbors]
-    #     neighbor_positions = latlon[valid_neighbors]  # [num_valid_neighbors, 2]
-    #     
-    #     # Compute features relative to neighbors
-    #     neighbor_distances = jnp.linalg.norm(neighbor_positions - xy_c[None, :], axis=1)
-    #     avg_neighbor_distance = jnp.mean(neighbor_distances)
-    #     
-    #     return jnp.concatenate([
-    #         xy_c, xy_p, time,
-    #         jnp.expand_dims(avg_neighbor_distance, axis=-1)
-    #     ], axis=-1)  # [6]
-
-    # JIT and batched versions
+    # JIT and batched versions - ensure proper compilation
     single_obs = jax.jit(single_obs)
     single_obs_batched = jax.vmap(single_obs)
 
@@ -226,28 +193,19 @@ def build_traffic_params(G: nx.DiGraph,
         if any(t in ("motorway", "trunk") for t in types):
             cycle, green = cycle_length, cycle_length    # effectively always green
         elif any(t == "primary" for t in types):
-            cycle, green = cycle_length, 5.0/6.0 * cycle_length
+            cycle, green = cycle_length, cycle_length * 5.0/6.0
         elif any(t == "secondary" for t in types):
-            cycle, green = cycle_length, 2.0/3.0 * cycle_length
+            cycle, green = cycle_length, cycle_length * 2.0/3.0
         elif any(t == "tertiary" for t in types):
-            cycle, green = cycle_length, 1.0/6.0 * cycle_length
+            cycle, green = cycle_length, cycle_length * 1.0/6.0
         elif any(t in ("residential", "living_street") for t in types):
-            cycle, green = cycle_length, 1.0/6.0 * cycle_length
+            cycle, green = cycle_length, cycle_length * 1.0/6.0
         else:
             cycle, green = cycle_length, cycle_length
 
-        # random phase offset
+        # fixed phase offset
         offset = offset
-        # --- VALIDITY CHECKS ---
-        # assert cycle > 0, f"Cycle length for node {node} must be positive, got {cycle}"
-        # assert green > 0, f"Green duration must be positive, got {green}"
-        # assert green <= cycle, (
-        #     f"Green duration ({green}) exceeds cycle ({cycle}) at node {node}"
-        # )
-        # assert 0 <= offset < cycle, (
-        #     f"Offset {offset:.2f} not in [0, {cycle}) for node {node}"
-        # )
-
+        
         traffic_params[node_to_idx[node]] = (cycle, green, offset)
 
     missing = set(node_to_idx.values()) - set(traffic_params.keys())
