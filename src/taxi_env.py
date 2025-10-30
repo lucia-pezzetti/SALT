@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrandom  
 import equinox as eqx
-from typing import NamedTuple, Sequence, Tuple, Dict
+from typing import NamedTuple, Sequence, Tuple, Dict, Optional
 import gymnasium as gym
 
 # ----- State -----
@@ -47,6 +47,7 @@ class TaxiEnv(eqx.Module):
     num_nodes: int
     distances: jnp.ndarray        # [num_nodes, num_nodes]
     hop_distances: jnp.ndarray    # [num_nodes, num_nodes]
+    paths_dict: Optional[dict] = None  # Dict of (source, target) -> path for precomputed shortest paths
     max_steps: int
     fixed_starts: jnp.ndarray     # [num_starts]
     fixed_pickups: jnp.ndarray    # [num_pickups]
@@ -57,7 +58,7 @@ class TaxiEnv(eqx.Module):
     offsets: jnp.ndarray          # [num_nodes]
     # Congestion weight & timeout
     # alpha: float                  # per-vehicle delay
-    pickup_bonus: float = 5.0  # bonus for reaching the pickup
+    pickup_bonus: float = 50.0  # bonus for reaching the pickup
     timeout_penalty: float
     global_state_dim: int
     gamma: float
@@ -73,6 +74,7 @@ class TaxiEnv(eqx.Module):
         hop_distances: jnp.ndarray,
         max_steps: int,
         traffic_params: Dict[int, Tuple[float, float, float]],
+        paths_dict: Optional[dict] = None,
         # alpha: float = 1.0,
         pickup_bonus: float = 5.0,
         timeout_penalty: float = -50.0,
@@ -85,6 +87,7 @@ class TaxiEnv(eqx.Module):
         self.neighbor_mask_static = jax.device_put(jnp.array(neighbor_mask_static, dtype=bool))
         self.distances = jax.device_put(jnp.array(distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
         self.hop_distances = jax.device_put(jnp.array(hop_distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
+        self.paths_dict = paths_dict
 
         # sizes
         self.num_nodes, self.max_deg = adj_list.shape
@@ -100,18 +103,24 @@ class TaxiEnv(eqx.Module):
         # self.alpha = alpha
         self.gamma = gamma
 
-        # unpack traffic_params - ensure on GPU
+        # unpack traffic_params - ensure on GPU with optimal data types
         nodes = jax.device_put(jnp.array(list(traffic_params.keys()), dtype=jnp.int32))
         params = jax.device_put(jnp.array(list(traffic_params.values()), dtype=jnp.float32))  # shape [N,3]
         periods_vals = params[:, 0]
         green_vals  = params[:, 1]
         offset_vals = params[:, 2]
 
+        # Pre-allocate with optimal memory layout
         zeros = jax.device_put(jnp.zeros((self.num_nodes,), dtype=jnp.float32))
         self.periods = zeros.at[nodes].set(periods_vals)
         self.max_wait_time = float(self.periods.max())  # max cycle length - convert to Python float
         self.green_durations = zeros.at[nodes].set(green_vals)
         self.offsets = zeros.at[nodes].set(offset_vals)
+        
+        # Ensure all arrays are properly aligned for GPU access
+        self.periods = jnp.asarray(self.periods, dtype=jnp.float32)
+        self.green_durations = jnp.asarray(self.green_durations, dtype=jnp.float32)
+        self.offsets = jnp.asarray(self.offsets, dtype=jnp.float32)
 
         # global traffic params shape [num_nodes, 3] (green/period rate, is green, time to next switch)
         self.global_state_dim = 3 * self.num_nodes  # [N,3] -> [3*N]
@@ -130,44 +139,57 @@ class TaxiEnv(eqx.Module):
 
     @jax.jit
     def step(self, state: TaxiState, action: int) -> Tuple[TaxiState, float, bool, dict]:
-        # Base move
+        """Optimized environment step function with reduced allocations and better GPU utilization"""
+        # Base move - optimized memory access
         curr = state.current_node
         nxt = self.adj_list[curr, action]
         travel = self.travel_times[curr, action]
 
-        # Terminal logic
+        # Terminal logic - combined conditions for efficiency
         invalid = (nxt == -1)
         reach = (curr == state.pickup_node) | (nxt == state.pickup_node)
         step_n = state.step_count + 1
         timeout = (step_n >= self.max_steps) & (~reach)
         done = invalid | reach | timeout
 
-        # Time after moving
+        # Time calculations - optimized
         t1 = state.time + travel
+        
+        # Signal phase & wait - pre-compute common values
+        period_nxt = self.periods[nxt]
+        offset_nxt = self.offsets[nxt]
+        green_nxt = self.green_durations[nxt]
+        
+        cycle = (t1 + offset_nxt) % period_nxt
+        wait = jnp.where(cycle < green_nxt, 0.0, period_nxt - cycle)
+        t2 = t1 + wait
+        norm_time = t2 % period_nxt
 
-        # Signal phase & wait
-        cycle    = (t1 + self.offsets[nxt]) % self.periods[nxt]
-        wait     = jnp.where(cycle < self.green_durations[nxt], 0.0, self.periods[nxt] - cycle)
-        t2       = t1 + wait
-        norm_time = t2 % self.periods[nxt]  # normalize to [0, period)
-
+        # Reward calculation - optimized
         total_delay = travel + wait
         dist_c = self.distances[curr, state.pickup_node]
         dist_n = self.distances[nxt, state.pickup_node]
-        shaping = dist_c - self.gamma * dist_n
-        bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        reward      = - total_delay/60.0 #+ bonus + shaping
+        shaping = (dist_c - self.gamma * dist_n)
+        
+        # Add pickup bonus when reaching the pickup location
+        pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
+        # Scale down delay penalty and increase pickup bonus to ensure positive rewards for completion
+        reward = -0.1*total_delay + 0.5*shaping + pickup_bonus
+        
+        # Debug reward components to check if shaping is negligible
+        jax.debug.print("Reward: delay={delay:.2f}, shaping={shaping:.2f}, pickup_bonus={bonus:.2f}, reward={reward:.2f}, reach={reach}", 
+                        delay=total_delay, shaping=shaping, bonus=pickup_bonus, reward=reward, reach=reach)
 
-        # 7) New neighbor mask
+        # New neighbor mask - direct access
         nm = self.neighbor_mask_static[nxt]
 
-        # 8) New state
+        # New state - optimized construction
         new_state = TaxiState(
-            current_node=jnp.int32(nxt),  # ensure it's a JAX array
+            current_node=nxt,  # already int32 from adj_list
             pickup_node=state.pickup_node,
             done=done,
-            step_count=jnp.where(done, jnp.int32(0), step_n),
+            step_count=jnp.where(done, 0, step_n),  # simplified
             neighbor_mask=nm,
-            time=jnp.float32(norm_time)
+            time=norm_time  # already float32
         )
         return new_state, reward, done, {"wait": wait, "travel": travel}

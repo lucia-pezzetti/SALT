@@ -188,6 +188,7 @@ def train(
     use_untied: bool = False,
     target_update_frequency: int = 1000,  # FIXED: Make configurable
     min_buffer_size: int = 1000,  # FIXED: Make configurable
+    sp_bias_beta: float = 2.0,  # Shortest-path bias strength for exploration
     ) -> dict:
 
     cum_visits = np.zeros(env.num_nodes, dtype=int)
@@ -271,7 +272,7 @@ def train(
     def get_batched_rollout_q(
         model: nn.Module,
         obs_fn_batch: Callable[[TaxiState], Dict[str, jnp.ndarray]],
-        *, num_steps: int = 128
+        *, num_steps: int = 128, sp_bias_beta: float = 2.0
     ):
         @jax.jit
         def rollout(env: TaxiEnv,
@@ -294,10 +295,35 @@ def train(
                 q_vals = model.apply(params, sf, mask)  # [B, max_deg]
                 greedy = jnp.argmax(q_vals, axis=-1)
 
-                # FIXED: uniform random over valid actions with safety check
+                # Shortest-path biased exploration
+                # Get neighbor nodes for each agent
+                curr_nodes = state.current_node  # [B]
+                pickup_nodes = state.pickup_node  # [B]
+                
+                # Get neighbors: [B, max_deg]
+                neighbors = env.adj_list[curr_nodes, :]  # [B, max_deg]
+                
+                # Compute distances from each neighbor to pickup: [B, max_deg]
+                # Use advanced indexing to get distances efficiently
+                neighbor_distances = env.distances[neighbors, pickup_nodes[:, None]]  # [B, max_deg]
+                
+                # Convert distances to logits (negative distance = closer is better)
+                sp_logits = -sp_bias_beta * neighbor_distances  # [B, max_deg]
+                
+                # Mask invalid actions and normalize
                 valid_actions = jnp.any(mask, axis=-1, keepdims=True)
-                probs = jnp.where(valid_actions, mask / jnp.sum(mask, axis=-1, keepdims=True), mask.astype(jnp.float32))
-                rand = random.categorical(k1, jnp.log(probs + 1e-8))
+                masked_sp_logits = jnp.where(mask, sp_logits, -jnp.inf)
+                
+                # Sample from SP-biased distribution
+                sp_rand = random.categorical(k1, masked_sp_logits)
+                
+                # Fallback to uniform if no valid actions (safety check)
+                uniform_probs = jnp.where(valid_actions, mask / jnp.sum(mask, axis=-1, keepdims=True), mask.astype(jnp.float32))
+                uniform_rand = random.categorical(k1, jnp.log(uniform_probs + 1e-8))
+                
+                # Use SP-biased sampling if we have valid actions, otherwise uniform
+                rand = jnp.where(valid_actions.squeeze(-1), sp_rand, uniform_rand)
+                
                 explore = random.uniform(k2, (state.current_node.shape[0],)) < epsilon
                 action = jnp.where(explore, rand, greedy)
                 # jax.debug.print("State: {}, mask: {} action: {}, explore: {}, probs: {}, greedy: {}, rand: {}", 
@@ -327,6 +353,7 @@ def train(
     
     # FIXED: Correct state dimension
     D_state = 9        # 2(curr_xy)+2(pick_xy)+2(relative_pos)+1(distance)+1(angle)+1(time)
+    # D_state = 5        # 2(curr_xy)+2(pick_xy)+1(time)
     
     if use_untied:
         model = QNetworkUntied(hidden_dim=128, num_actions=max_deg)
@@ -355,7 +382,7 @@ def train(
 
 
     rollout = get_batched_rollout_q(model, obs_fn_batch,
-                                    num_steps=num_steps)
+                                    num_steps=num_steps, sp_bias_beta=sp_bias_beta)
     
     key, vkey = random.split(key)
     init_states_val = init_state_fn()
@@ -497,20 +524,20 @@ def train(
         cum_visits += visits
 
         # Log metrics to wandb
-        wandb_metrics = {
-            "dqn/training/epoch": ep,
-            "dqn/training/loss": loss.item() if hasattr(loss, 'item') else loss,
-            "dqn/training/avg_episode_reward": avg_reward,
-            "dqn/training/avg_wait": avg_wait,
-            "dqn/training/avg_travel": avg_travel,
-            "dqn/training/update_norm": update_norm,
-            "dqn/training/q_stability": q_stability,
-            "dqn/training/epsilon": eps,
-            "dqn/training/buffer_size": buffer.size,
-            "dqn/training/visitation_counts": wandb.Histogram(visits.tolist()),
-            "dqn/training/cumulative_visits": wandb.Histogram(cum_visits.tolist()),
-        }
-        wandb.log(wandb_metrics, step=ep)
+        # wandb_metrics = {
+        #     "dqn/training/epoch": ep,
+        #     "dqn/training/loss": loss.item() if hasattr(loss, 'item') else loss,
+        #     "dqn/training/avg_episode_reward": avg_reward,
+        #     "dqn/training/avg_wait": avg_wait,
+        #     "dqn/training/avg_travel": avg_travel,
+        #     "dqn/training/update_norm": update_norm,
+        #     "dqn/training/q_stability": q_stability,
+        #     "dqn/training/epsilon": eps,
+        #     "dqn/training/buffer_size": buffer.size,
+        #     "dqn/training/visitation_counts": wandb.Histogram(visits.tolist()),
+        #     "dqn/training/cumulative_visits": wandb.Histogram(cum_visits.tolist()),
+        # }
+        # wandb.log(wandb_metrics, step=ep)
 
         if logger:
             logger.log({

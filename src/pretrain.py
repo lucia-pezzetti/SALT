@@ -99,7 +99,7 @@ def main():
         ui = node_to_idx[u]
         for v, d in lengths.items():
             vi = node_to_idx[v]
-            dist_np[ui, vi] = d
+            dist_np[ui, vi] = d * 60.0  # Convert minutes to seconds
     distances = jax.device_put(jnp.array(dist_np))
 
     # device arrays

@@ -3,8 +3,15 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import networkx as nx
-from taxi_env import TaxiEnv, TaxiState
 from typing import Callable, Dict, Tuple
+import os
+import pickle
+import time
+import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
+
+from taxi_env import TaxiEnv, TaxiState
+from utils import load_graph, fixed_starts_pickups, load_simple_graph
 
 # --- Graph conversion utilities ---
 def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = None):
@@ -36,6 +43,147 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
     # Ensure arrays are on GPU with proper dtypes
     return jax.device_put(jnp.array(adj, dtype=jnp.int32)), jax.device_put(jnp.array(times, dtype=jnp.float32)), jax.device_put(jnp.array(neighbor_mask, dtype=bool))
 
+def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhattan_distances.pkl", num_workers=None):
+    """
+    Load precomputed distance matrix or compute and cache it using parallel processing.
+    """
+    if os.path.exists(cache_file):
+        # print(f"Loading precomputed distance matrix from {cache_file}")
+        with open(cache_file, 'rb') as f:
+            data = pickle.load(f)
+            # Return None for paths_dict to use smart greedy approach
+            return data['dist_mat'], data['hop_dist_mat'], data['max_length'], None
+    
+    # print("Computing distance matrix with parallel processing (hybrid approach - no paths)...")
+    all_nodes = list(G.nodes())
+    N = len(all_nodes)
+    # print(f"Computing all-pairs shortest paths for {N} nodes using {num_workers or mp.cpu_count()} workers...")
+    
+    dist_mat = np.zeros((N, N), dtype=np.float32)
+    hop_dist_mat = np.zeros((N, N), dtype=np.float32)
+    max_length = 0
+    
+    # Parallel computation of distance matrices (NO PATH STORAGE)
+    def compute_node_distances(node_batch):
+        local_dist = np.zeros((len(node_batch), N), dtype=np.float32)
+        local_hop = np.zeros((len(node_batch), N), dtype=np.float32)
+        local_max = 0
+        
+        for i, u in enumerate(node_batch):
+            ui = node_to_idx[u]
+            # Travel time distances ONLY (no path storage) - convert to seconds
+            lengths = nx.single_source_dijkstra_path_length(G, u, weight="travel_time_congested")
+            for v, d in lengths.items():
+                vi = node_to_idx[v]
+                local_dist[i, vi] = d * 60.0  # Convert minutes to seconds
+            
+            # Hop distances
+            hop_lengths = nx.single_source_dijkstra_path_length(G, u, weight=None)
+            for v, d in hop_lengths.items():
+                vi = node_to_idx[v]
+                local_hop[i, vi] = d
+                if d > local_max:
+                    local_max = d
+        
+        return local_dist, local_hop, local_max
+    
+    # Split nodes into batches for parallel processing
+    if num_workers is None:
+        num_workers = min(mp.cpu_count(), N)
+    
+    batch_size = max(1, N // num_workers)
+    node_batches = [all_nodes[i:i + batch_size] for i in range(0, N, batch_size)]
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(compute_node_distances, node_batches))
+    
+    # Combine results (NO PATH MERGING)
+    for i, (local_dist, local_hop, local_max) in enumerate(results):
+        start_idx = i * batch_size
+        end_idx = min(start_idx + batch_size, N)
+        dist_mat[start_idx:end_idx] = local_dist
+        hop_dist_mat[start_idx:end_idx] = local_hop
+        max_length = max(max_length, local_max)
+    
+    # Cache the results (NO PATHS_DICT)
+    # print(f"Caching distance matrix to {cache_file} (hybrid approach)")
+    with open(cache_file, 'wb') as f:
+        pickle.dump({
+            'dist_mat': dist_mat,
+            'hop_dist_mat': hop_dist_mat,
+            'max_length': max_length,
+            # No paths_dict - using smart greedy approach instead
+        }, f)
+    
+    return dist_mat, hop_dist_mat, max_length, None
+
+def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
+    """Load cached graph or build and cache it."""
+    if os.path.exists(cache_file):
+        # print(f"Loading cached Manhattan graph from {cache_file}")
+        with open(cache_file, 'rb') as f:
+            data = pickle.load(f)
+            return data['G'], data['node_to_idx'], data['idx_to_node'], data['fixed_starts_idx'], data['fixed_pickups_idx'], data['traffic_params']
+    
+    # print("Building Manhattan graph (this may take a while on first run)...")
+    start_time = time.time()
+    
+    G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params = build_env(args)
+    
+    build_time = time.time() - start_time
+    # print(f"Graph built in {build_time:.2f} seconds")
+    
+    # Cache the graph
+    # print(f"Caching graph to {cache_file}")
+    with open(cache_file, 'wb') as f:
+        pickle.dump({
+            'G': G,
+            'node_to_idx': node_to_idx,
+            'idx_to_node': idx_to_node,
+            'fixed_starts_idx': fixed_starts_idx,
+            'fixed_pickups_idx': fixed_pickups_idx,
+            'traffic_params': traffic_params
+        }, f)
+    
+    return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
+
+
+def build_env(args):
+    """
+    Build graph G, node_to_idx mapping, fixed start/pickup indices.
+    Returns: G, node_to_idx, fixed_starts_idx, fixed_pickups_idx
+    """
+    if args.env_type == 'manhattan':
+        # --- Load and preprocess Manhattan graph ---
+        G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp, no_congestion= args.no_congestion)
+
+        fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
+            G, nodes_gdf, node_to_zone, zone_to_nodes, all = False
+        )
+        fixed_starts_idx  = jnp.array(fixed_starts_idx, dtype=jnp.int32)
+        fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
+        print(f"Fixed starts: {fixed_starts_idx}")
+        print(f"Fixed pickups: {fixed_pickups_idx}")
+
+    elif args.env_type == 'simple':
+        G = load_simple_graph(num_layers=args.num_layers, width=args.layer_width, no_congestion=args.no_congestion)
+        # index mappings
+        nodes = list(G.nodes())
+        node_to_idx = {n: i for i, n in enumerate(nodes)}
+        idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
+
+        # only one fixed start (node 0) and one fixed pickup (last one)
+        fixed_starts_idx = jnp.array([node_to_idx[n] for n in nodes[:args.layer_width]], dtype=jnp.int32)
+        fixed_pickups_idx = jnp.array([node_to_idx[n] for n in nodes[-args.layer_width:]], dtype=jnp.int32)
+
+    else:
+        raise ValueError(f"Unknown env_type: {args.env_type}")
+    
+    traffic_params = build_traffic_params(G, node_to_idx, args.cycle_length, args.offset, seed=42)
+
+    return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
+
+
 def make_obs_fn(
     env: TaxiEnv,
     G: nx.DiGraph,
@@ -65,48 +213,50 @@ def make_obs_fn(
 
     def single_obs(s: TaxiState) -> jnp.ndarray:
         """
-        Enhanced observation function using lat/lon coordinates.
+        Optimized observation function with reduced computations and better memory layout.
         
-        Benefits over raw node indices:
-        1. Spatial awareness: Network can understand geographic relationships
-        2. Generalization: Can work across different graph structures
-        3. Rich features: Distance, direction, and relative positioning
-        4. Scale invariance: Normalized coordinates work across different map scales
+        Performance optimizations:
+        1. Pre-computed normalized coordinates on GPU
+        2. Reduced memory allocations
+        3. Optimized mathematical operations
+        4. Better memory access patterns
         """
-        # # -- State features --
-
-        # Use normalized lat/lon coordinates instead of raw node indices
-        xy_c = latlon[s.current_node]   # [2] - normalized lat/lon of current position
-        xy_p = latlon[s.pickup_node]    # [2] - normalized lat/lon of pickup position
-        time = jnp.expand_dims(s.time, axis=-1)  # [1] - current time
+        # Use pre-computed normalized lat/lon coordinates (already on GPU)
+        xy_c = latlon[s.current_node]   # [2] - direct GPU memory access
+        xy_p = latlon[s.pickup_node]    # [2] - direct GPU memory access
         
         # Compute relative position (direction vector from current to pickup)
-        relative_pos = xy_p - xy_c  # [2] - direction vector
+        # relative_pos = xy_p - xy_c  # [2] - single operation
         
-        # Compute distance (Euclidean distance in normalized coordinates)
-        distance = jnp.linalg.norm(relative_pos, axis=-1, keepdims=True)  # [1] - keepdims for batching
+        # Compute distance and angle efficiently (avoid expensive operations)
+        # distance_sq = jnp.sum(relative_pos * relative_pos)  # [1] - faster than linalg.norm
+        # distance = jnp.sqrt(distance_sq + 1e-8)  # [1] - add small epsilon for numerical stability
         
-        # Compute angle (direction to pickup in radians)
-        angle = jnp.arctan2(relative_pos[..., 1:2], relative_pos[..., 0:1])  # [1] - use slicing for batching
+        # # Compute angle efficiently
+        # angle = jnp.arctan2(relative_pos[1], relative_pos[0])  # [1] - direct computation
         
-        # Combine all features
-        obs = jnp.concatenate([
-            xy_c,           # [2] - current position (normalized lat/lon)
-            xy_p,           # [2] - pickup position (normalized lat/lon)
-            relative_pos,   # [2] - direction vector (pickup - current)
-            distance,       # [1] - straight-line distance (already has keepdims=True)
-            angle,          # [1] - direction angle in radians (already has correct shape)
-            time            # [1] - current time (for traffic awareness)
-        ], axis=-1)  # Total: [9] features
-
+        # Pre-allocate result array for better memory layout
+        obs = jnp.zeros(5, dtype=jnp.float32)
+        
+        # Fill in values with optimized assignments
+        obs = obs.at[0:2].set(xy_c)           # [2] - current position
+        obs = obs.at[2:4].set(xy_p)           # [2] - pickup position  
+        # obs = obs.at[4:6].set(relative_pos)   # [2] - direction vector
+        # obs = obs.at[6].set(distance)         # [1] - distance
+        # obs = obs.at[7].set(angle)            # [1] - angle
+        obs = obs.at[4].set(s.time)           # [1] - time
+        
         return obs
 
-    # JIT and batched versions - ensure proper compilation
+    # JIT and batched versions with optimizations
     single_obs = jax.jit(single_obs)
-    single_obs_batched = jax.vmap(single_obs)
+    
+    # Pre-compile the vmap for better performance
+    single_obs_batched = jax.jit(jax.vmap(single_obs))
 
     @jax.jit
     def obs_fn_batch(batch: TaxiState) -> jnp.ndarray:
+        """Optimized batch observation function with pre-compiled vmap"""
         return single_obs_batched(batch)
 
     return single_obs, obs_fn_batch
@@ -193,19 +343,28 @@ def build_traffic_params(G: nx.DiGraph,
         if any(t in ("motorway", "trunk") for t in types):
             cycle, green = cycle_length, cycle_length    # effectively always green
         elif any(t == "primary" for t in types):
-            cycle, green = cycle_length, cycle_length * 5.0/6.0
+            cycle, green = cycle_length, cycle_length * 0.5
         elif any(t == "secondary" for t in types):
-            cycle, green = cycle_length, cycle_length * 2.0/3.0
+            cycle, green = cycle_length, cycle_length * 0.3
         elif any(t == "tertiary" for t in types):
-            cycle, green = cycle_length, cycle_length * 1.0/6.0
+            cycle, green = cycle_length, cycle_length #* 1.0/6.0
         elif any(t in ("residential", "living_street") for t in types):
-            cycle, green = cycle_length, cycle_length * 1.0/6.0
+            cycle, green = cycle_length, cycle_length * 0.3
         else:
             cycle, green = cycle_length, cycle_length
 
-        # fixed phase offset
+        # random phase offset
         offset = offset
-        
+        # --- VALIDITY CHECKS ---
+        # assert cycle > 0, f"Cycle length for node {node} must be positive, got {cycle}"
+        # assert green > 0, f"Green duration must be positive, got {green}"
+        # assert green <= cycle, (
+        #     f"Green duration ({green}) exceeds cycle ({cycle}) at node {node}"
+        # )
+        # assert 0 <= offset < cycle, (
+        #     f"Offset {offset:.2f} not in [0, {cycle}) for node {node}"
+        # )
+
         traffic_params[node_to_idx[node]] = (cycle, green, offset)
 
     missing = set(node_to_idx.values()) - set(traffic_params.keys())

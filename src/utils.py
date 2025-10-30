@@ -5,52 +5,16 @@ import geopandas as gpd
 import numpy as np
 from shapely.geometry import Point
 from typing import Callable, Dict, Tuple
+import random
 
 import jax
 from jax import numpy as jnp
 from flax import linen as nn
 from flax import struct
 
-from taxi_env_utils import build_traffic_params
 from taxi_env import TaxiEnv
 
 # --- Load and preprocess graph ---
-def build_env(args):
-    """
-    Build graph G, node_to_idx mapping, fixed start/pickup indices.
-    Returns: G, node_to_idx, fixed_starts_idx, fixed_pickups_idx
-    """
-    if args.env_type == 'manhattan':
-        # --- Load and preprocess Manhattan graph ---
-        G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp, no_congestion= args.no_congestion)
-
-        fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
-            G, nodes_gdf, node_to_zone, zone_to_nodes, all = True
-        )
-        fixed_starts_idx  = jnp.array(fixed_starts_idx, dtype=jnp.int32)
-        fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
-        print(f"Fixed starts: {fixed_starts_idx}")
-        print(f"Fixed pickups: {fixed_pickups_idx}")
-
-    elif args.env_type == 'simple':
-        G = load_simple_graph(num_layers=args.num_layers, width=args.layer_width, no_congestion=args.no_congestion)
-        # index mappings
-        nodes = list(G.nodes())
-        node_to_idx = {n: i for i, n in enumerate(nodes)}
-        idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
-
-        # only one fixed start (node 0) and one fixed pickup (last one)
-        fixed_starts_idx = jnp.array([node_to_idx[n] for n in nodes[:args.layer_width]], dtype=jnp.int32)
-        fixed_pickups_idx = jnp.array([node_to_idx[n] for n in nodes[-args.layer_width:]], dtype=jnp.int32)
-
-    else:
-        raise ValueError(f"Unknown env_type: {args.env_type}")
-    
-    traffic_params = build_traffic_params(G, node_to_idx, args.cycle_length, args.offset, seed=42)
-
-    return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
-
-
 def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_congestion: bool = False) -> nx.DiGraph:
     """
     Download and preprocess the OSMnx graph for a place, keeping only the
@@ -93,11 +57,13 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
 
     # Map zones to nodes, then filter to Financial District
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
-    zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
-    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill East"]  
-    gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326")
+    # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
+    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West"] 
+    # zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"]  
+    gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
     loc_ids = filtered_zones["LocationID"].tolist()
+    jax.debug.print("loc_ids: {loc_ids}", loc_ids=loc_ids)
     selected_nodes = [n for loc_id in loc_ids for n in zone_to_nodes.get(loc_id, [])]
     G_scc = G_scc.subgraph(selected_nodes).copy()
 
@@ -288,15 +254,44 @@ def fixed_starts_pickups(G: nx.DiGraph,
 
         nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
 
-        # Fix a node for every zone
-        for loc_id, nodes in zone_to_nodes.items():
+        # Select randomly up to 5 nodes for every zone
+        zone_list = list(zone_to_nodes.items())
+        for i, (loc_id, nodes) in enumerate(zone_list):
             if nodes:
-                # Use the first node in the list for each zone
-                fixed_starts.append(nodes[0])
-                fixed_pickups.append(nodes[0])
+                # jax.debug.print("loc_id: {loc_id}", loc_id=loc_id)
+                # Sample up to 5 nodes (or all nodes if fewer than 5)
+                num_to_sample = min(1, len(nodes))
+                sampled_indices = random.sample(range(len(nodes)), num_to_sample)
+                # jax.debug.print("sampled_indices: {sampled_indices}", sampled_indices=sampled_indices)
+                # Add individual nodes, not lists
+                for idx in sampled_indices:
+                    fixed_starts.append(nodes[idx])
+                    # Use nodes from a different zone for pickups to ensure meaningful journeys
+                    if i < len(zone_list) - 1:
+                        # Use next zone for pickup
+                        next_zone_id, next_zone_nodes = zone_list[i + 1]
+                        if next_zone_nodes:
+                            pickup_node = random.choice(next_zone_nodes)
+                            fixed_pickups.append(pickup_node)
+                        else:
+                            # Fallback to different node in same zone
+                            pickup_idx = (idx + 1) % len(nodes) if len(nodes) > 1 else idx
+                            fixed_pickups.append(nodes[pickup_idx])
+                    else:
+                        # For last zone, use first zone for pickup
+                        first_zone_id, first_zone_nodes = zone_list[0]
+                        if first_zone_nodes:
+                            pickup_node = random.choice(first_zone_nodes)
+                            fixed_pickups.append(pickup_node)
+                        else:
+                            # Fallback to different node in same zone
+                            pickup_idx = (idx + 1) % len(nodes) if len(nodes) > 1 else idx
+                            fixed_pickups.append(nodes[pickup_idx])
 
         fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
         fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
+
+        jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
 
     return fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node
 
@@ -339,12 +334,12 @@ def load_simple_graph(
     primary_edges   = {(layers[i][mid],   layers[i+1][mid])   for i in range(num_layers-1)}
     secondary_edges = set()
     tertiary_edges  = set()
+    residential_edges = set()
     for w in range(width):
         if w == mid:
             continue
         tertiary_edges |= {(layers[i][w],    layers[i+1][w])    for i in range(num_layers-1)}
     highway_edges = set()
-    residential_edges = set()
 
 
     def tag_for(u: int, v: int) -> str:
@@ -446,3 +441,38 @@ estimate_returns_jit = jax.jit(
     estimate_returns,
     static_argnums=(2, 3, 4, 8)  # model, obs_fn_batch, init_env_fn, rollout_steps
 )
+
+# --- HYBRID APPROACH: Smart Greedy Pathfinding ---
+@jax.jit
+def smart_greedy_next_hop(current_node, target_node, adj_list, travel_times, distances, neighbor_mask):
+    """
+    Smart greedy approach that considers both local travel times and remaining distances.
+    
+    This replaces the precomputed paths_dict with an on-demand approach that:
+    1. Uses travel time distance matrix for optimality
+    2. Computes next hop using: local_travel_time + remaining_distance
+    3. Maintains near-optimal path quality while saving memory
+    
+    Args:
+        current_node: Current node index
+        target_node: Target node index  
+        adj_list: Adjacency list [N, max_deg]
+        travel_times: Travel times [N, max_deg]
+        distances: Precomputed travel time distances [N, N]
+        neighbor_mask: Mask indicating valid neighbors [max_deg]
+    
+    Returns:
+        action: Index of best neighbor to move to
+    """
+    neighbors = adj_list[current_node]
+    neighbor_travel_times = travel_times[current_node]
+    
+    # For each neighbor, compute: local_travel_time + remaining_distance_to_target
+    total_costs = neighbor_travel_times + distances[neighbors, target_node]
+    # Mask invalid neighbors using provided neighbor_mask
+    total_costs = jnp.where(neighbor_mask, total_costs, jnp.inf)
+    return jnp.argmin(total_costs)
+
+# Batch version for efficient processing
+smart_greedy_next_hop_batch = jax.jit(jax.vmap(smart_greedy_next_hop, 
+                                               in_axes=(0, 0, None, None, None, 0)))
