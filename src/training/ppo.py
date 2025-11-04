@@ -9,7 +9,7 @@ import optax
 
 # --- Import your Taxi environment ---
 from taxi_env import init_env, TaxiState
-from utils import smart_greedy_next_hop
+from utils import smart_greedy_next_hop, smart_greedy_next_hop_batch
 
 # map activation names
 activation_dict = {"relu": jax.nn.relu, "silu": jax.nn.silu, "elu": jax.nn.elu}
@@ -345,6 +345,421 @@ def ppo_loss_fn(policy_apply, value_apply, policy_params, value_params, batch, o
         'total_loss': total_loss
     }
 
+# --- Behavioral Cloning Pretraining Function ---
+def pretrain_policy_on_shortest_path(
+    env, 
+    policy_params, 
+    policy_apply, 
+    policy_opt, 
+    policy_opt_state,
+    obs_fn_batch,
+    config,
+    key,
+    num_pretrain_steps=1000,
+    pretrain_batch_size=64,
+    pretrain_lr=None,
+    eval_starts=None,
+    eval_pickups=None,
+    log_fn=None,
+    value_params=None,
+    value_apply=None,
+    value_opt=None,
+    value_opt_state=None
+):
+    """
+    Behavioral Cloning pretraining: train policy to imitate expert shortest path actions.
+    
+    Builds dataset of (state, valid-action-mask, expert-action, return).
+    Trains with masked cross-entropy on expert actions.
+    Optionally regresses value head to returns.
+    Keeps entropy regularization to avoid over-confidence.
+    
+    Args:
+        env: TaxiEnv instance
+        policy_params: Current policy parameters
+        policy_apply: Policy network apply function
+        policy_opt: Policy optimizer
+        policy_opt_state: Policy optimizer state
+        obs_fn_batch: Batch observation function
+        config: Configuration dictionary
+        key: JAX random key
+        num_pretrain_steps: Number of pretraining steps
+        pretrain_batch_size: Batch size for pretraining
+        pretrain_lr: Learning rate for pretraining (if None, uses config policy_lr)
+        eval_starts: Optional array of start nodes for evaluation
+        eval_pickups: Optional array of pickup nodes for evaluation
+        log_fn: Optional logging function(log_dict, step) for metrics
+        value_params: Optional value network parameters for value regression
+        value_apply: Optional value network apply function
+        value_opt: Optional value optimizer
+        value_opt_state: Optional value optimizer state
+    
+    Returns:
+        Updated policy_params, policy_opt_state, final_key, (optional value_params, value_opt_state)
+    """
+    from utils import smart_greedy_next_hop_batch
+    
+    # Use separate pretraining optimizer if specified, otherwise use regular policy optimizer
+    if pretrain_lr is not None and pretrain_lr != config.get('policy_lr', 1e-4):
+        pretrain_policy_opt = optax.chain(
+            optax.clip_by_global_norm(config.get('max_grad_norm', 0.5)),
+            optax.adamw(
+                pretrain_lr,
+                eps=config.get('eps_adam', 1e-5),
+                b1=config.get('b1_adam', 0.9),
+                b2=config.get('b2_adam', 0.999),
+                weight_decay=config.get('wd_adam', 1e-4)
+            )
+        )
+        pretrain_policy_opt_state = pretrain_policy_opt.init(policy_params)
+        if value_params is not None:
+            pretrain_value_opt = optax.chain(
+                optax.clip_by_global_norm(config.get('max_grad_norm', 0.5)),
+                optax.adamw(
+                    pretrain_lr,
+                    eps=config.get('eps_adam', 1e-5),
+                    b1=config.get('b1_adam', 0.9),
+                    b2=config.get('b2_adam', 0.999),
+                    weight_decay=config.get('wd_adam', 1e-4)
+                )
+            )
+            pretrain_value_opt_state = pretrain_value_opt.init(value_params)
+        else:
+            pretrain_value_opt = None
+            pretrain_value_opt_state = None
+    else:
+        pretrain_policy_opt = policy_opt
+        pretrain_policy_opt_state = policy_opt_state
+        pretrain_value_opt = value_opt
+        pretrain_value_opt_state = value_opt_state
+    
+    batch_init = jax.jit(vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0)))
+    batch_step = jax.jit(vmap(env.step, in_axes=(0, 0)))
+    
+    gamma = config.get('gamma', 0.99)
+    entropy_coef = config.get('bc_entropy_coef', 0.01)
+    value_regression_enabled = value_params is not None and value_apply is not None
+    value_coef = config.get('bc_value_coef', 0.5) if value_regression_enabled else 0.0
+    
+    # Create evaluation function if eval sets provided
+    def evaluate_policy_performance(policy_params, starts, pickups):
+        """Evaluate policy on fixed start-pickup pairs and compute BC accuracy"""
+        if starts is None or pickups is None or len(starts) == 0:
+            return None
+        
+        eval_keys = jax.random.split(jax.random.PRNGKey(42), len(starts))
+        eval_states, _ = batch_init(eval_keys, starts, pickups)
+        
+        total_rewards = jnp.zeros(len(starts))
+        total_steps = jnp.zeros(len(starts))
+        completed = jnp.zeros(len(starts), dtype=bool)
+        correct_actions = 0
+        total_actions = 0
+        
+        # Run episodes with proper early stopping
+        for step in range(env.max_steps):
+            active_mask = ~completed
+            if bool(jnp.any(active_mask)):
+                obs = obs_fn_batch(eval_states)
+                logits = policy_apply(policy_params, obs)
+                neighbor_masks = eval_states.neighbor_mask
+                masked_logits = jnp.where(neighbor_masks, logits, -1e8)
+                actions = jnp.argmax(masked_logits, axis=-1)
+                
+                # Compute expert actions for BC accuracy
+                expert_actions = smart_greedy_next_hop_batch(
+                    eval_states.current_node,
+                    eval_states.pickup_node,
+                    env.adj_list,
+                    env.travel_times,
+                    env.distances,
+                    neighbor_masks
+                )
+                
+                # Count correct actions (only for active episodes)
+                correct_actions += jnp.sum(jnp.where(active_mask, actions == expert_actions, 0))
+                total_actions += jnp.sum(active_mask)
+                
+                next_states, rewards, terminals, info = batch_step(eval_states, actions)
+                total_rewards = jnp.where(active_mask, total_rewards + rewards, total_rewards)
+                total_steps = jnp.where(active_mask, total_steps + 1, total_steps)
+                completed = completed | terminals
+                eval_states = next_states
+                
+                if bool(jnp.all(completed)):
+                    break
+            else:
+                break
+        
+        bc_accuracy = float(correct_actions / total_actions) if total_actions > 0 else 0.0
+        
+        return {
+            'avg_reward': float(jnp.mean(total_rewards)),
+            'avg_steps': float(jnp.mean(total_steps)),
+            'completion_rate': float(jnp.mean(completed.astype(float))),
+            'bc_accuracy': bc_accuracy
+        }
+    
+    def compute_param_update_magnitude(params_before, params_after):
+        """Compute L2 norm of parameter updates"""
+        updates = jax.tree_util.tree_map(lambda a, b: a - b, params_after, params_before)
+        param_norms = jax.tree_util.tree_map(lambda x: jnp.linalg.norm(x), updates)
+        # Sum of squared norms
+        total_magnitude = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree_util.tree_leaves(updates)))
+        return float(total_magnitude)
+    
+    def pretrain_step(policy_params, policy_opt_state, key, value_params=None, value_opt_state=None):
+        """Single BC pretraining step
+        
+        Builds dataset of (state, valid-action-mask, expert-action, return).
+        Trains with masked cross-entropy on expert actions.
+        Optionally regresses value head to returns.
+        Includes entropy regularization.
+        """
+        # Generate random starts and pickups
+        key, key1, key2 = jax.random.split(key, 3)
+        subkeys1 = jax.random.split(key1, pretrain_batch_size)
+        subkeys2 = jax.random.split(key2, pretrain_batch_size)
+        
+        starts = jnp.stack([jax.random.choice(k, env.fixed_starts) for k in subkeys1])
+        pickups = jnp.stack([jax.random.choice(k, env.fixed_pickups) for k in subkeys2])
+        
+        # Initialize environment states
+        key, key_init = jax.random.split(key)
+        init_keys = jax.random.split(key_init, pretrain_batch_size)
+        env_states, _ = batch_init(init_keys, starts, pickups)
+        
+        # Collect expert trajectories: (state, mask, expert-action, return)
+        # For each trajectory, collect (state, mask, action, reward) and compute returns
+        max_rollout_steps = config.get('pretrain_rollout_steps', 20)
+        
+        # Store trajectories per episode (list of lists)
+        trajectories = [[] for _ in range(pretrain_batch_size)]
+        
+        current_states = env_states
+        for step in range(max_rollout_steps):
+            active_mask = ~current_states.done
+            if not bool(jnp.any(active_mask)):
+                break
+            
+            # Compute expert (shortest path) actions for active states
+            neighbor_masks = current_states.neighbor_mask
+            expert_actions = smart_greedy_next_hop_batch(
+                current_states.current_node,
+                current_states.pickup_node,
+                env.adj_list,
+                env.travel_times,
+                env.distances,
+                neighbor_masks
+            )
+            
+            # Take step using expert actions
+            next_states, rewards, terminals, _ = batch_step(current_states, expert_actions)
+            
+            # Store data for active episodes (before terminal)
+            for i in range(pretrain_batch_size):
+                if not bool(current_states.done[i]) and not bool(terminals[i]):
+                    trajectories[i].append({
+                        'state': jax.tree_util.tree_map(lambda x: x[i], current_states),
+                        'mask': neighbor_masks[i],
+                        'action': expert_actions[i],
+                        'reward': rewards[i]
+                    })
+            
+            # Update for next iteration
+            current_states = next_states
+            
+            # Stop if all episodes complete
+            if bool(jnp.all(terminals | current_states.done)):
+                break
+        
+        # Flatten trajectories and compute returns per trajectory
+        all_states = []
+        all_masks = []
+        all_expert_actions = []
+        all_returns = []
+        
+        for traj in trajectories:
+            if len(traj) == 0:
+                continue
+            # Compute returns backward through trajectory
+            returns = jnp.zeros(len(traj))
+            current_return = 0.0
+            for i in range(len(traj) - 1, -1, -1):
+                current_return = traj[i]['reward'] + gamma * current_return
+                returns = returns.at[i].set(current_return)
+            
+            # Store all data from this trajectory
+            for i, step_data in enumerate(traj):
+                all_states.append(step_data['state'])
+                all_masks.append(step_data['mask'])
+                all_expert_actions.append(step_data['action'])
+                all_returns.append(returns[i])
+        
+        if len(all_states) == 0:
+            # No data collected, return unchanged
+            return (policy_params, policy_opt_state, key, 
+                    {'policy_loss': 0.0, 'bc_accuracy': 0.0, 'value_loss': 0.0, 
+                     'ce_loss': 0.0, 'entropy_loss': 0.0, 'entropy': 0.0},
+                    value_params, value_opt_state)
+        
+        # Concatenate collected data
+        collected_states = jax.tree_util.tree_map(lambda *x: jnp.stack(x), *all_states)
+        collected_masks = jnp.stack(all_masks)
+        collected_expert_actions = jnp.array(all_expert_actions)
+        collected_returns = jnp.array(all_returns)
+        
+        # Limit to batch_size to prevent memory issues
+        num_collected = collected_states.current_node.shape[0]
+        if num_collected > pretrain_batch_size:
+            key, sample_key = jax.random.split(key)
+            indices = jax.random.choice(
+                sample_key, 
+                num_collected, 
+                shape=(pretrain_batch_size,),
+                replace=False
+            )
+            collected_states = jax.tree_util.tree_map(lambda x: x[indices], collected_states)
+            collected_masks = collected_masks[indices]
+            collected_expert_actions = collected_expert_actions[indices]
+            collected_returns = collected_returns[indices]
+        
+        # Get observations for collected states
+        obs = obs_fn_batch(collected_states)
+        
+        # Define BC loss function with masked cross-entropy and entropy regularization
+        def bc_loss_fn(p):
+            policy_logits = policy_apply(p, obs)  # [batch_size, max_deg]
+            # Apply masking to logits
+            masked_logits = jnp.where(collected_masks, policy_logits, -1e-8)
+            # Compute log probabilities
+            log_probs = jax.nn.log_softmax(masked_logits)  # [batch_size, max_deg]
+            # Select log prob of expert action
+            expert_log_probs = jnp.sum(
+                log_probs * jax.nn.one_hot(collected_expert_actions, env.max_deg),
+                axis=-1
+            )
+            # Masked cross-entropy loss (negative log likelihood)
+            ce_loss = -jnp.mean(expert_log_probs)
+            
+            # Entropy regularization to avoid over-confidence
+            probs = jax.nn.softmax(masked_logits)
+            entropy = -jnp.mean(jnp.sum(log_probs * probs, axis=-1))
+            entropy_loss = -entropy_coef * entropy
+            
+            total_loss = ce_loss + entropy_loss
+            return total_loss, {'ce_loss': ce_loss, 'entropy_loss': entropy_loss, 'entropy': entropy}
+        
+        # Compute policy gradients and update
+        (policy_loss, policy_info), policy_grads = jax.value_and_grad(
+            bc_loss_fn, has_aux=True
+        )(policy_params)
+        updates, new_policy_opt_state = pretrain_policy_opt.update(policy_grads, policy_opt_state, policy_params)
+        new_policy_params = optax.apply_updates(policy_params, updates)
+        
+        # Optionally update value network
+        value_loss = 0.0
+        new_value_params = value_params
+        new_value_opt_state = value_opt_state
+        if value_regression_enabled:
+            def value_loss_fn(v):
+                values = value_apply(v, obs)  # [batch_size]
+                return jnp.mean((values - collected_returns) ** 2)
+            
+            value_loss, value_grads = jax.value_and_grad(value_loss_fn)(value_params)
+            value_updates, new_value_opt_state = pretrain_value_opt.update(value_grads, value_opt_state, value_params)
+            new_value_params = optax.apply_updates(value_params, value_updates)
+        
+        # Compute BC accuracy
+        policy_logits = policy_apply(new_policy_params, obs)
+        masked_logits = jnp.where(collected_masks, policy_logits, -1e8)
+        predicted_actions = jnp.argmax(masked_logits, axis=-1)
+        bc_accuracy = jnp.mean((predicted_actions == collected_expert_actions).astype(float))
+        
+        return (new_policy_params, new_policy_opt_state, key, 
+                {'policy_loss': policy_loss, 'bc_accuracy': bc_accuracy, 
+                 'value_loss': value_loss, **policy_info},
+                new_value_params, new_value_opt_state)
+    
+    # Run pretraining steps
+    current_policy_params = policy_params
+    current_policy_opt_state = pretrain_policy_opt_state
+    current_value_params = value_params
+    current_value_opt_state = pretrain_value_opt_state
+    current_key = key
+    
+    # Evaluation frequency
+    eval_frequency = config.get('pretrain_eval_frequency', 100)
+    
+    print(f"Starting BC pretraining: {num_pretrain_steps} steps with batch size {pretrain_batch_size}")
+    if value_regression_enabled:
+        print(f"Value regression enabled with coefficient {value_coef}")
+    if eval_starts is not None and eval_pickups is not None:
+        print(f"Will evaluate policy every {eval_frequency} steps on {len(eval_starts)} evaluation pairs")
+    
+    for step in range(num_pretrain_steps):
+        params_before = current_policy_params
+        result = pretrain_step(
+            current_policy_params, current_policy_opt_state, current_key,
+            current_value_params, current_value_opt_state
+        )
+        current_policy_params, current_policy_opt_state, current_key, step_metrics, current_value_params, current_value_opt_state = result
+        
+        # Compute parameter update magnitude
+        param_update_mag = compute_param_update_magnitude(params_before, current_policy_params)
+        
+        # Prepare logging dictionary
+        log_dict = {
+            'pretrain/step': step,
+            'pretrain/policy_loss': float(step_metrics['policy_loss']),
+            'pretrain/bc_accuracy': float(step_metrics['bc_accuracy']),
+            'pretrain/ce_loss': float(step_metrics.get('ce_loss', 0.0)),
+            'pretrain/entropy_loss': float(step_metrics.get('entropy_loss', 0.0)),
+            'pretrain/entropy': float(step_metrics.get('entropy', 0.0)),
+            'pretrain/param_update_magnitude': param_update_mag,
+        }
+        
+        if value_regression_enabled:
+            log_dict['pretrain/value_loss'] = float(step_metrics['value_loss'])
+        
+        # Evaluate policy performance if evaluation set provided
+        eval_metrics = None
+        if eval_starts is not None and eval_pickups is not None:
+            if step % eval_frequency == 0 or step == num_pretrain_steps - 1:
+                eval_metrics = evaluate_policy_performance(current_policy_params, eval_starts, eval_pickups)
+                if eval_metrics:
+                    log_dict.update({
+                        'pretrain/eval_avg_reward': eval_metrics['avg_reward'],
+                        'pretrain/eval_avg_steps': eval_metrics['avg_steps'],
+                        'pretrain/eval_completion_rate': eval_metrics['completion_rate'],
+                        'pretrain/eval_bc_accuracy': eval_metrics['bc_accuracy'],
+                    })
+        
+        # Log metrics
+        if log_fn:
+            log_fn(log_dict, step)
+        
+        # Print progress
+        if step % 100 == 0 or step == num_pretrain_steps - 1:
+            print(f"BC Pretraining step {step}/{num_pretrain_steps}: "
+                  f"Policy loss = {float(step_metrics['policy_loss']):.6f}, "
+                  f"BC accuracy = {float(step_metrics['bc_accuracy']):.4f}, "
+                  f"Entropy = {float(step_metrics.get('entropy', 0.0)):.4f}")
+            if value_regression_enabled:
+                print(f"  Value loss = {float(step_metrics['value_loss']):.6f}")
+            if eval_metrics:
+                print(f"  Eval - Avg reward: {eval_metrics['avg_reward']:.4f}, "
+                      f"Avg steps: {eval_metrics['avg_steps']:.2f}, "
+                      f"Completion: {eval_metrics['completion_rate']:.2%}, "
+                      f"BC accuracy: {eval_metrics['bc_accuracy']:.2%}")
+    
+    print("BC Pretraining completed!")
+    
+    if value_regression_enabled:
+        return current_policy_params, current_policy_opt_state, current_key, current_value_params, current_value_opt_state
+    else:
+        return current_policy_params, current_policy_opt_state, current_key
+
 # --- PPO Training Functions ---
 def get_ppo_init_fn(env, config, obs_fn_single):
     """Initialize PPO networks and optimizers"""
@@ -416,12 +831,55 @@ def get_ppo_init_fn(env, config, obs_fn_single):
     return init_fn
 
 def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, value_apply, 
-                      policy_opt, value_opt, epsilon_schedule_fn=None, eval_starts=None, eval_pickups=None):
-    """Create PPO training loop with proper loss computation and evaluation"""
+                      policy_opt, value_opt, epsilon_schedule_fn=None, eval_starts=None, eval_pickups=None, bc_policy_params=None):
+    """Create PPO training loop with proper loss computation and evaluation
+    
+    After BC pretraining:
+    - Uses small clip=0.1, entropy≈0.01-0.02
+    - Adds KL penalty to frozen BC policy (decays to 0)
+    """
     
     # Batch operations
     batch_step = jax.jit(vmap(env.step, in_axes=(0, 0)))
     batch_reset = jax.jit(vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0)))
+    
+    # Curriculum learning schedule: alpha decays from initial_alpha to final_alpha over decay_steps
+    # alpha = probability of using shortest path action (1.0 = always SP, 0.0 = always learned policy)
+    curriculum_enabled = config.get('curriculum_learning', False)
+    if curriculum_enabled:
+        initial_alpha = config.get('curriculum_initial_alpha', 1.0)  # Start with 100% SP
+        final_alpha = config.get('curriculum_final_alpha', 0.0)     # End with 0% SP
+        hold_steps = config.get('curriculum_hold_steps', config.get('num_steps', 50000) * 0.3)  # Keep SP for this many steps
+        decay_steps = config.get('curriculum_decay_steps', config.get('num_steps', 50000))
+        
+        def curriculum_schedule(step):
+            """Linear decay schedule for curriculum learning with hold period"""
+            # Hold at initial_alpha for hold_steps, then decay linearly
+            # Use jnp.where for JAX compatibility
+            effective_step = step - hold_steps
+            effective_decay_steps = jnp.maximum(decay_steps - hold_steps, 1)  # Ensure positive
+            progress = jnp.clip(effective_step / effective_decay_steps, 0.0, 1.0)
+            decayed_alpha = initial_alpha * (1.0 - progress) + final_alpha * progress
+            # If step < hold_steps, return initial_alpha, otherwise return decayed_alpha
+            return jnp.where(step < hold_steps, initial_alpha, decayed_alpha)
+    else:
+        def curriculum_schedule(step):
+            """No curriculum learning - always return 0.0 (use learned policy)"""
+            return 0.0
+    
+    # KL penalty schedule for BC policy (decays to 0)
+    use_kl_penalty = config.get('use_kl_penalty', False) and bc_policy_params is not None
+    if use_kl_penalty:
+        kl_penalty_initial = config.get('kl_penalty_initial', 0.1)
+        kl_penalty_decay_steps = config.get('kl_penalty_decay_steps', config.get('num_steps', 50000))
+        
+        def kl_penalty_schedule(step):
+            """KL penalty schedule: decays linearly from initial to 0"""
+            progress = jnp.clip(step / kl_penalty_decay_steps, 0.0, 1.0)
+            return kl_penalty_initial * (1.0 - progress)
+    else:
+        def kl_penalty_schedule(step):
+            return 0.0
     
     # Setup fixed evaluation set
     if eval_starts is None or eval_pickups is None:
@@ -457,7 +915,7 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 
                 # Apply action masking
                 neighbor_masks = eval_states.neighbor_mask
-                masked_logits = jnp.where(neighbor_masks, logits, -jnp.inf)
+                masked_logits = jnp.where(neighbor_masks, logits, -1e8)
                 
                 # Select actions greedily (no exploration during evaluation)
                 actions = jnp.argmax(masked_logits, axis=-1)
@@ -524,9 +982,45 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         return advantages
     
     @jax.jit
-    def policy_loss_jit(policy_params, batch, old_log_probs, clip_ratio=0.2, entropy_coef=0.01):
-        """JIT-compiled policy loss computation"""
-        return policy_loss_fn(policy_apply, policy_params, batch, old_log_probs, clip_ratio, entropy_coef)
+    def policy_loss_jit(policy_params, batch, old_log_probs, clip_ratio=0.2, entropy_coef=0.01, 
+                        bc_policy_params=None, kl_penalty_weight=0.0):
+        """JIT-compiled policy loss computation with optional KL penalty to BC policy"""
+        loss, info = policy_loss_fn(policy_apply, policy_params, batch, old_log_probs, clip_ratio, entropy_coef)
+        
+        # Add KL penalty to frozen BC policy if enabled
+        # Check if we should compute KL (kl_penalty_weight > 0 implies bc_policy_params is not None)
+        # Use jax.lax.cond to handle the conditional computation
+        def compute_kl(_):
+            # Compute current policy log probs
+            logits = policy_apply(policy_params, batch['observations'])
+            masked_logits = jnp.where(batch['masks'], logits, -1e8)
+            current_log_probs = jax.nn.log_softmax(masked_logits)
+            current_probs = jax.nn.softmax(masked_logits)
+            
+            # Compute BC policy log probs
+            bc_logits = policy_apply(bc_policy_params, batch['observations'])
+            bc_masked_logits = jnp.where(batch['masks'], bc_logits, -1e8)
+            bc_log_probs = jax.nn.log_softmax(bc_masked_logits)
+            
+            # Compute KL divergence: KL(current || bc) = sum(current_probs * (log(current_probs) - log(bc_probs)))
+            kl_div = jnp.mean(jnp.sum(
+                current_probs * (current_log_probs - bc_log_probs),
+                axis=-1
+            ))
+            kl_penalty = kl_penalty_weight * kl_div
+            new_loss = loss + kl_penalty
+            new_info = {**info, 'kl_div': kl_div, 'kl_penalty': kl_penalty}
+            return new_loss, new_info
+        
+        def skip_kl(_):
+            return loss, {**info, 'kl_div': jnp.array(0.0), 'kl_penalty': jnp.array(0.0)}
+        
+        # Condition: compute KL only if bc_policy_params exists and weight > 0
+        bc_available = bc_policy_params is not None
+        pred = jnp.logical_and(jnp.array(bc_available), kl_penalty_weight > 0.0)
+        loss, info = jax.lax.cond(pred, compute_kl, skip_kl, operand=None)
+        
+        return loss, info
     
     @jax.jit
     def value_loss_jit(value_params, batch, value_coef=0.5, value_clip_ratio=0.2):
@@ -559,13 +1053,47 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         masked_logits = jnp.where(
             neighbor_mask,
             policy_logits,
-            -jnp.inf
+            -1e8
         )
         
-        # Sample actions
+        # Curriculum learning: compute shortest path actions and mix with learned policy
         state_dict['key'], sample_key = jax.random.split(state_dict['key'])
         sample_keys = jax.random.split(sample_key, config['batch_size'])
-        actions = jax.vmap(jax.random.categorical)(sample_keys, masked_logits)
+        
+        if curriculum_enabled:
+            # Get current curriculum alpha (probability of using SP)
+            current_alpha = curriculum_schedule(state_dict['opt_t'])
+            
+            # Compute shortest path actions for current states
+            sp_actions = smart_greedy_next_hop_batch(
+                state_dict['env_states'].current_node,
+                state_dict['env_states'].pickup_node,
+                env.adj_list,
+                env.travel_times,
+                env.distances,
+                neighbor_mask
+            )
+            
+            # Sample learned policy actions
+            policy_actions = jax.vmap(jax.random.categorical)(sample_keys, masked_logits)
+            
+            # Mix actions based on curriculum alpha: with probability alpha use SP, else use learned policy
+            # Generate random values for mixing decision
+            state_dict['key'], mix_key = jax.random.split(state_dict['key'])
+            mix_keys = jax.random.split(mix_key, config['batch_size'])
+            mix_probs = jax.random.uniform(mix_keys)
+            use_sp = mix_probs < current_alpha
+            
+            # Select actions: use SP if use_sp is True, otherwise use learned policy
+            actions = jnp.where(use_sp, sp_actions, policy_actions)
+            
+            # For logging: track which actions came from SP
+            sp_action_fraction = jnp.mean(use_sp.astype(float))
+        else:
+            # No curriculum learning - just use learned policy
+            actions = jax.vmap(jax.random.categorical)(sample_keys, masked_logits)
+            current_alpha = 0.0
+            sp_action_fraction = 0.0
         
         # Debug prints for multi-agent behavior
         # jax.debug.print("=== MULTI-AGENT DEBUG ===")
@@ -574,7 +1102,8 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         # jax.debug.print("Agent actions: {actions}", actions=actions)
         # jax.debug.print("Agent starts: {starts}", starts=state_dict['last_start'])
         
-        # Get log probabilities
+        # Get log probabilities - always use learned policy log_probs (even for SP actions)
+        # This is important for PPO training: we need policy log_probs for all actions
         log_probs = jax.nn.log_softmax(masked_logits)
         selected_log_probs = jnp.sum(log_probs * jax.nn.one_hot(actions, masked_logits.shape[-1]), axis=-1)
         
@@ -655,7 +1184,9 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             'loss': 0.0,  # Loss will be computed during updates
             'avg_return': jnp.mean(state_dict['avg_return']),  # Ensure scalar
             'num_episodes': jnp.sum(state_dict['num_episodes']),  # Ensure scalar
-            'experiences': experiences  # Return experiences for PPO updates
+            'experiences': experiences,  # Return experiences for PPO updates
+            'curriculum_alpha': current_alpha,  # Current curriculum learning alpha
+            'sp_action_fraction': sp_action_fraction  # Fraction of actions from SP
         }
     
     def run_loop(state_dict):
@@ -731,6 +1262,10 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         total_value_loss = 0.0
         min_buffer_size = config.get('min_buffer_size', 32)
         
+        # Initialize KL metrics
+        kl_div = 0.0
+        kl_penalty_val = 0.0
+        
         # Debug buffer status
         # jax.debug.print("Buffer status:")
         # jax.debug.print("  Buffer size: {size}", size=buffer.size)
@@ -751,17 +1286,32 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 # jax.debug.print("  Avg advantage: {avg_adv}", avg_adv=jnp.mean(ppo_batch['advantages']))
                 # jax.debug.print("  Avg return: {avg_ret}", avg_ret=jnp.mean(ppo_batch['returns']))
                 
-                # Use raw advantages (no normalization - this is standard PPO)
-                # batch_advantages = ppo_batch['advantages']
-                # batch_advantages_normalized = (batch_advantages - jnp.mean(batch_advantages)) / (jnp.std(batch_advantages) + 1e-8)
-                # ppo_batch['advantages'] = batch_advantages_normalized
+                # Normalize advantages for stability (standard practice in PPO)
+                # This helps with gradient stability when advantage scales vary widely
+                batch_advantages = ppo_batch['advantages']
+                advantage_mean = jnp.mean(batch_advantages)
+                advantage_std = jnp.std(batch_advantages)
+                batch_advantages_normalized = (batch_advantages - advantage_mean) / (advantage_std + 1e-8)
+                ppo_batch_normalized = {**ppo_batch, 'advantages': batch_advantages_normalized}
+                
+                # Get KL penalty weight for current step
+                kl_weight = kl_penalty_schedule(state_dict['opt_t'])
+                
+                # Use BC-appropriate hyperparameters if BC was used
+                clip_ratio = config.get('ppo_clip_ratio', config.get('clip_ratio', 0.2))
+                entropy_coef = config.get('ppo_entropy_coef', config.get('entropy_coef', 0.01))
                 
                 # Update policy network (actor) - OPTIMIZED: compute loss and grad together
+                # Fallback BC params: if None, use current policy params (KL becomes ~0 and avoids Haiku param errors)
+                bc_params_for_kl = bc_policy_params if bc_policy_params is not None else state_dict['policy_params']
+
                 (policy_loss, policy_info), policy_grads = jax.value_and_grad(
                     lambda p: policy_loss_jit(
-                        p, ppo_batch, ppo_batch['log_probs'],
-                        clip_ratio=config.get('clip_ratio', 0.2),
-                        entropy_coef=config.get('entropy_coef', 0.01)
+                        p, ppo_batch_normalized, ppo_batch_normalized['log_probs'],
+                        clip_ratio=clip_ratio,
+                        entropy_coef=entropy_coef,
+                        bc_policy_params=bc_params_for_kl,
+                        kl_penalty_weight=kl_weight
                     ), has_aux=True
                 )(state_dict['policy_params'])
                 
@@ -770,6 +1320,7 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 state_dict['policy_opt_state'] = policy_opt_state
                 
                 # Update value network (critic) - OPTIMIZED: compute loss and grad together
+                # Use original batch for value updates (not normalized advantages)
                 (value_loss, value_info), value_grads = jax.value_and_grad(
                     lambda v: value_loss_jit(
                         v, ppo_batch, value_coef=config.get('value_coef', 0.5), value_clip_ratio=config.get('value_clip_ratio', 0.2)
@@ -782,6 +1333,11 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 
                 total_policy_loss += policy_loss
                 total_value_loss += value_loss
+                
+                # Store KL metrics for logging if available (use last epoch's values)
+                if 'kl_div' in policy_info:
+                    kl_div = float(policy_info['kl_div'])
+                    kl_penalty_val = float(policy_info.get('kl_penalty', 0.0))
                 
                 # Debug: Print loss values
                 # print(f"PPO Epoch {epoch}: Policy Loss = {policy_loss:.6f}, Value Loss = {value_loss:.6f}")
@@ -810,6 +1366,15 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             'buffer_size': buffer.size,  # Current buffer size
             'buffer_utilization': buffer.size / buffer.buffer_size,  # Buffer utilization
             'learning_active': buffer.size >= min_buffer_size,  # Whether learning is active
+            
+            # Curriculum learning metrics
+            'curriculum/alpha': float(jnp.mean(metrics['curriculum_alpha'])) if 'curriculum_alpha' in metrics else 0.0,
+            'curriculum/sp_action_fraction': float(jnp.mean(metrics['sp_action_fraction'])) if 'sp_action_fraction' in metrics else 0.0,
+            
+            # KL penalty metrics (if BC was used)
+            'kl/kl_div': kl_div if use_kl_penalty else 0.0,
+            'kl/kl_penalty': kl_penalty_val if use_kl_penalty else 0.0,
+            'kl/kl_weight': float(kl_penalty_schedule(state_dict['opt_t'])),
             
             # Evaluation metrics
             'eval/avg_reward': float(eval_results['avg_reward']),

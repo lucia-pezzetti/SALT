@@ -184,10 +184,31 @@ def build_env(args):
     return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
 
 
+def compute_normalized_node_coordinates(
+    G: nx.DiGraph,
+    node_to_idx: Dict[int, int]
+) -> jnp.ndarray:
+    """
+    Compute normalized lat/lon coordinates for all nodes.
+    Returns: [num_nodes, 2] array of normalized coordinates
+    """
+    idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
+    lats = jax.device_put(jnp.array([G.nodes[n]['y'] for n in idx_to_node], dtype=jnp.float32))
+    lons = jax.device_put(jnp.array([G.nodes[n]['x'] for n in idx_to_node], dtype=jnp.float32))
+    lat_min, lat_max = lats.min(), lats.max()
+    lon_min, lon_max = lons.min(), lons.max()
+    latlon = jax.device_put(jnp.stack([
+        (lats - lat_min) / (lat_max - lat_min),
+        (lons - lon_min) / (lon_max - lon_min)
+    ], axis=-1))  # [N,2]
+    return latlon
+
+
 def make_obs_fn(
     env: TaxiEnv,
     G: nx.DiGraph,
-    node_to_idx: Dict[int,int]
+    node_to_idx: Dict[int,int],
+    include_neighbor_info: bool = True
 ) -> Tuple[
     Callable[[TaxiState], jnp.ndarray],
     Callable[[TaxiState], jnp.ndarray]
@@ -201,15 +222,10 @@ def make_obs_fn(
       - obs_fn_batch: batched TaxiState -> batched observation vectors [B, 9]
     """
     # Precompute normalized lat/lon per node - ensure on GPU
-    idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
-    lats = jax.device_put(jnp.array([G.nodes[n]['y'] for n in idx_to_node], dtype=jnp.float32))
-    lons = jax.device_put(jnp.array([G.nodes[n]['x'] for n in idx_to_node], dtype=jnp.float32))
-    lat_min, lat_max = lats.min(), lats.max()
-    lon_min, lon_max = lons.min(), lons.max()
-    latlon = jax.device_put(jnp.stack([
-        (lats - lat_min) / (lat_max - lat_min),
-        (lons - lon_min) / (lon_max - lon_min)
-    ], axis=-1))  # [N,2]
+    latlon = compute_normalized_node_coordinates(G, node_to_idx)
+    
+    # Precompute max distance for normalization (if using neighbor info)
+    max_dist = float(env.distances.max()) if include_neighbor_info else 0.0
 
     def single_obs(s: TaxiState) -> jnp.ndarray:
         """
@@ -235,16 +251,39 @@ def make_obs_fn(
         # # Compute angle efficiently
         # angle = jnp.arctan2(relative_pos[1], relative_pos[0])  # [1] - direct computation
         
-        # Pre-allocate result array for better memory layout
-        obs = jnp.zeros(5, dtype=jnp.float32)
+        # Base features: current_pos(2), pickup_pos(2), time(1) = 5 dims
+        base_dims = 5
+        neighbor_dims = 2 * env.max_deg if include_neighbor_info else 0
+        total_dims = base_dims + neighbor_dims
         
-        # Fill in values with optimized assignments
+        obs = jnp.zeros(total_dims, dtype=jnp.float32)
+        
+        # Fill in base values
         obs = obs.at[0:2].set(xy_c)           # [2] - current position
         obs = obs.at[2:4].set(xy_p)           # [2] - pickup position  
-        # obs = obs.at[4:6].set(relative_pos)   # [2] - direction vector
-        # obs = obs.at[6].set(distance)         # [1] - distance
-        # obs = obs.at[7].set(angle)            # [1] - angle
         obs = obs.at[4].set(s.time)           # [1] - time
+        
+        # Add neighbor information if enabled (critical for matching expert decisions)
+        if include_neighbor_info:
+            # Get travel times to each neighbor
+            neighbor_travel_times = env.travel_times[s.current_node]  # [max_deg]
+            # Normalize travel times (divide by max travel time for stability)
+            neighbor_travel_times_norm = neighbor_travel_times / (env.max_travel_time + 1e-8)
+            
+            # Get distances from each neighbor to pickup
+            neighbors = env.adj_list[s.current_node]  # [max_deg]
+            neighbor_distances = env.distances[neighbors, s.pickup_node]  # [max_deg]
+            # Normalize distances (divide by max distance for stability - precomputed)
+            neighbor_distances_norm = neighbor_distances / (max_dist + 1e-8)
+            
+            # Mask invalid neighbors (set to large value instead of 0 to distinguish from valid)
+            # Use mask to zero out invalid positions
+            neighbor_travel_times_norm = jnp.where(s.neighbor_mask, neighbor_travel_times_norm, 0.0)
+            neighbor_distances_norm = jnp.where(s.neighbor_mask, neighbor_distances_norm, 0.0)
+            
+            # Store neighbor info: [travel_times (max_deg), distances (max_deg)]
+            obs = obs.at[5:5+env.max_deg].set(neighbor_travel_times_norm)
+            obs = obs.at[5+env.max_deg:5+2*env.max_deg].set(neighbor_distances_norm)
         
         return obs
 

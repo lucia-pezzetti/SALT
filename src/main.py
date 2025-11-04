@@ -27,6 +27,11 @@ from training.policy_improvement import get_init_fn, get_recurrent_fn, get_agent
 from training.ppo import get_ppo_init_fn, get_ppo_agent_loop
 from evaluation.evaluation import evaluate_all_combinations, create_traveling_times_plot
 from evaluation.plot_agent_paths import plot_agent_path_from_trajectory, plot_rl_vs_shortest_path
+from modes.context import RunContext
+from modes.eval_only import run_eval_only
+from modes.train_dqn import run_dqn
+from modes.train_pi import run_pi
+from modes.train_ppo import run_ppo
 
 import argparse
 from functools import partial
@@ -76,7 +81,7 @@ parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zone
 parser.add_argument("--num_agents", type=int, default=1, help="Number of agents in the environment")
 parser.add_argument("--base_time", type=float, default=1.0, help="Base travel time for grid environment")
 parser.add_argument("--max_steps", type=int, default=300, help="Maximum number of steps per episode")
-parser.add_argument("--pickup_bonus", type=float, default=50.0, help="Bonus for picking up a passenger")
+parser.add_argument("--pickup_bonus", type=float, default=5.0, help="Bonus for picking up a passenger")
 parser.add_argument("--timeout_penalty", type=float, default=-5.0, help="Penalty for timeout")
 parser.add_argument("--n_expert_samples", type=int, default=5000, help="Number of expert samples for pretraining")
 parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512], help="Hidden dimensions for the neural network")
@@ -167,6 +172,10 @@ distances = jax.device_put(jnp.array(dist_mat, dtype=jnp.float32))
 hop_distances = jax.device_put(jnp.array(hop_dist_mat, dtype=jnp.float32))
 # print(f"Max shortest path: {max_length}")
 
+# --- Compute normalized node coordinates for Euclidean distance in reward ---
+from taxi_env_utils import compute_normalized_node_coordinates
+node_coordinates = compute_normalized_node_coordinates(G, node_to_idx)
+
 # --- Create environment ---
 # print("Creating environment...")
 env = TaxiEnv(
@@ -180,6 +189,7 @@ env = TaxiEnv(
     max_steps=args.max_steps,
     traffic_params=traffic_params,
     paths_dict=paths_dict,
+    node_coordinates=node_coordinates,  # Pass normalized coordinates for Euclidean distance
     pickup_bonus=args.pickup_bonus,
     timeout_penalty=args.timeout_penalty,
     gamma=args.gamma,   
@@ -226,7 +236,29 @@ estimate_state = EstimateReturnsState.create(rollout_steps=10, gamma=args.gamma)
 fixed_starts_idx = jax.device_put(jnp.array(fixed_starts_idx, dtype=jnp.int32))
 fixed_pickups_idx = jax.device_put(jnp.array(fixed_pickups_idx, dtype=jnp.int32))
 
-# Handle evaluation-only mode
+# Modular early-dispatch for eval-only (keeps legacy block below unreachable)
+ctx = RunContext(
+    env=env,
+    G=G,
+    node_to_idx=node_to_idx,
+    idx_to_node=idx_to_node,
+    obs_fn_single=obs_fn_single,
+    obs_fn_batch=obs_fn_batch,
+    fixed_starts_idx=fixed_starts_idx,
+    fixed_pickups_idx=fixed_pickups_idx,
+    distances=distances,
+    hop_distances=hop_distances,
+    neighbor_mask_static=neighbor_mask_static,
+    estimate_state=estimate_state,
+    max_length=max_length,
+    paths_dict=paths_dict,
+)
+if args.eval_only:
+    run_eval_only(args, ctx)
+    exit(0)
+
+'''
+# Handle evaluation-only mode (LEGACY - now dispatched via modes.eval_only.run_eval_only)
 if args.eval_only:
     if args.load_params is None:
         raise ValueError("--load_params must be specified when using --eval_only")
@@ -673,10 +705,24 @@ if args.eval_only:
     
     print("=== Evaluation Complete ===")
     exit(0)
+'''
 
 # WandB will be initialized after PPO config is loaded
 
-# --- DQN ---
+# Early-dispatch to modular training handlers
+if not args.eval_only:
+    if args.model == "dqn":
+        run_dqn(args, ctx)
+        exit(0)
+    elif args.model == "pi":
+        run_pi(args, ctx)
+        exit(0)
+    elif args.model == "ppo":
+        run_ppo(args, ctx)
+        exit(0)
+
+'''
+# --- DQN --- (LEGACY - now dispatched via modes.train_dqn.run_dqn)
 if args.model == "dqn":
     # print("Starting DQN training...")
     params = train(
@@ -1165,7 +1211,7 @@ elif args.model == "pi":
         fig = plot_rl_vs_shortest_path(v_paths, sp_paths, G, node_to_idx, idx_to_node, eval_starts, rl_pickups)
         fig.savefig(f"rl_vs_sp_{eval_starts}_{rl_pickups}.png")
 
-# --- PPO Training ---
+# --- PPO Training --- (LEGACY - now dispatched via modes.train_ppo.run_ppo)
 elif args.model == "ppo":
     obs_fn_single, obs_fn_batch = make_obs_fn(env, G, node_to_idx)
     
@@ -1663,3 +1709,4 @@ elif args.model == "ppo":
 
 # Finish wandb logging
 wandb.finish()
+'''

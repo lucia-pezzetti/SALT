@@ -95,17 +95,31 @@ def main():
 
     # precompute distances via networkx
     dist_np = np.full((N, N), np.inf, dtype=np.float32)
+    hop_dist_np = np.full((N, N), np.inf, dtype=np.float32)
     for u, lengths in nx.all_pairs_dijkstra_path_length(G, weight='travel_time_congested'):
         ui = node_to_idx[u]
         for v, d in lengths.items():
             vi = node_to_idx[v]
             dist_np[ui, vi] = d * 60.0  # Convert minutes to seconds
+    
+    # Compute hop distances
+    for u, lengths in nx.all_pairs_dijkstra_path_length(G, weight=None):
+        ui = node_to_idx[u]
+        for v, d in lengths.items():
+            vi = node_to_idx[v]
+            hop_dist_np[ui, vi] = d
+    
     distances = jax.device_put(jnp.array(dist_np))
+    hop_distances = jax.device_put(jnp.array(hop_dist_np, dtype=jnp.float32))
 
     # device arrays
     adj_dev  = jax.device_put(jnp.array(adj_list, dtype=jnp.int32))
     tt_dev   = jax.device_put(jnp.array(travel_times, dtype=jnp.float32))
     mask_dev = jax.device_put(jnp.array(neighbor_mask, dtype=bool))
+
+    # Compute normalized node coordinates for Euclidean distance in reward
+    from taxi_env_utils import compute_normalized_node_coordinates
+    node_coordinates = compute_normalized_node_coordinates(G, node_to_idx)
 
     # instantiate environment
     env = TaxiEnv(adj_list=adj_dev,
@@ -114,8 +128,10 @@ def main():
                   fixed_starts=fixed_starts,
                   fixed_pickups=fixed_pickups,
                   distances=distances,
+                  hop_distances=hop_distances,
                   max_steps=args.max_steps,
                   traffic_params=traffic_params,
+                  node_coordinates=node_coordinates,  # Pass normalized coordinates for Euclidean distance
                   pickup_bonus=args.pickup_bonus,
                   timeout_penalty=args.timeout_penalty,
                   gamma=args.gamma)

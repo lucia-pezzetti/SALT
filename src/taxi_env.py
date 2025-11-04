@@ -47,6 +47,7 @@ class TaxiEnv(eqx.Module):
     num_nodes: int
     distances: jnp.ndarray        # [num_nodes, num_nodes]
     hop_distances: jnp.ndarray    # [num_nodes, num_nodes]
+    node_coordinates: Optional[jnp.ndarray] = None  # [num_nodes, 2] - normalized lat/lon coordinates
     paths_dict: Optional[dict] = None  # Dict of (source, target) -> path for precomputed shortest paths
     max_steps: int
     fixed_starts: jnp.ndarray     # [num_starts]
@@ -75,6 +76,7 @@ class TaxiEnv(eqx.Module):
         max_steps: int,
         traffic_params: Dict[int, Tuple[float, float, float]],
         paths_dict: Optional[dict] = None,
+        node_coordinates: Optional[jnp.ndarray] = None,  # [num_nodes, 2] - normalized lat/lon coordinates
         # alpha: float = 1.0,
         pickup_bonus: float = 5.0,
         timeout_penalty: float = -50.0,
@@ -88,6 +90,11 @@ class TaxiEnv(eqx.Module):
         self.distances = jax.device_put(jnp.array(distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
         self.hop_distances = jax.device_put(jnp.array(hop_distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
         self.paths_dict = paths_dict
+        # Store normalized node coordinates for Euclidean distance computation
+        if node_coordinates is not None:
+            self.node_coordinates = jax.device_put(jnp.array(node_coordinates, dtype=jnp.float32))  # [num_nodes, 2]
+        else:
+            self.node_coordinates = None
 
         # sizes
         self.num_nodes, self.max_deg = adj_list.shape
@@ -167,18 +174,29 @@ class TaxiEnv(eqx.Module):
 
         # Reward calculation - optimized
         total_delay = travel + wait
-        dist_c = self.distances[curr, state.pickup_node]
+        
+        # Use Euclidean distance from normalized coordinates if available, otherwise fall back to travel time distance
+        # Note: In JIT-compiled code, we can't check None with Python if, so we always compute both and select
+        # Since node_coordinates is either None (not provided) or a valid array, we use jnp.where with a check
+        # if self.node_coordinates is not None:
+        #     # Compute Euclidean distance from normalized coordinates
+        #     coord_nxt = self.node_coordinates[nxt]  # [2]
+        #     coord_pickup = self.node_coordinates[state.pickup_node]  # [2]
+        #     diff = coord_nxt - coord_pickup
+        #     dist_n = jnp.sqrt(jnp.sum(diff * diff) + 1e-8)  # Euclidean distance in normalized coordinate space (add small epsilon for numerical stability)
+        # else:
+            # Fallback to shortest path travel time distance
         dist_n = self.distances[nxt, state.pickup_node]
-        shaping = (dist_c - self.gamma * dist_n)
         
         # Add pickup bonus when reaching the pickup location
         pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
         # Scale down delay penalty and increase pickup bonus to ensure positive rewards for completion
-        reward = -0.1*total_delay + 0.5*shaping + pickup_bonus
+        # Using Euclidean distance penalty instead of travel time distance
+        reward = - total_delay / 60.0 - dist_n / 60.0 
         
         # Debug reward components to check if shaping is negligible
-        jax.debug.print("Reward: delay={delay:.2f}, shaping={shaping:.2f}, pickup_bonus={bonus:.2f}, reward={reward:.2f}, reach={reach}", 
-                        delay=total_delay, shaping=shaping, bonus=pickup_bonus, reward=reward, reach=reach)
+        # jax.debug.print("Reward: delay={delay:.2f}, shaping={shaping:.2f}, pickup_bonus={bonus:.2f}, reward={reward:.2f}, reach={reach}", 
+        #                 delay=total_delay, shaping=shaping, bonus=pickup_bonus, reward=reward, reach=reach)
 
         # New neighbor mask - direct access
         nm = self.neighbor_mask_static[nxt]
