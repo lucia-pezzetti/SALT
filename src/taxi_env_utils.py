@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from taxi_env import TaxiEnv, TaxiState
 from utils import load_graph, fixed_starts_pickups, load_simple_graph
 
-# --- Graph conversion utilities ---
+# Graph conversion utilities
 def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = None):
     node_list = list(G.nodes())
     num_nodes = len(node_list)
@@ -35,35 +35,34 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
             adj[i, j] = node_to_idx[nbr]
             times[i, j] = time_sec
         if 0 < n_neighbors < max_deg:
-            # pad with first neighbor
+            # Pad with first neighbor
             adj[i, n_neighbors:] = adj[i, 0]
             times[i, n_neighbors:] = times[i, 0]
         neighbor_mask[i, :n_neighbors] = True
 
-    # Ensure arrays are on GPU with proper dtypes
+    # Align arrays
     return jax.device_put(jnp.array(adj, dtype=jnp.int32)), jax.device_put(jnp.array(times, dtype=jnp.float32)), jax.device_put(jnp.array(neighbor_mask, dtype=bool))
 
 def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhattan_distances.pkl", num_workers=None):
     """
     Load precomputed distance matrix or compute and cache it using parallel processing.
     """
-    if os.path.exists(cache_file):
+    if cache_file is not None and os.path.exists(cache_file):
         # print(f"Loading precomputed distance matrix from {cache_file}")
         with open(cache_file, 'rb') as f:
             data = pickle.load(f)
             # Return None for paths_dict to use smart greedy approach
             return data['dist_mat'], data['hop_dist_mat'], data['max_length'], None
     
-    # print("Computing distance matrix with parallel processing (hybrid approach - no paths)...")
+    # Compute distance matrix with parallel processing
     all_nodes = list(G.nodes())
     N = len(all_nodes)
-    # print(f"Computing all-pairs shortest paths for {N} nodes using {num_workers or mp.cpu_count()} workers...")
     
     dist_mat = np.zeros((N, N), dtype=np.float32)
     hop_dist_mat = np.zeros((N, N), dtype=np.float32)
     max_length = 0
     
-    # Parallel computation of distance matrices (NO PATH STORAGE)
+    # Parallel computation of distance matrices
     def compute_node_distances(node_batch):
         local_dist = np.zeros((len(node_batch), N), dtype=np.float32)
         local_hop = np.zeros((len(node_batch), N), dtype=np.float32)
@@ -71,7 +70,7 @@ def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhatt
         
         for i, u in enumerate(node_batch):
             ui = node_to_idx[u]
-            # Travel time distances ONLY (no path storage) - convert to seconds
+            # Travel time distances - convert to seconds
             lengths = nx.single_source_dijkstra_path_length(G, u, weight="travel_time_congested")
             for v, d in lengths.items():
                 vi = node_to_idx[v]
@@ -97,7 +96,7 @@ def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhatt
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         results = list(executor.map(compute_node_distances, node_batches))
     
-    # Combine results (NO PATH MERGING)
+    # Combine results
     for i, (local_dist, local_hop, local_max) in enumerate(results):
         start_idx = i * batch_size
         end_idx = min(start_idx + batch_size, N)
@@ -105,45 +104,86 @@ def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhatt
         hop_dist_mat[start_idx:end_idx] = local_hop
         max_length = max(max_length, local_max)
     
-    # Cache the results (NO PATHS_DICT)
-    # print(f"Caching distance matrix to {cache_file} (hybrid approach)")
-    with open(cache_file, 'wb') as f:
-        pickle.dump({
-            'dist_mat': dist_mat,
-            'hop_dist_mat': hop_dist_mat,
-            'max_length': max_length,
-            # No paths_dict - using smart greedy approach instead
-        }, f)
+    # Cache the results - only if cache_file is provided
+    if cache_file is not None:
+        # print(f"Caching distance matrix to {cache_file} (hybrid approach)")
+        with open(cache_file, 'wb') as f:
+            pickle.dump({
+                'dist_mat': dist_mat,
+                'hop_dist_mat': hop_dist_mat,
+                'max_length': max_length,
+            }, f)
     
     return dist_mat, hop_dist_mat, max_length, None
 
 def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
     """Load cached graph or build and cache it."""
-    if os.path.exists(cache_file):
-        # print(f"Loading cached Manhattan graph from {cache_file}")
+    if cache_file is not None and os.path.exists(cache_file):
         with open(cache_file, 'rb') as f:
             data = pickle.load(f)
-            return data['G'], data['node_to_idx'], data['idx_to_node'], data['fixed_starts_idx'], data['fixed_pickups_idx'], data['traffic_params']
+            traffic_params = data['traffic_params']
+            
+            # Check if traffic_params is in old format and needs conversion
+            if isinstance(traffic_params, dict):
+                # Rebuild traffic params in new format
+                G = data['G']
+                node_to_idx = data['node_to_idx']
+                max_deg = max(dict(G.out_degree()).values())
+                periods, green_durations, offsets = build_traffic_params(
+                    G, node_to_idx, args.cycle_length, args.offset, seed=42, max_deg=max_deg
+                )
+                traffic_params = (periods, green_durations, offsets)
+                # Update cache
+                with open(cache_file, 'wb') as cache_f:
+                    data['traffic_params'] = traffic_params
+                    pickle.dump(data, cache_f)
+            
+            # If seed is provided, recompute starts/pickups
+            # Otherwise use cached values
+            seed = getattr(args, 'seed', None)
+            if seed is not None and args.env_type == 'manhattan':
+                # Recompute starts/pickups
+                G = data['G']
+                nodes_gdf = data.get('nodes_gdf')
+                node_to_zone = data.get('node_to_zone')
+                zone_to_nodes = data.get('zone_to_nodes')
+                
+                # If we don't have the metadata, reload it
+                if nodes_gdf is None or node_to_zone is None or zone_to_nodes is None:
+                    G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(
+                        place_name=args.place_name, 
+                        zone_shp=args.zone_shp, 
+                        no_congestion=args.no_congestion
+                    )
+                
+                fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
+                    G, nodes_gdf, node_to_zone, zone_to_nodes, all=False, seed=seed
+                )
+                fixed_starts_idx = jnp.array(fixed_starts_idx, dtype=jnp.int32)
+                fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
+                return data['G'], node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
+            
+            return data['G'], data['node_to_idx'], data['idx_to_node'], data['fixed_starts_idx'], data['fixed_pickups_idx'], traffic_params
     
-    # print("Building Manhattan graph (this may take a while on first run)...")
+    # Build Manhattan graph
     start_time = time.time()
     
     G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params = build_env(args)
     
     build_time = time.time() - start_time
-    # print(f"Graph built in {build_time:.2f} seconds")
-    
+
     # Cache the graph
-    # print(f"Caching graph to {cache_file}")
-    with open(cache_file, 'wb') as f:
-        pickle.dump({
-            'G': G,
-            'node_to_idx': node_to_idx,
-            'idx_to_node': idx_to_node,
-            'fixed_starts_idx': fixed_starts_idx,
-            'fixed_pickups_idx': fixed_pickups_idx,
-            'traffic_params': traffic_params
-        }, f)
+    if cache_file is not None:
+        # Cache graph
+        with open(cache_file, 'wb') as f:
+            pickle.dump({
+                'G': G,
+                'node_to_idx': node_to_idx,
+                'idx_to_node': idx_to_node,
+                'fixed_starts_idx': fixed_starts_idx,
+                'fixed_pickups_idx': fixed_pickups_idx,
+                'traffic_params': traffic_params
+            }, f)
     
     return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
 
@@ -157,8 +197,9 @@ def build_env(args):
         # --- Load and preprocess Manhattan graph ---
         G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp, no_congestion= args.no_congestion)
 
+        seed = getattr(args, 'seed', None)
         fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
-            G, nodes_gdf, node_to_zone, zone_to_nodes, all = False
+            G, nodes_gdf, node_to_zone, zone_to_nodes, all = False, seed=seed
         )
         fixed_starts_idx  = jnp.array(fixed_starts_idx, dtype=jnp.int32)
         fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
@@ -167,19 +208,24 @@ def build_env(args):
 
     elif args.env_type == 'simple':
         G = load_simple_graph(num_layers=args.num_layers, width=args.layer_width, no_congestion=args.no_congestion)
-        # index mappings
+        # Index mappings
         nodes = list(G.nodes())
         node_to_idx = {n: i for i, n in enumerate(nodes)}
         idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
-        # only one fixed start (node 0) and one fixed pickup (last one)
+        # Only one fixed start (node 0) and one fixed pickup (last one)
         fixed_starts_idx = jnp.array([node_to_idx[n] for n in nodes[:args.layer_width]], dtype=jnp.int32)
         fixed_pickups_idx = jnp.array([node_to_idx[n] for n in nodes[-args.layer_width:]], dtype=jnp.int32)
 
     else:
         raise ValueError(f"Unknown env_type: {args.env_type}")
     
-    traffic_params = build_traffic_params(G, node_to_idx, args.cycle_length, args.offset, seed=42)
+    # Compute max_deg for traffic params
+    max_deg = max(dict(G.out_degree()).values())
+    periods, green_durations, offsets = build_traffic_params(
+        G, node_to_idx, args.cycle_length, args.offset, seed=42, max_deg=max_deg
+    )
+    traffic_params = (periods, green_durations, offsets)
 
     return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
 
@@ -189,18 +235,53 @@ def compute_normalized_node_coordinates(
     node_to_idx: Dict[int, int]
 ) -> jnp.ndarray:
     """
-    Compute normalized lat/lon coordinates for all nodes.
-    Returns: [num_nodes, 2] array of normalized coordinates
+    Compute normalized lat/lon coordinates for all nodes in the graph.
+    
+    Normalizes coordinates based on the min/max of the filtered nodes in G
+    (i.e., nodes from the selected zones). After normalization:
+    - min lat/lon becomes 0
+    - max lat/lon becomes 1
+    - All other values are in [0, 1]
+    
+    Args:
+        G: Graph containing only the filtered nodes (from selected zones)
+        node_to_idx: Mapping from node IDs to indices
+        
+    Returns:
+        [num_nodes, 2] array of normalized coordinates [lat, lon] in [0, 1]
     """
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
     lats = jax.device_put(jnp.array([G.nodes[n]['y'] for n in idx_to_node], dtype=jnp.float32))
     lons = jax.device_put(jnp.array([G.nodes[n]['x'] for n in idx_to_node], dtype=jnp.float32))
+    
+    # Find min/max for the filtered nodes
     lat_min, lat_max = lats.min(), lats.max()
     lon_min, lon_max = lons.min(), lons.max()
+    
+    # Normalize: (value - min) / (max - min)
+    # Handle edge case where all nodes have same lat/lon (avoid division by zero)
+    lat_range = lat_max - lat_min
+    lon_range = lon_max - lon_min
+    
+    # Normalize latitude: min -> 0, max -> 1
+    normalized_lats = jnp.where(
+        lat_range > 1e-8,  # If range is non-zero
+        (lats - lat_min) / lat_range,
+        jnp.zeros_like(lats)  # If all same, set to 0
+    )
+    
+    # Normalize longitude: min -> 0, max -> 1
+    normalized_lons = jnp.where(
+        lon_range > 1e-8,  # If range is non-zero
+        (lons - lon_min) / lon_range,
+        jnp.zeros_like(lons)  # If all same, set to 0
+    )
+    
     latlon = jax.device_put(jnp.stack([
-        (lats - lat_min) / (lat_max - lat_min),
-        (lons - lon_min) / (lon_max - lon_min)
+        normalized_lats,
+        normalized_lons
     ], axis=-1))  # [N,2]
+    
     return latlon
 
 
@@ -215,29 +296,17 @@ def make_obs_fn(
 ]:
     """
     Returns two functions:
-    #   - single_obs: TaxiState -> (state_feats [6], action_feats [max_deg,2], global_feats [3*N])
-    #   - obs_fn_batch: batched TaxiState -> dict of trajectories
       - single_obs: TaxiState -> observation vector [9] 
-        Features: [current_pos(2), pickup_pos(2), relative_pos(2), distance(1), angle(1), time(1)]
       - obs_fn_batch: batched TaxiState -> batched observation vectors [B, 9]
     """
-    # Precompute normalized lat/lon per node - ensure on GPU
+    # Precompute normalized lat/lon per node
     latlon = compute_normalized_node_coordinates(G, node_to_idx)
-    
-    # Precompute max distance for normalization (if using neighbor info)
-    max_dist = float(env.distances.max()) if include_neighbor_info else 0.0
 
     def single_obs(s: TaxiState) -> jnp.ndarray:
         """
-        Optimized observation function with reduced computations and better memory layout.
-        
-        Performance optimizations:
-        1. Pre-computed normalized coordinates on GPU
-        2. Reduced memory allocations
-        3. Optimized mathematical operations
-        4. Better memory access patterns
+        Observation function
         """
-        # Use pre-computed normalized lat/lon coordinates (already on GPU)
+        # Use pre-computed normalized lat/lon coordinates
         xy_c = latlon[s.current_node]   # [2] - direct GPU memory access
         xy_p = latlon[s.pickup_node]    # [2] - direct GPU memory access
         
@@ -251,51 +320,27 @@ def make_obs_fn(
         # # Compute angle efficiently
         # angle = jnp.arctan2(relative_pos[1], relative_pos[0])  # [1] - direct computation
         
-        # Base features: current_pos(2), pickup_pos(2), time(1) = 5 dims
-        base_dims = 5
-        neighbor_dims = 2 * env.max_deg if include_neighbor_info else 0
-        total_dims = base_dims + neighbor_dims
+        # Pre-allocate result array for better memory layout
+        obs = jnp.zeros(5, dtype=jnp.float32)
         
-        obs = jnp.zeros(total_dims, dtype=jnp.float32)
-        
-        # Fill in base values
+        # Fill in values with optimized assignments
         obs = obs.at[0:2].set(xy_c)           # [2] - current position
         obs = obs.at[2:4].set(xy_p)           # [2] - pickup position  
+        # obs = obs.at[4:6].set(relative_pos)   # [2] - direction vector
+        # obs = obs.at[6].set(distance)         # [1] - distance
+        # obs = obs.at[7].set(angle)            # [1] - angle
         obs = obs.at[4].set(s.time)           # [1] - time
-        
-        # Add neighbor information if enabled (critical for matching expert decisions)
-        if include_neighbor_info:
-            # Get travel times to each neighbor
-            neighbor_travel_times = env.travel_times[s.current_node]  # [max_deg]
-            # Normalize travel times (divide by max travel time for stability)
-            neighbor_travel_times_norm = neighbor_travel_times / (env.max_travel_time + 1e-8)
-            
-            # Get distances from each neighbor to pickup
-            neighbors = env.adj_list[s.current_node]  # [max_deg]
-            neighbor_distances = env.distances[neighbors, s.pickup_node]  # [max_deg]
-            # Normalize distances (divide by max distance for stability - precomputed)
-            neighbor_distances_norm = neighbor_distances / (max_dist + 1e-8)
-            
-            # Mask invalid neighbors (set to large value instead of 0 to distinguish from valid)
-            # Use mask to zero out invalid positions
-            neighbor_travel_times_norm = jnp.where(s.neighbor_mask, neighbor_travel_times_norm, 0.0)
-            neighbor_distances_norm = jnp.where(s.neighbor_mask, neighbor_distances_norm, 0.0)
-            
-            # Store neighbor info: [travel_times (max_deg), distances (max_deg)]
-            obs = obs.at[5:5+env.max_deg].set(neighbor_travel_times_norm)
-            obs = obs.at[5+env.max_deg:5+2*env.max_deg].set(neighbor_distances_norm)
         
         return obs
 
-    # JIT and batched versions with optimizations
     single_obs = jax.jit(single_obs)
     
-    # Pre-compile the vmap for better performance
+    # Pre-compile the vmap
     single_obs_batched = jax.jit(jax.vmap(single_obs))
 
     @jax.jit
     def obs_fn_batch(batch: TaxiState) -> jnp.ndarray:
-        """Optimized batch observation function with pre-compiled vmap"""
+        """Batch observation function"""
         return single_obs_batched(batch)
 
     return single_obs, obs_fn_batch
@@ -334,7 +379,7 @@ def get_global_state(env, batch) -> jnp.ndarray:
 
     return global_feats
 
-# --- Example init_state_fn ---
+# Example init_state_fn
 def make_init_state_fn(env: TaxiEnv, num_envs: int, rng_key):
     """
     Returns a batched initial TaxiState array and new rng_key.
@@ -355,58 +400,65 @@ def build_traffic_params(G: nx.DiGraph,
                          cycle_length: float = 60.0,
                          offset: float = 0.0,
                          seed: int = 0,
-                        ) -> Dict[int, Tuple[float,float,float]]:
+                         max_deg: int = None,
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    For each intersection (node), look at the highway‐types of
-    all incident edges and pick a cycle/green split:
+    For each edge (at the end of each edge), look at the highway type of that edge
+    and pick a cycle/green split:
       • Motorway/Trunk: always green (no light)
-      • Primary:         cycle/green = 5/6
-      • Secondary:       cycle/green = 2/3
-      • Tertiary:        cycle/green = 1/6
-      • Otherwise:       cycle/green = 1/2
-    We then pick a fixed offset per each node.
+      • Primary:         cycle/green = 60/30 (50% green)
+      • Secondary:       cycle/green = 60/18 (30% green)
+      • Tertiary:        cycle/green = 60/60 (always green)
+      • Residential/Living street: cycle/green = 60/18 (30% green)
+      • Otherwise:       cycle/green = 60/60 (always green)
+    
+    Returns arrays of shape [num_nodes, max_deg] for periods, green_durations, and offsets.
     """
-    rng = np.random.default_rng(seed)
-    traffic_params = {}
-    for node, idx in node_to_idx.items():
-        # collect all highway‐types on edges touching this node
-        types = []
-        # For a MultiDiGraph:
-        for u, v, key, data in G.edges(node, keys=True, data=True):
-            hw = data.get("highway", "unclassified")
+    node_list = list(G.nodes())
+    num_nodes = len(node_list)
+    
+    if max_deg is None:
+        max_deg = max(dict(G.out_degree()).values())
+    
+    periods = np.zeros((num_nodes, max_deg), dtype=np.float32)
+    green_durations = np.zeros((num_nodes, max_deg), dtype=np.float32)
+    offsets_arr = np.zeros((num_nodes, max_deg), dtype=np.float32)
+    
+    for i, node in enumerate(node_list):
+        neighbors = list(G.successors(node))
+        n_neighbors = len(neighbors)
+        for j, nbr in enumerate(neighbors[:max_deg]):
+            # Get the best edge (same logic as build_adj_and_time_matrix)
+            best_k = min(G[node][nbr], key=lambda k: G[node][nbr][k]['travel_time_congested'])
+            edge_data = G[node][nbr][best_k]
+            
+            # Get highway type from this specific edge
+            hw = edge_data.get("highway", "unclassified")
             if isinstance(hw, list):
-                types.extend(hw)
+                hw = hw[0] if hw else "unclassified"
+            
+            # decide cycle & green based on edge's highway type
+            if hw in ("motorway", "trunk"):
+                cycle, green = cycle_length, cycle_length    # effectively always green
+            elif hw == "primary":
+                cycle, green = cycle_length, cycle_length * 0.5
+            elif hw == "secondary":
+                cycle, green = cycle_length, cycle_length * 0.3
+            elif hw == "tertiary":
+                cycle, green = cycle_length, cycle_length
+            elif hw in ("residential", "living_street"):
+                cycle, green = cycle_length, cycle_length * 0.3
             else:
-                types.append(hw)
-        # decide cycle & green based on priority
-        if any(t in ("motorway", "trunk") for t in types):
-            cycle, green = cycle_length, cycle_length    # effectively always green
-        elif any(t == "primary" for t in types):
-            cycle, green = cycle_length, cycle_length * 0.5
-        elif any(t == "secondary" for t in types):
-            cycle, green = cycle_length, cycle_length * 0.3
-        elif any(t == "tertiary" for t in types):
-            cycle, green = cycle_length, cycle_length #* 1.0/6.0
-        elif any(t in ("residential", "living_street") for t in types):
-            cycle, green = cycle_length, cycle_length * 0.3
-        else:
-            cycle, green = cycle_length, cycle_length
-
-        # random phase offset
-        offset = offset
-        # --- VALIDITY CHECKS ---
-        # assert cycle > 0, f"Cycle length for node {node} must be positive, got {cycle}"
-        # assert green > 0, f"Green duration must be positive, got {green}"
-        # assert green <= cycle, (
-        #     f"Green duration ({green}) exceeds cycle ({cycle}) at node {node}"
-        # )
-        # assert 0 <= offset < cycle, (
-        #     f"Offset {offset:.2f} not in [0, {cycle}) for node {node}"
-        # )
-
-        traffic_params[node_to_idx[node]] = (cycle, green, offset)
-
-    missing = set(node_to_idx.values()) - set(traffic_params.keys())
-    assert not missing, f"Missing params for node indices: {sorted(missing)}"
-
-    return traffic_params
+                cycle, green = cycle_length, cycle_length
+            
+            periods[i, j] = cycle
+            green_durations[i, j] = green
+            offsets_arr[i, j] = offset
+        
+        # Pad with first edge's params if needed (same as adj_list padding)
+        if 0 < n_neighbors < max_deg:
+            periods[i, n_neighbors:] = periods[i, 0]
+            green_durations[i, n_neighbors:] = green_durations[i, 0]
+            offsets_arr[i, n_neighbors:] = offsets_arr[i, 0]
+    
+    return periods, green_durations, offsets_arr

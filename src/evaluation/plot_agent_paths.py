@@ -136,10 +136,28 @@ def plot_rl_vs_shortest_path(
     """
     
     # Support both single path (list[int]) and multiple paths (list[list[int]]) inputs
-    if rl_trajectory and isinstance(rl_trajectory[0], list):
+    # Convert JAX/NumPy arrays to lists if needed
+    if rl_trajectory is not None and not isinstance(rl_trajectory, list):
+        # Check if it's an array-like object (NumPy or JAX array)
+        if hasattr(rl_trajectory, 'tolist'):
+            rl_trajectory = rl_trajectory.tolist()
+        elif hasattr(rl_trajectory, '__iter__'):
+            # Convert any iterable to list
+            rl_trajectory = list(rl_trajectory)
+    
+    if sp_trajectory is not None and not isinstance(sp_trajectory, list):
+        # Check if it's an array-like object (NumPy or JAX array)
+        if hasattr(sp_trajectory, 'tolist'):
+            sp_trajectory = sp_trajectory.tolist()
+        elif hasattr(sp_trajectory, '__iter__'):
+            # Convert any iterable to list
+            sp_trajectory = list(sp_trajectory)
+    
+    # Check if we have multiple trajectories (list of lists)
+    if rl_trajectory is not None and len(rl_trajectory) > 0 and isinstance(rl_trajectory[0], list):
         # Multiple trajectories provided
         rl_paths = rl_trajectory
-        sp_paths = sp_trajectory if (sp_trajectory and isinstance(sp_trajectory[0], list)) else [sp_trajectory]
+        sp_paths = sp_trajectory if (sp_trajectory is not None and len(sp_trajectory) > 0 and isinstance(sp_trajectory[0], list)) else [sp_trajectory]
         paths = rl_paths + sp_paths
         labels = [f"RL Agent {i+1}" for i in range(len(rl_paths))] + [f"Shortest Path {i+1}" for i in range(len(sp_paths))]
         base_colors = ["red", "blue", "green", "orange", "purple", "brown", "pink", "gray"]

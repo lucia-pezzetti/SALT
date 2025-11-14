@@ -14,19 +14,17 @@ from flax import struct
 
 from taxi_env import TaxiEnv
 
-# --- Load and preprocess graph ---
+# Load and preprocess graph
 def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_congestion: bool = False) -> nx.DiGraph:
     """
-    Download and preprocess the OSMnx graph for a place, keeping only the
-    largest strongly-connected component and adding 'congested_time'.
-    Removes self-loops from the graph.
+    Download and preprocess the OSMnx graph for a place, keeping only the largest strongly-connected component and adding 'congested_time'. Removes self-loops from the graph.
     """
-    # Download & basic routing attributes
+    # Download
     G = ox.graph.graph_from_place(place_name, network_type=network_type)
     G = ox.add_edge_speeds(G)
     G = ox.add_edge_travel_times(G)
 
-    # Extract largest SCC
+    # Extract largest strongly-connected component
     if not nx.is_strongly_connected(G):
         sccs = nx.strongly_connected_components(G)
         largest = max(sccs, key=len)
@@ -36,8 +34,7 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
 
     # Remove self-loops
     G_scc.remove_edges_from(nx.selfloop_edges(G_scc))
-
-    # Alias travel_time → congested_time
+    # Alias
     for u, v, k, data in G_scc.edges(keys=True, data=True):
         data['congested_time'] = data.get('travel_time', data.get('length', 0) / 10)
 
@@ -55,10 +52,10 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
         }
     apply_congestion_model(G_scc, multipliers)
 
-    # Map zones to nodes, then filter to Financial District
+    # Map zones to nodes, then filter
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
     # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
-    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West"] 
+    zone_names = ["Upper East Side North"] #, "Yorkville West"] # , "Upper East Side South", "Lenox Hill West"] 
     # zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"]  
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
@@ -231,11 +228,15 @@ def fixed_starts_pickups(G: nx.DiGraph,
                          nodes_gdf: gpd.GeoDataFrame,
                          node_to_zone: dict,
                          zone_to_nodes: dict,
-                         all: bool = False) -> tuple:
+                         all: bool = False,
+                         seed: int = None) -> tuple:
     """
     Choose fixed start & pickup nodes for the environment.
     If all=True, use all nodes as starts/pickups.
     Otherwise, use one node per zone.
+    
+    Args:
+        seed: Random seed for reproducibility. If None, uses current random state.
     """
 
     all_nodes = list(G.nodes())
@@ -243,55 +244,48 @@ def fixed_starts_pickups(G: nx.DiGraph,
     node_to_idx = {n: i for i, n in enumerate(all_nodes)}
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
-    # Choose fixed start & pickup sets (here: all nodes)
-    if all:
-        fixed_starts_idx = list(range(len(all_nodes)))
-        fixed_pickups_idx = list(range(len(all_nodes)))
-    else:
-        # choose fixed start & pickup nodes
-        fixed_starts = []
-        fixed_pickups = []
+    # Set seed if provided
+    if seed is not None:
+        random.seed(seed)
 
-        nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
+    num_to_sample = 1
+    sampled_indices_starts = random.sample(range(len(all_nodes)), num_to_sample)
+    sampled_indices_pickups = random.sample(range(len(all_nodes)), num_to_sample)
+    fixed_starts = [all_nodes[idx] for idx in sampled_indices_starts]
+    fixed_pickups = [all_nodes[idx] for idx in sampled_indices_pickups]
 
-        # Select randomly up to 5 nodes for every zone
-        zone_list = list(zone_to_nodes.items())
-        for i, (loc_id, nodes) in enumerate(zone_list):
-            if nodes:
-                # jax.debug.print("loc_id: {loc_id}", loc_id=loc_id)
-                # Sample up to 5 nodes (or all nodes if fewer than 5)
-                num_to_sample = min(1, len(nodes))
-                sampled_indices = random.sample(range(len(nodes)), num_to_sample)
-                # jax.debug.print("sampled_indices: {sampled_indices}", sampled_indices=sampled_indices)
-                # Add individual nodes, not lists
-                for idx in sampled_indices:
-                    fixed_starts.append(nodes[idx])
-                    # Use nodes from a different zone for pickups to ensure meaningful journeys
-                    if i < len(zone_list) - 1:
-                        # Use next zone for pickup
-                        next_zone_id, next_zone_nodes = zone_list[i + 1]
-                        if next_zone_nodes:
-                            pickup_node = random.choice(next_zone_nodes)
-                            fixed_pickups.append(pickup_node)
-                        else:
-                            # Fallback to different node in same zone
-                            pickup_idx = (idx + 1) % len(nodes) if len(nodes) > 1 else idx
-                            fixed_pickups.append(nodes[pickup_idx])
-                    else:
-                        # For last zone, use first zone for pickup
-                        first_zone_id, first_zone_nodes = zone_list[0]
-                        if first_zone_nodes:
-                            pickup_node = random.choice(first_zone_nodes)
-                            fixed_pickups.append(pickup_node)
-                        else:
-                            # Fallback to different node in same zone
-                            pickup_idx = (idx + 1) % len(nodes) if len(nodes) > 1 else idx
-                            fixed_pickups.append(nodes[pickup_idx])
+    # # Choose fixed start & pickup sets (here: all nodes)
+    # if all:
+    #     fixed_starts_idx = list(range(len(all_nodes)))
+    #     fixed_pickups_idx = list(range(len(all_nodes)))
+    # else:
+    #     # choose fixed start & pickup nodes
+    #     fixed_starts = []
+    #     fixed_pickups = []
 
-        fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
-        fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
+    #     nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
 
-        jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
+    #     # Select randomly up to 5 nodes for every zone
+    #     zone_list = list(zone_to_nodes.items())
+    #     for i, (loc_id, nodes) in enumerate(zone_list):
+    #         if nodes:
+    #             # jax.debug.print("loc_id: {loc_id}", loc_id=loc_id)
+    #             # Sample up to 5 nodes (or all nodes if fewer than 5)
+    #             num_to_sample = min(1, len(nodes))
+    #             sampled_indices_starts = random.sample(range(len(nodes)), num_to_sample)
+    #             sampled_indices_pickups = random.sample(range(len(nodes)), num_to_sample)
+    #             # jax.debug.print("sampled_indices: {sampled_indices}", sampled_indices=sampled_indices)
+    #             # Add individual nodes, not lists
+    #             for idx in sampled_indices_starts:
+    #                 fixed_starts.append(nodes[idx])
+                
+    #             for idx in sampled_indices_pickups:
+    #                 fixed_pickups.append(nodes[idx])
+
+    fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
+    fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
+
+    jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
 
     return fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node
 
@@ -436,22 +430,16 @@ def estimate_returns(
     )
     return total_ret.reshape((N, N)).astype(jnp.float32)
 
-# JIT with fixed static args
 estimate_returns_jit = jax.jit(
     estimate_returns,
     static_argnums=(2, 3, 4, 8)  # model, obs_fn_batch, init_env_fn, rollout_steps
 )
 
-# --- HYBRID APPROACH: Smart Greedy Pathfinding ---
+# Shortest path actions
 @jax.jit
-def smart_greedy_next_hop(current_node, target_node, adj_list, travel_times, distances, neighbor_mask):
+def offline_shortest_path_action(current_node, target_node, adj_list, travel_times, distances, neighbor_mask):
     """
-    Smart greedy approach that considers both local travel times and remaining distances.
-    
-    This replaces the precomputed paths_dict with an on-demand approach that:
-    1. Uses travel time distance matrix for optimality
-    2. Computes next hop using: local_travel_time + remaining_distance
-    3. Maintains near-optimal path quality while saving memory
+    Computes offline shortest path actions.
     
     Args:
         current_node: Current node index
@@ -462,17 +450,17 @@ def smart_greedy_next_hop(current_node, target_node, adj_list, travel_times, dis
         neighbor_mask: Mask indicating valid neighbors [max_deg]
     
     Returns:
-        action: Index of best neighbor to move to
+        action: Index of the shortest path neighbor
     """
     neighbors = adj_list[current_node]
     neighbor_travel_times = travel_times[current_node]
     
-    # For each neighbor, compute: local_travel_time + remaining_distance_to_target
+    # Local travel time + remaining distance to target
     total_costs = neighbor_travel_times + distances[neighbors, target_node]
     # Mask invalid neighbors using provided neighbor_mask
     total_costs = jnp.where(neighbor_mask, total_costs, jnp.inf)
     return jnp.argmin(total_costs)
 
-# Batch version for efficient processing
-smart_greedy_next_hop_batch = jax.jit(jax.vmap(smart_greedy_next_hop, 
+# Batch
+offline_shortest_path_action_batch = jax.jit(jax.vmap(offline_shortest_path_action, 
                                                in_axes=(0, 0, None, None, None, 0)))

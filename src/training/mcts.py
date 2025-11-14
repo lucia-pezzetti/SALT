@@ -48,7 +48,7 @@ class GraphAwareVFunction(hk.Module):
         self.activation = activation_dict[config['activation']]
         self.node_embedding_dim = config.get('node_embedding_dim', 64)
         self.max_nodes = config.get('max_nodes', 100)
-        self.cycle_length = config.get('cycle_length', 200)  # Default cycle length
+        self.cycle_length = config.get('cycle_length', 90)  # Default cycle length
         
     def __call__(self, obs, adj_list=None, road_types=None):
         # # Node embeddings
@@ -123,7 +123,7 @@ class GraphAwareVFunction(hk.Module):
         )(x).squeeze(-1)
         
         # Clip output
-        return jnp.clip(output, -100.0, 100.0)
+        return jnp.clip(output, -5000.0, 5000.0)
 
 def epsilon_greedy_qvalue_prior(env, V_apply, V_target_params, obs_fn_batch, state: TaxiState, 
                                          epsilon: float, key: jax.random.PRNGKey) -> jnp.ndarray:
@@ -167,6 +167,27 @@ def epsilon_greedy_qvalue_prior(env, V_apply, V_target_params, obs_fn_batch, sta
     logits = jnp.where(mask, jnp.log(uniform_prob + 1e-8), -jnp.inf)
     # Add extra probability to best action
     logits = logits.at[best_action].set(jnp.log(greedy_prob + 1e-8))
+
+    # Debug: print Q-value components to understand the variation
+    qmax = jnp.max(jnp.where(mask, qvalues, -jnp.inf))
+    qmin = jnp.min(jnp.where(mask, qvalues, jnp.inf))
+    reward_max = jnp.max(rewards)
+    reward_min = jnp.min(rewards)
+    next_val_max = jnp.max(next_values)
+    next_val_min = jnp.min(next_values)
+    any_done = jnp.any(dones)
+    
+    # jax.debug.print(
+    #     "[prior] num_valid={nv} qmax={qmax:.2f} qmin={qmin:.2f} rmax={rmax:.2f} rmin={rmin:.2f} Vmax={vmax:.2f} Vmin={vmin:.2f} any_done={done}",
+    #     nv=jnp.sum(mask),
+    #     qmax=qmax,
+    #     qmin=qmin,
+    #     rmax=reward_max,
+    #     rmin=reward_min,
+    #     vmax=next_val_max,
+    #     vmin=next_val_min,
+    #     done=any_done,
+    # )
     
     return logits
 
@@ -195,6 +216,11 @@ def estimate_returns_batch(keys, V_apply, obs_fn_batch, batch_init,
     
     # Get observations for all states
     obs = obs_fn_batch(all_states)
+    
+    # Ensure obs has the correct shape [batch_size, obs_dim]
+    # jnp.atleast_2d ensures 2D: [obs_dim] -> [1, obs_dim], [batch, obs_dim] -> [batch, obs_dim]
+    # This handles the case where obs_fn_batch might return a 1D array
+    obs = jnp.atleast_2d(obs)
     
     # Get value estimates directly from the learned value function
     batch_V = vmap(V_apply, in_axes=(None, 0))
@@ -330,12 +356,32 @@ def get_recurrent_fn(
 
             actions = jax.vmap(node_to_action)(states.current_node, next_nodes)  # [B]
 
+            # jax.debug.print(
+            #     "[rollout s={step}] curr={curr} tgt={tgt} next_hop={nh} action={act} valid?={valid} hop(curr,tgt)={hd} hop(nh,tgt)={hdn}",
+            #     step=step,
+            #     curr=states.current_node,
+            #     tgt=states.pickup_node,
+            #     nh=next_nodes,
+            #     act=actions,
+            #     valid=env.neighbor_mask_static[states.current_node, actions],
+            #     hd=env.hop_distances[states.current_node, states.pickup_node],
+            #     hdn=env.hop_distances[next_nodes, states.pickup_node],
+            # )
+
             next_s, rew, term, _ = batch_step(states, actions)
 
             # accumulate only for still‑alive ones
             R        = R + discount * rew
             discount = discount * env.gamma * (1.0 - term)
             done     = done | term
+
+            # jax.debug.print(
+            #     "[rollout s={step}] rew={r} term={term} disc={disc}",
+            #     step=step,
+            #     r=rew,
+            #     term=term,
+            #     disc=discount,
+            # )
 
             return (step + 1, next_s, R, discount, done)
 
@@ -354,13 +400,15 @@ def get_recurrent_fn(
         V_params   = params["V"]
         step_count = params.get("step", 0)
         ε          = epsilon_schedule_fn(step_count) if epsilon_schedule_fn else 0.1
-        alpha      = jnp.clip(step_count / float(curriculum_steps), 0.0, 1.0)
+        # Curriculum learning disabled
+        # alpha      = jnp.clip(step_count / float(curriculum_steps), 0.0, 1.0)
+        alpha = 1.0
 
         # 1) actual environment step
         next_states, rewards, terminals, _ = batch_step(states, actions)
         obs = obs_fn_batch(next_states)
 
-        # 2) rollout return under shortest-path policy
+        # 2) rollout return under shortest-path policy (curriculum learning disabled)
         rollout_vals = rollout_value_fn(next_states)  # shape [B]
 
         # 3) your learned V
@@ -368,8 +416,9 @@ def get_recurrent_fn(
         V_learned = jnp.squeeze(V_learned)            # make sure [B]
         V_learned = jnp.where(terminals, 0.0, V_learned)
 
-        # 4) curriculum mix (optional)
+        # 4) curriculum mix (disabled - use only learned V)
         value = (1.0 - alpha) * rollout_vals + alpha * V_learned
+        # value = V_learned  # Use only learned value function
 
         # 5) ε‑greedy prior (unchanged)
         B = next_states.current_node.shape[0]
@@ -437,10 +486,14 @@ def get_recurrent_fn(
 # --- Main training loop builder ---
 def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_update, get_V_params, epsilon_schedule_fn=None):
     @jax.jit
-    def batch_loss(V_params, value_targets, obs):
-        return jnp.mean(vmap(lambda vp, vt, o: (V_apply(vp, o) - vt) ** 2, 
-                     in_axes=(None, 0, 0))(V_params, value_targets, obs))
-    loss_grad = jax.jit(grad(batch_loss))
+    def batch_loss(V_params, value_targets, obs, mask):
+        per_sample = vmap(lambda vp, vt, o: (V_apply(vp, o) - vt) ** 2,
+                          in_axes=(None, 0, 0))(V_params, value_targets, obs)
+        mask = mask.astype(per_sample.dtype)
+        normalizer = jnp.maximum(1.0, jnp.sum(mask))
+        return jnp.sum(per_sample * mask) / normalizer
+
+    loss_grad = jax.jit(grad(batch_loss, argnums=0))
     batch_step = vmap(env.step, in_axes=(0, 0))
     batch_V = vmap(V_apply, in_axes=(None, 0))
     batch_reset = vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
@@ -449,6 +502,7 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         obs = obs_fn_batch(state_dict['env_states'])
         V_params = state_dict["V_params"]
         V_target_params = state_dict["V_target_params"]
+        active_mask = jnp.logical_not(state_dict['env_states'].done)
         
         # Get policy logits and value
         epsilon = epsilon_schedule_fn(state_dict['opt_t']) if epsilon_schedule_fn else 0.1
@@ -471,13 +525,22 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
             embedding=state_dict['env_states']
         )
 
+        # Define inv_mask before using it in debug print
+        inv_mask = jnp.logical_not(state_dict['env_states'].neighbor_mask)
+
+        # jax.debug.print(
+        #     "[root] any_invalid={ai} num_invalid={ni} prior_has_mass_on_invalid={mi} sum_prior_on_valid={sv}",
+        #     ai=jnp.any(inv_mask),
+        #     ni=jnp.sum(inv_mask),
+        #     mi=jnp.any(jnp.isfinite(root_prior) & inv_mask),
+        #     sv=jnp.sum(jnp.where(~inv_mask, jnp.exp(root_prior), 0.0)),
+        # )
+
         # Use subkey2 for tree search
         sk = subkey2
         
         # Combine parameters for recurrent function
         params = {"V": V_target_params, "step": state_dict['opt_t']}
-
-        inv_mask = jnp.logical_not(state_dict['env_states'].neighbor_mask)
         
         po = mctx.muzero_policy(
             params=params,
@@ -496,9 +559,35 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         # extract search targets
         search_val = po.search_tree.node_values[:, po.search_tree.ROOT_INDEX]
         value_targets = jax.lax.stop_gradient(search_val)
+        
+        # For done agents, set value target to 0 (they're done, no future reward)
+        # IMPORTANT: Include done states in training with target 0 so value function learns V(terminal) = 0
+        value_targets = jnp.where(active_mask, value_targets, 0.0)
 
-        loss = batch_loss(V_params, value_targets, obs)
-        V_grads = loss_grad(V_params, value_targets, obs)
+        jax.debug.print(
+            "[targets] mean={mt:.4f} std={st:.4f} min={mn:.4f} max={mx:.4f} V_pred_mean={mp:.4f}",
+            mt=jnp.mean(value_targets), st=jnp.std(value_targets),
+            mn=jnp.min(value_targets), mx=jnp.max(value_targets),
+            mp=jnp.mean(V),
+        )
+
+        # Include done states in training with target 0 to teach value function that V(terminal) = 0
+        # Use all states (not just active_mask) so done states are included
+        loss = batch_loss(V_params, value_targets, obs, jnp.ones_like(active_mask))
+        V_grads = loss_grad(V_params, value_targets, obs, jnp.ones_like(active_mask))
+        
+        # Debug: print loss components and mask info
+        num_done = jnp.sum(state_dict['env_states'].done.astype(jnp.int32))
+        num_active = jnp.sum(active_mask.astype(jnp.int32))
+        jax.debug.print(
+            "MCTS Loss | loss={loss:.6f} active={active}/{total} done={done} value_targets={targets} V_pred={vpred}",
+            loss=loss,
+            active=num_active,
+            total=active_mask.shape[0],
+            done=num_done,
+            targets=value_targets,
+            vpred=batch_V(V_params, obs)
+        )
 
         # Update value function
         V_updates, state_dict['V_opt_state'] = V_opt_update(V_grads, state_dict['V_opt_state'], V_params)
@@ -516,20 +605,48 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         # take action & step
         actions = po.action
         # jax.debug.print("Current state: {currs}, actions taken: {actions}", currs=state_dict['env_states'].current_node, actions=actions)
+        
+        # Capture state before step to check if agents were already done
+        was_already_done = state_dict['env_states'].done
+        
         state_dict['env_states'], rewards, terminals, info = batch_step(state_dict['env_states'], actions)
-        # jax.debug.print("Next states: {next_states}, pickups: {pickups}, done: {done}", next_states=state_dict['env_states'].current_node, pickups=state_dict['env_states'].pickup_node, done=terminals)
-        # jax.debug.print("Rewards: {rewards}", rewards=rewards)
-        # jax.debug.print("Terminals: {terminals}", terminals=terminals)
-        # jax.debug.print("Info: {info}", info=info)
+        
+        # jax.debug.print(
+        #     "MCTS | current_node={curr} pickup_node={pickup} reward={rew} done={done}",
+        #     curr=state_dict['env_states'].current_node,
+        #     pickup=state_dict['env_states'].pickup_node,
+        #     rew=rewards,
+        #     done=terminals
+        # )
+        # elap sed = info['travel'] + info['wait']  # or info['elapsed'] if you have it
+        # jax.debug.print(
+        #     "[step] rew={r} term={t} travel={tr} wait={wa} elapsed={el} step_gamma={g} time_gamma={tg}",
+        #     r=rewards, t=terminals, tr=info['travel'], wa=info['wait'], el=elapsed,
+        #     g=env.gamma,
+        #     tg=(env.gamma ** elapsed),
+        # )
 
-        # reset environments that are done
+        # Check if agents reached pickup (should keep them still, not reset)
+        reached_pickup = terminals & (state_dict['env_states'].current_node == state_dict['env_states'].pickup_node)
+        
+        # Check if agents were already done before this step (to avoid double-counting episodes)
+        new_episode_termination = terminals & ~was_already_done
+
+        # reset environments - only reset episodes that terminated but didn't reach pickup (e.g., timeout, invalid)
+        # For agents that reached pickup, keep them still at pickup location (avoid truncation bias)
         state_dict["key"], subkey = jax.random.split(state_dict["key"])
         subkeys = jax.random.split(subkey, num=config['batch_size'])
+        should_reset = terminals & ~reached_pickup  # Reset for timeout/invalid, but not for reaching pickup
+        jax.debug.print(
+            "[reset] term={term} reached_pickup={rp} should_reset={sr} resets={nres}",
+            term=terminals, rp=reached_pickup, sr=should_reset,
+            nres=jnp.sum(should_reset.astype(jnp.int32)),
+        )
         state_dict['env_states'] = jax.tree_util.tree_map(
             lambda reset, current: jnp.where(
-                jnp.reshape(terminals, [terminals.shape[0]] + [1] * (len(current.shape) - 1)),
-                reset,
-                current
+                jnp.reshape(should_reset, [should_reset.shape[0]] + [1] * (len(current.shape) - 1)),
+                reset,  # Use reset state for terminated episodes that didn't reach pickup
+                current  # Use current state for continuing episodes or agents that reached pickup
             ),
             batch_reset(subkeys, state_dict['last_start'], state_dict['env_states'].pickup_node)[0],
             state_dict["env_states"]
@@ -543,21 +660,42 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         episode_total_wait = state_dict['episode_wait']
         episode_total_time = state_dict['episode_total_time']
 
-        # update statistics
+        completed_time_increment = jnp.sum(jnp.where(new_episode_termination, episode_total_time, 0.0))
+        completed_travel_increment = jnp.sum(jnp.where(new_episode_termination, episode_total_travel, 0.0))
+        completed_wait_increment = jnp.sum(jnp.where(new_episode_termination, episode_total_wait, 0.0))
+        completed_episodes_increment = jnp.sum(new_episode_termination.astype(jnp.float32))
+
+        term_mask = new_episode_termination
+        term_count = jnp.sum(term_mask)
+        term_sum = jnp.sum(jnp.where(term_mask, state_dict['episode_return'], 0.0))
+        jax.debug.print(
+            "[avg_return] term_count={tc} batch_mean={bm:.4f} true_mean_over_terms={tm:.4f}",
+            tc=term_count,
+            bm=jnp.mean(jnp.where(term_mask, state_dict['episode_return'], 0.0)),
+            tm=term_sum / jnp.maximum(1.0, term_count),
+        )
+
+        # update statistics - only count new episode terminations (not already-done agents)
+        # Episode return accumulates for all agents (adding zero doesn't change it for done agents)
         state_dict.update({
             'episode_return': state_dict['episode_return'] + rewards,
             'avg_return': jnp.where(
-                terminals,
+                jnp.any(new_episode_termination),  # Only update on new terminations
                 (state_dict['avg_return'] * config['avg_return_smoothing'] + 
-                 state_dict['episode_return'] * (1.0 - config['avg_return_smoothing'])),
+                 jnp.mean(jnp.where(new_episode_termination, state_dict['episode_return'], 0.0)) * (1.0 - config['avg_return_smoothing'])),
                 state_dict['avg_return']
             ),
-            'num_episodes': jnp.where(terminals, state_dict['num_episodes'] + 1, state_dict['num_episodes']),
+            'num_episodes': jnp.where(jnp.any(new_episode_termination), state_dict['num_episodes'] + jnp.sum(new_episode_termination), state_dict['num_episodes']),
+            'completed_total_time': state_dict['completed_total_time'] + completed_time_increment,
+            'completed_travel_time': state_dict['completed_travel_time'] + completed_travel_increment,
+            'completed_wait_time': state_dict['completed_wait_time'] + completed_wait_increment,
+            'completed_episodes': state_dict['completed_episodes'] + completed_episodes_increment,
         })
-        state_dict['episode_return'] = jnp.where(terminals, 0, state_dict['episode_return'])
-        state_dict['episode_travel'] = jnp.where(terminals, 0, state_dict['episode_travel'])
-        state_dict['episode_wait'] = jnp.where(terminals, 0, state_dict['episode_wait'])
-        state_dict['episode_total_time'] = jnp.where(terminals, 0, state_dict['episode_total_time'])
+        # Reset episode statistics only for new terminations (when episode first completes)
+        state_dict['episode_return'] = jnp.where(new_episode_termination, 0, state_dict['episode_return'])
+        state_dict['episode_travel'] = jnp.where(new_episode_termination, 0, state_dict['episode_travel'])
+        state_dict['episode_wait'] = jnp.where(new_episode_termination, 0, state_dict['episode_wait'])
+        state_dict['episode_total_time'] = jnp.where(new_episode_termination, 0, state_dict['episode_total_time'])
 
         state_dict['avg_travel'] = jnp.where(
             state_dict['num_episodes'] > 0,
@@ -621,6 +759,8 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         starts = jnp.stack([jax_random.choice(k, env.fixed_starts) for k in subkeys_starts])
         pickups = jnp.stack([jax_random.choice(k, env.fixed_pickups) for k in subkeys_pickups])
 
+        # jax.debug.print("starts={starts} pickups={pickups}", starts=starts, pickups=pickups)
+
         batch_init = vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
 
         do_random = jax_random.uniform(eps_key, shape=()) < eps_ot
@@ -639,14 +779,24 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         state_dict['last_start'] = starts
         state_dict['key'] = key
 
-        freq = state_dict['visit_counts'] / state_dict['visit_counts'].sum()
+        total_visits = jnp.sum(state_dict['visit_counts'])
+        freq = jnp.where(
+            total_visits > 0,
+            state_dict['visit_counts'] / total_visits,
+            jnp.zeros_like(state_dict['visit_counts'], dtype=jnp.float32)
+        )
+        completed_eps = jnp.maximum(state_dict['completed_episodes'], 1.0)
+        avg_total_time = state_dict['completed_total_time'] / completed_eps
+        avg_travel_time = state_dict['completed_travel_time'] / completed_eps
+        avg_wait_time = state_dict['completed_wait_time'] / completed_eps
+
         return state_dict, {
             'loss': state_dict['loss'], 
             'avg_return': state_dict['avg_return'], 
             'visit_freq': freq, 
-            'avg_wait': jnp.mean(metrics['wait']), 
-            'avg_travel': jnp.mean(metrics['travel']), 
-            'avg_total_time': jnp.mean(state_dict['avg_total_time']),
+            'avg_wait': avg_wait_time,
+            'avg_travel': avg_travel_time,
+            'avg_total_time': avg_total_time,
             'starts': starts,
             'pickups': pickups
         }

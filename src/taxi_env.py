@@ -4,8 +4,9 @@ import jax.random as jrandom
 import equinox as eqx
 from typing import NamedTuple, Sequence, Tuple, Dict, Optional
 import gymnasium as gym
+import numpy as np
 
-# ----- State -----
+# State
 class TaxiState(NamedTuple):
     current_node: jnp.ndarray  # shape () - scalar int32
     pickup_node: jnp.ndarray   # shape () - scalar int32  
@@ -36,7 +37,7 @@ def init_env(
     )
     return state, rng_key
 
-# ----- Environment -----
+# Environment
 class TaxiEnv(eqx.Module):
     # Graph and base dynamics
     adj_list: jnp.ndarray         # [num_nodes, max_deg]
@@ -52,11 +53,11 @@ class TaxiEnv(eqx.Module):
     max_steps: int
     fixed_starts: jnp.ndarray     # [num_starts]
     fixed_pickups: jnp.ndarray    # [num_pickups]
-    # Traffic-signal parameters per node
-    periods: jnp.ndarray          # [num_nodes]
+    # Traffic-signal parameters per edge (at the end of each edge)
+    periods: jnp.ndarray          # [num_nodes, max_deg]
     max_wait_time: float
-    green_durations: jnp.ndarray  # [num_nodes]
-    offsets: jnp.ndarray          # [num_nodes]
+    green_durations: jnp.ndarray  # [num_nodes, max_deg]
+    offsets: jnp.ndarray          # [num_nodes, max_deg]
     # Congestion weight & timeout
     # alpha: float                  # per-vehicle delay
     pickup_bonus: float = 50.0  # bonus for reaching the pickup
@@ -74,7 +75,7 @@ class TaxiEnv(eqx.Module):
         distances: jnp.ndarray,
         hop_distances: jnp.ndarray,
         max_steps: int,
-        traffic_params: Dict[int, Tuple[float, float, float]],
+        traffic_params: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],  # (periods, green_durations, offsets) each [num_nodes, max_deg]
         paths_dict: Optional[dict] = None,
         node_coordinates: Optional[jnp.ndarray] = None,  # [num_nodes, 2] - normalized lat/lon coordinates
         # alpha: float = 1.0,
@@ -83,6 +84,15 @@ class TaxiEnv(eqx.Module):
         gamma: float = 0.99,
     ):
         # static graph data - ensure all arrays are on GPU with proper dtypes
+        travel_times_host = np.asarray(travel_times, dtype=np.float32)
+        valid_times = travel_times_host[travel_times_host > 0.0]
+        # Equinox modules are frozen dataclasses; use object.__setattr__ for new fields
+        object.__setattr__(
+            self,
+            "avg_travel_time_per_hop",
+            float(valid_times.mean()) if valid_times.size else 0.0,
+        )
+
         self.adj_list = jax.device_put(jnp.array(adj_list, dtype=jnp.int32))
         self.travel_times = jax.device_put(jnp.array(travel_times, dtype=jnp.float32))
         self.max_travel_time = float(travel_times.max())
@@ -100,7 +110,7 @@ class TaxiEnv(eqx.Module):
         self.num_nodes, self.max_deg = adj_list.shape
         self.max_steps = max_steps
 
-        # fixed starts/pickups - ensure on GPU
+        # fixed starts/pickups
         self.fixed_starts = jax.device_put(jnp.array(fixed_starts, dtype=jnp.int32))
         self.fixed_pickups = jax.device_put(jnp.array(fixed_pickups, dtype=jnp.int32))
 
@@ -110,31 +120,24 @@ class TaxiEnv(eqx.Module):
         # self.alpha = alpha
         self.gamma = gamma
 
-        # unpack traffic_params - ensure on GPU with optimal data types
-        nodes = jax.device_put(jnp.array(list(traffic_params.keys()), dtype=jnp.int32))
-        params = jax.device_put(jnp.array(list(traffic_params.values()), dtype=jnp.float32))  # shape [N,3]
-        periods_vals = params[:, 0]
-        green_vals  = params[:, 1]
-        offset_vals = params[:, 2]
-
-        # Pre-allocate with optimal memory layout
-        zeros = jax.device_put(jnp.zeros((self.num_nodes,), dtype=jnp.float32))
-        self.periods = zeros.at[nodes].set(periods_vals)
+        # Traffic params
+        periods_arr, green_durations_arr, offsets_arr = traffic_params
+        self.periods = jax.device_put(jnp.array(periods_arr, dtype=jnp.float32))  # [num_nodes, max_deg]
+        self.green_durations = jax.device_put(jnp.array(green_durations_arr, dtype=jnp.float32))  # [num_nodes, max_deg]
+        self.offsets = jax.device_put(jnp.array(offsets_arr, dtype=jnp.float32))  # [num_nodes, max_deg]
         self.max_wait_time = float(self.periods.max())  # max cycle length - convert to Python float
-        self.green_durations = zeros.at[nodes].set(green_vals)
-        self.offsets = zeros.at[nodes].set(offset_vals)
         
-        # Ensure all arrays are properly aligned for GPU access
+        # Align arrays
         self.periods = jnp.asarray(self.periods, dtype=jnp.float32)
         self.green_durations = jnp.asarray(self.green_durations, dtype=jnp.float32)
         self.offsets = jnp.asarray(self.offsets, dtype=jnp.float32)
 
-        # global traffic params shape [num_nodes, 3] (green/period rate, is green, time to next switch)
+        # Global traffic params
         self.global_state_dim = 3 * self.num_nodes  # [N,3] -> [3*N]
 
     @jax.jit
     def reset(self, rng_key) -> Tuple[TaxiState, jnp.ndarray]:
-        # resets global time via init_env
+        # Reset
         key1, subkey = jrandom.split(rng_key)
         key2, rng_key = jrandom.split(subkey)
         start = jrandom.choice(key1, self.fixed_starts)
@@ -146,35 +149,44 @@ class TaxiEnv(eqx.Module):
 
     @jax.jit
     def step(self, state: TaxiState, action: int) -> Tuple[TaxiState, float, bool, dict]:
-        """Optimized environment step function with reduced allocations and better GPU utilization"""
-        # Base move - optimized memory access
+        """Environment step
+        
+        If the episode is already done (state.done == True), the agent stays in place
+        and receives zero reward. This prevents agents from continuing to move and
+        accumulate rewards after reaching the pickup point.
+        """
+        # Already done
+        already_done = state.done
+        
+        # Base move
         curr = state.current_node
         nxt = self.adj_list[curr, action]
         travel = self.travel_times[curr, action]
 
-        # Terminal logic - combined conditions for efficiency
+        # Terminal logic
         invalid = (nxt == -1)
         reach = (curr == state.pickup_node) | (nxt == state.pickup_node)
         step_n = state.step_count + 1
         timeout = (step_n >= self.max_steps) & (~reach)
         done = invalid | reach | timeout
 
-        # Time calculations - optimized
+        # Time calculations
         t1 = state.time + travel
         
-        # Signal phase & wait - pre-compute common values
-        period_nxt = self.periods[nxt]
-        offset_nxt = self.offsets[nxt]
-        green_nxt = self.green_durations[nxt]
+        # Signal phase & wait - use edge-based traffic params (at the end of the edge)
+        period_edge = self.periods[curr, action]
+        offset_edge = self.offsets[curr, action]
+        green_edge = self.green_durations[curr, action]
         
-        cycle = (t1 + offset_nxt) % period_nxt
-        wait = jnp.where(cycle < green_nxt, 0.0, period_nxt - cycle)
+        cycle = (t1 + offset_edge) % period_edge
+        wait = jnp.where(cycle < green_edge, 0.0, period_edge - cycle)
         t2 = t1 + wait
-        norm_time = t2 % period_nxt
+        norm_time = t2 % period_edge
 
         # Reward calculation - optimized
         total_delay = travel + wait
         
+        # EUCLIDEAN DISTANCE
         # Use Euclidean distance from normalized coordinates if available, otherwise fall back to travel time distance
         # Note: In JIT-compiled code, we can't check None with Python if, so we always compute both and select
         # Since node_coordinates is either None (not provided) or a valid array, we use jnp.where with a check
@@ -185,29 +197,76 @@ class TaxiEnv(eqx.Module):
         #     diff = coord_nxt - coord_pickup
         #     dist_n = jnp.sqrt(jnp.sum(diff * diff) + 1e-8)  # Euclidean distance in normalized coordinate space (add small epsilon for numerical stability)
         # else:
-            # Fallback to shortest path travel time distance
-        dist_n = self.distances[nxt, state.pickup_node]
+        #     # Fallback to shortest path travel time distance
+        # dist_n = self.distances[nxt, state.pickup_node]
+        # 
+        # # Add pickup bonus when reaching the pickup location
+        # pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
+        # # Scale down delay penalty and increase pickup bonus to ensure positive rewards for completion
+        # # Using Euclidean distance penalty instead of travel time distance
+        # reward = - total_delay/60.0 - 0.5*dist_n/60.0
         
-        # Add pickup bonus when reaching the pickup location
+        # HOP DISTANCES
+        # Compute hop distances from current and next nodes to pickup
+        # hop_dist_curr = self.hop_distances[curr, state.pickup_node]
+        # hop_dist_next = self.hop_distances[nxt, state.pickup_node]
+        # hop_dist_diff = hop_dist_curr - hop_dist_next
+        # Average travel time per hop
+        # valid_travel_times = jnp.where(self.travel_times > 0.0, self.travel_times, 0.0)
+        # sum_valid = jnp.sum(valid_travel_times)
+        # count_valid = jnp.sum(self.travel_times > 0.0, dtype=jnp.float32)
+        # avg_travel_time_per_hop = jnp.where(
+        #     count_valid > 0.0, sum_valid / count_valid, 0.0
+        # )
+        # Scale the hop-based shaping term by the average travel time per hop
+        # hop_shaping = (avg_travel_time_per_hop / 60.0) * hop_dist_diff
+        dist_curr = self.distances[curr, state.pickup_node]
+        dist_next = self.distances[nxt, state.pickup_node]
+        dist_diff = dist_curr - dist_next
+        dist_shaping = dist_diff / 60.0
+        
+        # Pickup bonus
         pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        # Scale down delay penalty and increase pickup bonus to ensure positive rewards for completion
-        # Using Euclidean distance penalty instead of travel time distance
-        reward = - total_delay / 60.0 - dist_n / 60.0 
+        reward = - total_delay/60.0 + pickup_bonus #dist_shaping + pickup_bonus
         
-        # Debug reward components to check if shaping is negligible
+        # Already done
+        reward = jnp.where(already_done, 0.0, reward)
+
+        # Debug
         # jax.debug.print("Reward: delay={delay:.2f}, shaping={shaping:.2f}, pickup_bonus={bonus:.2f}, reward={reward:.2f}, reach={reach}", 
         #                 delay=total_delay, shaping=shaping, bonus=pickup_bonus, reward=reward, reach=reach)
 
-        # New neighbor mask - direct access
+        # Neighbor mask
         nm = self.neighbor_mask_static[nxt]
-
-        # New state - optimized construction
-        new_state = TaxiState(
-            current_node=nxt,  # already int32 from adj_list
-            pickup_node=state.pickup_node,
-            done=done,
-            step_count=jnp.where(done, 0, step_n),  # simplified
-            neighbor_mask=nm,
-            time=norm_time  # already float32
+        
+        # Already done
+        at_pickup_before = (curr == state.pickup_node)
+        reached_pickup_this_step = reach & ~already_done
+        final_node = jnp.where(
+            already_done,
+            curr,
+            jnp.where(
+                reached_pickup_this_step,
+                jnp.where(at_pickup_before, curr, nxt),  # At pickup: stay at curr if already there, otherwise use nxt
+                nxt  # Not at pickup, move to next node
+            )
         )
-        return new_state, reward, done, {"wait": wait, "travel": travel}
+        final_neighbor_mask = jnp.where(already_done, state.neighbor_mask, nm)
+        final_time = jnp.where(already_done, state.time, norm_time)
+        final_step_count = jnp.where(already_done, state.step_count, jnp.where(done, 0, step_n))
+        final_done = jnp.where(already_done, True, done)
+        
+        # Already done
+        final_wait = jnp.where(already_done, 0.0, wait)
+        final_travel = jnp.where(already_done, 0.0, travel)
+
+        # State
+        new_state = TaxiState(
+            current_node=final_node,
+            pickup_node=state.pickup_node,
+            done=final_done,
+            step_count=final_step_count,
+            neighbor_mask=final_neighbor_mask,
+            time=final_time
+        )
+        return new_state, reward, final_done, {"wait": final_wait, "travel": final_travel}
