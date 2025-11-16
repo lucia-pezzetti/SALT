@@ -90,3 +90,17 @@ src/*.tmp
 src/*.sh
 plot_traveling_times.py
 *.png
+src/traveling_times_comparison_*.pdf
+src/setup_wandb_dashboard.py
+src/clear_cache.py
+
+src/ablation_studies/
+src/todelete/
+src/params/
+src/training/policy_improvement_sp.py
+src/traffic_experiments/
+src/paths/
+src/create_boxplots.py
+src/training/mcts_sp.py
+src/training/gnn_networks.py
+plot_evaluation_results.py

@@ -58,7 +58,7 @@ parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zone
 parser.add_argument("--num_agents", type=int, default=1, help="Number of agents in the environment")
 parser.add_argument("--base_time", type=float, default=1.0, help="Base travel time for grid environment")
 parser.add_argument("--max_steps", type=int, default=300, help="Maximum number of steps per episode")
-parser.add_argument("--pickup_bonus", type=float, default=500.0, help="Bonus for picking up a passenger")
+parser.add_argument("--pickup_bonus", type=float, default=5.0, help="Bonus for picking up a passenger")
 parser.add_argument("--timeout_penalty", type=float, default=-5.0, help="Penalty for timeout")
 parser.add_argument("--n_expert_samples", type=int, default=5000, help="Number of expert samples for pretraining")
 parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512], help="Hidden dimensions for the neural network")

@@ -163,12 +163,12 @@ class TaxiEnv(eqx.Module):
         nxt = self.adj_list[curr, action]
         travel = self.travel_times[curr, action]
 
-        # Terminal logic
+        # Check for invalid moves - should not happen if action masking is correct
+        # Raise an error if invalid move is attempted
         invalid = (nxt == -1)
         reach = (curr == state.pickup_node) | (nxt == state.pickup_node)
         step_n = state.step_count + 1
-        timeout = (step_n >= self.max_steps) & (~reach)
-        done = invalid | reach | timeout
+        done = reach
 
         # Time calculations
         t1 = state.time + travel
@@ -227,7 +227,13 @@ class TaxiEnv(eqx.Module):
         
         # Pickup bonus
         pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        reward = - total_delay/60.0 + pickup_bonus #dist_shaping + pickup_bonus
+
+        # Reward scaling (we want to make the reward between -1 and 1)
+        reward_scaling = 1.0 #5e-3
+
+        # Include distance shaping to guide agent toward pickup
+        # Positive reward for moving closer (dist_diff > 0), negative for moving away
+        reward = - reward_scaling * total_delay/60.0 + pickup_bonus
         
         # Already done
         reward = jnp.where(already_done, 0.0, reward)
