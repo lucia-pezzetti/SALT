@@ -1,6 +1,7 @@
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import jax.tree_util as tree_util
 from jax import random as jax_random
 from jax import jit, vmap, grad, profiler
 from functools import partial
@@ -13,6 +14,22 @@ from utils import offline_shortest_path_action, offline_shortest_path_action_bat
 
 # map activation names
 activation_dict = {"relu": jax.nn.relu, "silu": jax.nn.silu, "elu": jax.nn.elu}
+
+
+def tree_l2_norm(tree):
+    """Compute L2 norm of all leaves in a pytree."""
+    leaves = tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.array(0.0)
+    return jnp.sqrt(
+        sum(jnp.sum(jnp.square(leaf)) for leaf in leaves)
+    )
+
+
+def tree_l2_distance(tree_a, tree_b):
+    """Compute L2 distance between two pytrees."""
+    diff = tree_util.tree_map(lambda a, b: a - b, tree_a, tree_b)
+    return tree_l2_norm(diff)
 
 # Import GNN networks (optional)
 try:
@@ -145,15 +162,16 @@ class PPOValueNetwork(hk.Module):
         return hk.Linear(
             1,
             w_init=hk.initializers.VarianceScaling(0.1, "fan_in", "truncated_normal"),
-            b_init=hk.initializers.Constant(0.0)
+            b_init=hk.initializers.Constant(self.init_bias)
         )(x).squeeze(-1)
 
 # PPO Experience Buffer
 class PPOExperienceBuffer:
-    def __init__(self, buffer_size, obs_dim, max_deg):
+    def __init__(self, buffer_size, obs_dim, max_deg, use_full_buffer=False):
         self.buffer_size = buffer_size
         self.obs_dim = obs_dim
         self.max_deg = max_deg
+        self.use_full_buffer = use_full_buffer
         self.reset()
     
     def reset(self):
@@ -202,6 +220,31 @@ class PPOExperienceBuffer:
             replace=False
         )
         
+        return {
+            'observations': self.observations[indices],
+            'actions': self.actions[indices],
+            'rewards': self.rewards[indices],
+            'values': self.values[indices],
+            'log_probs': self.log_probs[indices],
+            'advantages': self.advantages[indices],
+            'returns': self.returns[indices],
+            'masks': self.masks[indices],
+            'dones': self.dones[indices],
+            'weights': self.weights[indices]
+        }
+
+    def get_full_batch(self):
+        """Return all experiences with non-zero weights (fallback to all if none)"""
+        effective_size = int(self.size)
+        if effective_size == 0:
+            return None
+
+        weights_np = onp.array(self.weights[:effective_size])
+        valid_indices = onp.nonzero(weights_np > 0.0)[0]
+        if valid_indices.size == 0:
+            valid_indices = onp.arange(effective_size)
+        indices = jnp.array(valid_indices, dtype=jnp.int32)
+
         return {
             'observations': self.observations[indices],
             'actions': self.actions[indices],
@@ -282,14 +325,23 @@ def policy_loss_fn(policy_apply, policy_params, batch, old_log_probs, clip_ratio
     }
 
 def value_loss_fn(value_apply, value_params, batch, value_coef=0.5, value_clip_ratio=0.2):
-    """Compute value loss (critic loss) with clipping for stability"""
+    """Compute value loss (critic loss) with optional clipping"""
     values = value_apply(value_params, batch['observations'])
     returns = batch['returns']
     weights = batch.get('weights', jnp.ones_like(returns))
     weight_sum = jnp.sum(weights) + 1e-8
-    
-    value_loss = jnp.sum(((values - returns) ** 2) * weights) / weight_sum
-    
+
+    if value_clip_ratio is not None and value_clip_ratio > 0.0 and 'values' in batch:
+        old_values = batch['values']
+        value_clipped = old_values + jnp.clip(values - old_values, -value_clip_ratio, value_clip_ratio)
+        loss_unclipped = (values - returns) ** 2
+        loss_clipped = (value_clipped - returns) ** 2
+        value_loss = jnp.maximum(loss_unclipped, loss_clipped)
+    else:
+        value_loss = (values - returns) ** 2
+
+    value_loss = jnp.sum(value_loss * weights) / weight_sum
+
     return value_coef * value_loss, {
         'value_loss': value_loss
     }
@@ -816,20 +868,11 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         def kl_penalty_schedule(step):
             return 0.0
     
-    # Entropy coefficient schedule
-    entropy_decay_enabled = config.get('entropy_decay_enabled', True)
-    if entropy_decay_enabled:
-        entropy_coef_initial = config.get('entropy_coef_initial', config.get('entropy_coef', 0.01))
-        entropy_coef_final = config.get('entropy_coef_final', 0.001)
-        entropy_decay_steps = config.get('entropy_decay_steps', config.get('num_steps', 50000))
-        
-        def entropy_coef_schedule(step):
-            progress = jnp.clip(step / entropy_decay_steps, 0.0, 1.0)
-            return entropy_coef_initial * (1.0 - progress) + entropy_coef_final * progress
-    else:
-        fixed_entropy_coef = config.get('ppo_entropy_coef', config.get('entropy_coef', 0.01))
-        def entropy_coef_schedule(step):
-            return fixed_entropy_coef
+    # Entropy coefficient (fixed, no decay)
+    entropy_coef_value = config.get('ppo_entropy_coef', config.get('entropy_coef', 0.01))
+
+    def entropy_coef_schedule(_):
+        return entropy_coef_value
     
     # Evaluation set
     if eval_starts is None or eval_pickups is None:
@@ -857,12 +900,29 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 neighbor_masks = eval_states.neighbor_mask
                 masked_logits = jnp.where(neighbor_masks, logits, -1e8)
                 
+                # Debug: Print masked logits summary for first agent in evaluation
+                # first_agent_logits = logits[0]
+                # first_agent_mask = neighbor_masks[0]
+                # first_agent_masked = masked_logits[0]
+                # max_raw_idx = jnp.argmax(first_agent_logits)
+                # max_masked_idx = jnp.argmax(first_agent_masked)
+                # num_valid = jnp.sum(first_agent_mask)
+                # jax.debug.print(
+                #     "[eval] step={step} node={node} pickup={pickup} max_raw_idx={mri} max_masked_idx={mmi} num_valid={nv} max_raw={mr:.3f} max_masked={mm:.3f} action={act}",
+                #     step=step,
+                #     node=eval_states.current_node[0],
+                #     pickup=eval_states.pickup_node[0],
+                #     mri=max_raw_idx,
+                #     mmi=max_masked_idx,
+                #     nv=num_valid,
+                #     mr=first_agent_logits[max_raw_idx],
+                #     mm=first_agent_masked[max_masked_idx],
+                #     act=max_masked_idx
+                # )
+                
                 actions = jnp.argmax(masked_logits, axis=-1)
                 
                 next_states, rewards, terminals, info = batch_step(eval_states, actions)
-                
-                # Note: terminals (done) is True only when reaching pickup (invalid moves error)
-                # So completed == reached_pickup
                 
                 # Only update metrics for active episodes
                 total_rewards = jnp.where(active_mask, total_rewards + rewards, total_rewards)
@@ -897,8 +957,10 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
     buffer = PPOExperienceBuffer(
         buffer_size=config.get('buffer_size', 10000),
         obs_dim=5,
-        max_deg=env.max_deg
+        max_deg=env.max_deg,
+        use_full_buffer=config.get('use_full_buffer', False)
     )
+    value_clip_ratio = float(config.get('value_clip_ratio', 0.0) or 0.0)
     
     # GAE
     @jax.jit
@@ -919,16 +981,16 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         
         # Debug: Check GAE inputs
         # Note: This will print for every trajectory, but JAX will optimize it
-        num_done = jnp.sum(dones.astype(jnp.int32))
-        traj_length = rewards.shape[0]
-        jax.debug.print(
-            "[GAE_fn] T={T} last_value={lv:.4f} num_done={nd} mean_reward={mr:.4f} mean_value={mv:.4f}",
-            T=traj_length,
-            lv=last_value,
-            nd=num_done,
-            mr=jnp.mean(rewards),
-            mv=jnp.mean(values)
-        )
+        # num_done = jnp.sum(dones.astype(jnp.int32))
+        # traj_length = rewards.shape[0]
+        # jax.debug.print(
+        #     "[GAE_fn] T={T} last_value={lv:.4f} num_done={nd} mean_reward={mr:.4f} mean_value={mv:.4f}",
+        #     T=traj_length,
+        #     lv=last_value,
+        #     nd=num_done,
+        #     mr=jnp.mean(rewards),
+        #     mv=jnp.mean(values)
+        # )
         
         # TD errors
         deltas = rewards + gamma * next_values * (1 - dones) - values
@@ -992,7 +1054,7 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
     
     # Value loss
     @jax.jit
-    def value_loss_jit(value_params, batch, value_coef=0.5, value_clip_ratio=0.2):
+    def value_loss_jit(value_params, batch, value_coef=0.5):
         """Value loss"""
         return value_loss_fn(value_apply, value_params, batch, value_coef, value_clip_ratio)
     
@@ -1019,6 +1081,25 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             -1e8
         )
         
+        # Debug: Print masked logits summary for first agent in rollout
+        # first_agent_logits = policy_logits[0]
+        # first_agent_mask = neighbor_mask[0]
+        # first_agent_masked = masked_logits[0]
+        # max_raw_idx = jnp.argmax(first_agent_logits)
+        # max_masked_idx = jnp.argmax(first_agent_masked)
+        # num_valid = jnp.sum(first_agent_mask)
+        # jax.debug.print(
+        #     "[rollout] step={step} node={node} pickup={pickup} max_raw_idx={mri} max_masked_idx={mmi} num_valid={nv} max_raw={mr:.3f} max_masked={mm:.3f}",
+        #     step=state_dict['opt_t'],
+        #     node=state_dict['env_states'].current_node[0],
+        #     pickup=state_dict['env_states'].pickup_node[0],
+        #     mri=max_raw_idx,
+        #     mmi=max_masked_idx,
+        #     nv=num_valid,
+        #     mr=first_agent_logits[max_raw_idx],
+        #     mm=first_agent_masked[max_masked_idx]
+        # )
+        
         state_dict['key'], sample_key = jax.random.split(state_dict['key'], 2)
         sample_keys = jax.random.split(sample_key, config['batch_size'])
         actions = jax.vmap(jax.random.categorical)(sample_keys, masked_logits)
@@ -1032,16 +1113,20 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         
         # Environment step
         next_states, rewards, terminals, info = batch_step(state_dict['env_states'], actions)
+
+        # Debug: Check environment step
+        # jax.debug.print(
+        #     "[step] current_node={curr} pickup_node={pickup} reward={rew} done={done} wait={wait} travel={travel}",
+        #     curr=state_dict['env_states'].current_node,
+        #     pickup=state_dict['env_states'].pickup_node,
+        #     rew=rewards,
+        #     done=terminals,
+        #     wait=info['wait'],
+        #     travel=info['travel']
+        # )
         
         # Debug: Check episode termination behavior
-        num_terminated = jnp.sum(terminals.astype(jnp.int32))
-        jax.debug.print(
-            "[step] step={step} terminated={term} mean_reward={r:.4f} mean_value={v:.4f}",
-            step=state_dict['opt_t'],
-            term=num_terminated,
-            r=jnp.mean(rewards),
-            v=jnp.mean(values)
-        )
+        # num_terminated = jnp.sum(terminals.astype(jnp.int32))
         
         # Experiences
         # Note: terminals (done) is True only when reaching pickup (invalid moves error)
@@ -1052,7 +1137,9 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             'values': values,
             'log_probs': selected_log_probs,
             'masks': neighbor_mask,
-            'dones': terminals
+            'dones': terminals,
+            'current_nodes': state_dict['env_states'].current_node,
+            'already_done': state_dict['env_states'].done
         }
         # No reset logic - agents stay at pickup when done (invalid moves will error)
         updated_env_states = next_states
@@ -1061,13 +1148,13 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         episode_return = state_dict['episode_return'] + rewards
         
         # Calculate mean return only for terminated episodes (when they reach pickup)
-        terminated_returns = jnp.where(terminals, episode_return, 0.0)
-        num_terminations = jnp.sum(terminals.astype(jnp.int32))
-        mean_terminated_return = jnp.where(
-            num_terminations > 0,
-            jnp.sum(terminated_returns) / num_terminations,
-            0.0
-        )
+        # terminated_returns = jnp.where(terminals, episode_return, 0.0)
+        # num_terminations = jnp.sum(terminals.astype(jnp.int32))
+        # mean_terminated_return = jnp.where(
+        #     num_terminations > 0,
+        #     jnp.sum(terminated_returns) / num_terminations,
+        #     0.0
+        # )
         avg_return = state_dict['avg_return']
         num_episodes = jnp.where(jnp.any(terminals), state_dict['num_episodes'] + jnp.sum(terminals.astype(jnp.int32)), state_dict['num_episodes'])
         
@@ -1094,6 +1181,25 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         
         # Environment steps
         state_dict, metrics = jax.lax.scan(loop_fn, state_dict, None, length=config.get('eval_frequency', 100))
+        value_params_before = state_dict['value_params']
+
+        unfinished_mask = ~state_dict['env_states'].done
+
+        def _print_unfinished(_):
+            jax.debug.print(
+                "[rollout] epoch={ep} unfinished_agents={mask} nodes={nodes}",
+                ep=state_dict['opt_t'],
+                mask=unfinished_mask,
+                nodes=state_dict['env_states'].current_node
+            )
+            return None
+
+        jax.lax.cond(
+            jnp.any(unfinished_mask),
+            _print_unfinished,
+            lambda _: None,
+            operand=None
+        )
         
         # Experiences
         all_experiences = {
@@ -1103,7 +1209,9 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             'values': metrics['experiences']['values'],
             'log_probs': metrics['experiences']['log_probs'],
             'masks': metrics['experiences']['masks'],
-            'dones': metrics['experiences']['dones']
+            'dones': metrics['experiences']['dones'],
+            'current_nodes': metrics['experiences']['current_nodes'],
+            'already_done': metrics['experiences']['already_done']
         }
         
         # Flatten experiences
@@ -1117,8 +1225,21 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         log_probs_flat = all_experiences['log_probs'].reshape(-1)
         masks_flat = all_experiences['masks'].reshape(-1, all_experiences['masks'].shape[-1])
         dones_flat = all_experiences['dones'].reshape(-1)
+        already_done_flat = all_experiences['already_done'].reshape(-1)
         # Weight experiences: exclude done experiences (no learning signal after reaching pickup)
-        weights_flat = jnp.ones_like(dones_flat, dtype=jnp.float32)
+        weights_flat = jnp.where(already_done_flat, 0.0, 1.0).astype(jnp.float32)
+        current_nodes_flat = all_experiences['current_nodes'].reshape(-1)
+
+        # Node visitation statistics
+        visit_counts = jnp.bincount(current_nodes_flat, length=env.num_nodes)
+        total_visits = jnp.sum(visit_counts)
+        visit_freq = jnp.where(
+            total_visits > 0,
+            visit_counts / total_visits,
+            jnp.zeros_like(visit_counts, dtype=jnp.float32)
+        )
+        visit_entropy = -jnp.sum(jnp.where(visit_freq > 0, visit_freq * jnp.log(visit_freq + 1e-8), 0.0))
+        visit_coverage = jnp.sum(visit_counts > 0) / env.num_nodes
 
         # Compute last values for GAE computation
         # Get final states after the rollout
@@ -1135,15 +1256,15 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         last_values = jnp.where(last_done, 0.0, final_values)  # [batch_size]
         
         # Debug: Check GAE last value computation
-        num_done_at_end = jnp.sum(last_done.astype(jnp.int32))
-        mean_final_value = jnp.mean(final_values)
-        mean_last_value = jnp.mean(last_values)
-        jax.debug.print(
-            "[GAE] num_done_at_end={nd} mean_final_value={fv:.4f} mean_last_value={lv:.4f}",
-            nd=num_done_at_end,
-            fv=mean_final_value,
-            lv=mean_last_value
-        )
+        # num_done_at_end = jnp.sum(last_done.astype(jnp.int32))
+        # mean_final_value = jnp.mean(final_values)
+        # mean_last_value = jnp.mean(last_values)
+        # jax.debug.print(
+        #     "[GAE] num_done_at_end={nd} mean_final_value={fv:.4f} mean_last_value={lv:.4f}",
+        #     nd=num_done_at_end,
+        #     fv=mean_final_value,
+        #     lv=mean_last_value
+        # )
 
         # GAE
         def compute_gae_single_trajectory(rewards, values, dones, last_value):
@@ -1168,32 +1289,32 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         returns_flat = advantages_flat + all_experiences['values'].reshape(-1)
         
         # Debug: Check advantages and returns
-        mean_advantage = jnp.mean(advantages_flat)
-        std_advantage = jnp.std(advantages_flat)
-        mean_return = jnp.mean(returns_flat)
-        std_return = jnp.std(returns_flat)
-        min_adv = jnp.min(advantages_flat)
-        max_adv = jnp.max(advantages_flat)
-        jax.debug.print(
-            "[advantages] mean={ma:.4f} std={sa:.4f} min={min:.4f} max={max:.4f} mean_return={mr:.4f} std_return={sr:.4f}",
-            ma=mean_advantage,
-            sa=std_advantage,
-            min=min_adv,
-            max=max_adv,
-            mr=mean_return,
-            sr=std_return
-        )
+        # mean_advantage = jnp.mean(advantages_flat)
+        # std_advantage = jnp.std(advantages_flat)
+        # mean_return = jnp.mean(returns_flat)
+        # std_return = jnp.std(returns_flat)
+        # min_adv = jnp.min(advantages_flat)
+        # max_adv = jnp.max(advantages_flat)
+        # jax.debug.print(
+        #     "[advantages] mean={ma:.4f} std={sa:.4f} min={min:.4f} max={max:.4f} mean_return={mr:.4f} std_return={sr:.4f}",
+        #     ma=mean_advantage,
+        #     sa=std_advantage,
+        #     min=min_adv,
+        #     max=max_adv,
+        #     mr=mean_return,
+        #     sr=std_return
+        # )
 
         total_entries = obs_flat.shape[0]
         
         # Debug: Check experience statistics before adding to buffer
-        num_done_in_buffer = jnp.sum(dones_flat.astype(jnp.int32))
-        jax.debug.print(
-            "[buffer] total_entries={te} num_done={nd} buffer_size={bs}",
-            te=total_entries,
-            nd=num_done_in_buffer,
-            bs=buffer.buffer_size
-        )
+        # num_done_in_buffer = jnp.sum(dones_flat.astype(jnp.int32))
+        # jax.debug.print(
+        #     "[buffer] total_entries={te} num_done={nd} buffer_size={bs}",
+        #     te=total_entries,
+        #     nd=num_done_in_buffer,
+        #     bs=buffer.buffer_size
+        # )
         
         buffer.observations = buffer.observations.at[:total_entries].set(obs_flat)
         buffer.actions = buffer.actions.at[:total_entries].set(actions_flat)
@@ -1223,14 +1344,19 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         
         if buffer.size >= min_buffer_size:
             # Debug: Training started
-            jax.debug.print("[training] buffer_size={bs} min_buffer_size={mbs} training_active", 
-                          bs=buffer.size, mbs=min_buffer_size)
+            # jax.debug.print("[training] buffer_size={bs} min_buffer_size={mbs} training_active", 
+            #               bs=buffer.size, mbs=min_buffer_size)
             
             # PPO
             for epoch in range(config.get('ppo_epochs', 4)):
                 # Get batch for PPO update with proper random key
-                state_dict['key'], batch_key = jax.random.split(state_dict['key'])
-                ppo_batch = buffer.get_batch(config.get('ppo_batch_size', 64), batch_key)
+                if buffer.use_full_buffer:
+                    ppo_batch = buffer.get_full_batch()
+                    if ppo_batch is None:
+                        continue
+                else:
+                    state_dict['key'], batch_key = jax.random.split(state_dict['key'])
+                    ppo_batch = buffer.get_batch(config.get('ppo_batch_size', 64), batch_key)
                 
                 # Normalize
                 batch_advantages = ppo_batch['advantages']
@@ -1274,7 +1400,7 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 # Value
                 (value_loss, value_info), value_grads = jax.value_and_grad(
                     lambda v: value_loss_jit(
-                        v, ppo_batch, value_coef=config.get('value_coef', 0.5), value_clip_ratio=config.get('value_clip_ratio', 0.2)
+                        v, ppo_batch, value_coef=config.get('value_coef', 0.5)
                     ), has_aux=True
                 )(state_dict['value_params'])
                 
@@ -1286,13 +1412,13 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 total_value_loss += value_loss
                 
                 # Debug: Check losses per epoch
-                jax.debug.print(
-                    "[losses] epoch={ep} policy_loss={pl:.6f} value_loss={vl:.6f} entropy={ent:.6f}",
-                    ep=epoch,
-                    pl=policy_loss,
-                    vl=value_loss,
-                    ent=policy_info.get('entropy', 0.0)
-                )
+                # jax.debug.print(
+                #     "[losses] epoch={ep} policy_loss={pl:.6f} value_loss={vl:.6f} entropy={ent:.6f}",
+                #     ep=epoch,
+                #     pl=policy_loss,
+                #     vl=value_loss,
+                #     ent=policy_info.get('entropy', 0.0)
+                # )
                 
                 # KL metrics
                 if 'kl_div' in policy_info:
@@ -1301,6 +1427,10 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 
                 # Entropy
                 policy_entropy = float(policy_info.get('entropy', 0.0))
+        
+        value_params_after = state_dict['value_params']
+        value_param_update_norm = float(tree_l2_distance(value_params_after, value_params_before))
+        value_param_norm = float(tree_l2_norm(value_params_after))
                 
         # Reset
         state_dict["key"], subkey = jax.random.split(state_dict["key"])
@@ -1316,6 +1446,23 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
         # Evaluation
         eval_results = evaluate_policy_on_fixed_set(state_dict['policy_params'], eval_starts, eval_pickups)
 
+        not_reached_mask = ~jnp.array(eval_results['reached_pickup'], dtype=bool)
+
+        def _print_eval_unfinished(_):
+            jax.debug.print(
+                "[eval_set] epoch={ep} unfinished_eval_agents={mask}",
+                ep=state_dict['opt_t'],
+                mask=not_reached_mask
+            )
+            return None
+
+        jax.lax.cond(
+            jnp.any(not_reached_mask),
+            _print_eval_unfinished,
+            lambda _: None,
+            operand=None
+        )
+
         # Metrics
         aggregated_metrics = {
             'policy_loss': total_policy_loss,
@@ -1328,6 +1475,11 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             'learning_active': buffer.size >= min_buffer_size,
             'filtered_experiences': int(filtered_count),
             'filter_rate': filter_rate,
+            'node_visit_counts': visit_counts.tolist(),
+            'node_visit_freq': visit_freq.tolist(),
+            'node_visit_entropy': float(visit_entropy),
+            'node_visit_coverage': float(visit_coverage),
+            'node_total_visits': int(total_visits),
             
             # KL penalty metrics
             'kl/kl_div': kl_div if use_kl_penalty else 0.0,
@@ -1335,7 +1487,7 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             'kl/kl_weight': float(kl_penalty_schedule(state_dict['opt_t'])),
             
             # Entropy coefficient
-            'entropy/entropy_coef': float(entropy_coef_schedule(state_dict['opt_t'])),
+            'entropy/entropy_coef': float(entropy_coef_value),
             'entropy/policy_entropy': policy_entropy,
             
             # Evaluation
@@ -1345,7 +1497,11 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
             'eval/reached_pickup_rate': float(eval_results['reached_pickup_rate']),
             'eval/total_rewards': eval_results['total_rewards'].tolist(),
             'eval/total_steps': eval_results['total_steps'].tolist(),
-            'eval/reached_pickup': eval_results['reached_pickup'].tolist()
+            'eval/reached_pickup': eval_results['reached_pickup'].tolist(),
+
+            # Value function diagnostics
+            'value/value_update_norm': value_param_update_norm,
+            'value/value_param_norm': value_param_norm
         }
         
         return state_dict, aggregated_metrics

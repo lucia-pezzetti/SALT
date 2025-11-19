@@ -329,7 +329,9 @@ def make_obs_fn(
         # obs = obs.at[4:6].set(relative_pos)   # [2] - direction vector
         # obs = obs.at[6].set(distance)         # [1] - distance
         # obs = obs.at[7].set(angle)            # [1] - angle
-        obs = obs.at[4].set(s.time)           # [1] - time
+        # DEBUG: Commented out time for time-invariant shortest path learning
+        # obs = obs.at[4].set(s.time)           # [1] - time
+        obs = obs.at[4].set(0.0)               # [1] - time (set to 0 for debugging)
         
         return obs
 

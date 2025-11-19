@@ -35,11 +35,37 @@ def optimize_jax_config():
     jax.config.update('jax_enable_x64', False)
     jax.config.update('jax_enable_compilation_cache', True)
     
+    # Reduce compilation memory usage
+    # This helps prevent LLVM from trying to allocate large contiguous memory blocks
+    try:
+        jax.config.update('jax_platform_name', 'cpu')  # Ensure we're using CPU backend
+    except:
+        pass  # Ignore if already set
+    
     # Set memory preallocation (respect environment variables if set)
     if 'XLA_PYTHON_CLIENT_PREALLOCATE' not in os.environ:
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     if 'XLA_PYTHON_CLIENT_MEM_FRACTION' not in os.environ:
-        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'  # Reduced to prevent OOM
+    if 'XLA_PYTHON_CLIENT_ALLOCATOR' not in os.environ:
+        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # Use platform allocator
+    
+    # Configure XLA flags to avoid contiguous memory allocation issues
+    # This prevents LLVM from trying to allocate large contiguous memory sections
+    xla_flags = os.environ.get('XLA_FLAGS', '')
+    xla_flags_parts = xla_flags.split() if xla_flags else []
+    
+    # Add flags to reduce memory pressure during compilation
+    # Only use valid XLA flags to avoid crashes
+    flags_to_add = [
+        '--xla_cpu_enable_fast_math=false',  # Disable fast math to reduce memory usage
+    ]
+    
+    for flag in flags_to_add:
+        if flag not in xla_flags_parts:
+            xla_flags_parts.append(flag)
+    
+    os.environ['XLA_FLAGS'] = ' '.join(xla_flags_parts)
     
     # Get platform info
     platforms = os.environ.get('JAX_PLATFORMS', 'auto')

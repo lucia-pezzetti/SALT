@@ -263,10 +263,6 @@ def run_ppo(args, ctx: RunContext) -> None:
             "ppo/buffer_utilization": float(metrics.get('buffer_utilization', 0.0)),
             "ppo/learning_active": bool(metrics.get('learning_active', False)),
 
-            # Curriculum (only if provided)
-            "curriculum/alpha": float(metrics.get('curriculum/alpha', 0.0)),
-            "curriculum/sp_action_fraction": float(metrics.get('curriculum/sp_action_fraction', 0.0)),
-
             # Evaluation on fixed set
             "evaluation/avg_reward": float(metrics.get('eval/avg_reward', 0.0)),
             "evaluation/avg_steps": float(metrics.get('eval/avg_steps', 0.0)),
@@ -274,7 +270,19 @@ def run_ppo(args, ctx: RunContext) -> None:
             "evaluation/reached_pickup_rate": float(metrics.get('eval/reached_pickup_rate', 0.0)),  # Success rate (reached pickup / total)
             "evaluation/performance_ratio": performance_ratio,
             "evaluation/improvement_over_sp": float(1.0 - performance_ratio),
+            "value/value_update_norm": float(metrics.get('value/value_update_norm', 0.0)),
+            "value/value_param_norm": float(metrics.get('value/value_param_norm', 0.0)),
         }
+
+        node_visit_counts = metrics.get('node_visit_counts')
+        if node_visit_counts:
+            node_visit_counts_array = np.array(node_visit_counts)
+            log_metrics["exploration/node_total_visits"] = int(metrics.get('node_total_visits', 0))
+            log_metrics["exploration/node_visit_entropy"] = float(metrics.get('node_visit_entropy', 0.0))
+            log_metrics["exploration/node_visit_coverage"] = float(metrics.get('node_visit_coverage', 0.0))
+            log_metrics["exploration/node_visit_histogram"] = wandb.Histogram(node_visit_counts_array)
+            log_metrics["exploration/most_visited_node"] = int(np.argmax(node_visit_counts_array))
+
         wandb.log(log_metrics)
 
     final_metrics = {
@@ -313,12 +321,12 @@ def run_ppo(args, ctx: RunContext) -> None:
     wandb.log({"training_summary": summary_table})
 
     # Greedy PPO policy
-    def ppo_policy(state: TaxiState) -> int:
+    def ppo_policy(policy_params, state: TaxiState) -> int:
         obs = obs_fn_single(state)
-        logits = policy_apply(state_dict['policy_params'], obs)
+        logits = policy_apply(policy_params, obs)
         neighbor_mask = state.neighbor_mask
-        masked_logits = jnp.where(neighbor_mask, logits, -jnp.inf)
-        action = jnp.argmax(masked_logits)
+        masked_logits = jnp.where(neighbor_mask, logits, -1e8)
+        action = jnp.argmax(masked_logits, axis=-1)
         return int(action)
 
     # Offline shortest path policy
@@ -367,6 +375,13 @@ def run_ppo(args, ctx: RunContext) -> None:
                 while (not bool(state.done)) and step_count < 3*ctx.max_length:
                     action = policy_fn(state)
                     state, reward, _, info = ctx.env.step(state, action)
+                    jax.debug.print("Step {step} Node {node} Action {action} Travel {travel} Wait {wait}", 
+                        step=step_count,
+                        node=int(state.current_node),
+                        action=action,
+                        travel=info['travel'],
+                        wait=info['wait']
+                    )
                     total_time += float(info['travel'] + info['wait'])
                     total_reward += float(reward)
                     traj.append(state.current_node)
@@ -377,7 +392,12 @@ def run_ppo(args, ctx: RunContext) -> None:
             return np.array(times), paths, np.array(rewards)
 
         print(f"Evaluating PPO policy for starts: {eval_starts} and pickups: {ppo_pickups}")
-        ppo_times, ppo_paths, ppo_rewards = evaluate_policy_single(ppo_policy, eval_starts, ppo_pickups)
+        current_policy_params = state_dict['policy_params']
+        ppo_times, ppo_paths, ppo_rewards = evaluate_policy_single(
+            lambda state: ppo_policy(current_policy_params, state),
+            eval_starts,
+            ppo_pickups
+        )
         
         print(f"Evaluating SP policy for starts: {eval_starts} and pickups: {sp_pickups}")
         sp_times, sp_paths, sp_rewards = evaluate_policy_single(sp_policy, eval_starts, sp_pickups)
