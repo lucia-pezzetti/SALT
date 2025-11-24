@@ -99,6 +99,12 @@ parser.add_argument("--epsilon_end", type=float, default=0.01, help="Final epsil
 parser.add_argument("--epsilon_decay_fraction", type=float, default=0.5, help="Fraction of total training steps over which epsilon decays (Q-learning, default: 0.5 = 50%%)")
 parser.add_argument("--sp_bias_beta", type=float, default=2.0, help="Shortest-path bias strength for exploration (higher = more SP bias)")
 parser.add_argument("--params_dir", type=str, default=None, help="Output file for pretrained parameters")
+parser.add_argument(
+    "--q_table_path",
+    type=str,
+    default=None,
+    help="Path to save/load tabular Q-learning state when --discrete is set",
+)
 parser.add_argument("--pretrain_ckpt", type=str, default="pretrained_params.pkl", help="Checkpoint file for pretrained parameters")
 parser.add_argument("--model", type=str, default="ppo", choices=["dqn", "mcts", "ppo"])
 parser.add_argument("--config", "-c", type=str, default="config.json", help="Path to configuration file")
@@ -222,8 +228,10 @@ all_keys = jax_random.split(key2, 2 * num_envs)
 start_keys, pickup_keys = all_keys[:num_envs], all_keys[num_envs:]
 key3, eval_key = jax_random.split(key1)
 
-start_idxs = jax.device_put(jnp.stack([jax_random.choice(k, fixed_starts_idx) for k in start_keys]))
-pickup_idxs = jax.device_put(jnp.stack([jax_random.choice(k, fixed_pickups_idx) for k in pickup_keys]))
+sample_start = vmap(lambda k: jax_random.choice(k, fixed_starts_idx))(start_keys)
+sample_pickup = vmap(lambda k: jax_random.choice(k, fixed_pickups_idx))(pickup_keys)
+start_idxs = jax.device_put(sample_start)
+pickup_idxs = jax.device_put(sample_pickup)
 
 @jax.jit
 def init_env_batch(keys, starts, pickups, neighbor_mask_static):

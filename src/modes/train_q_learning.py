@@ -1,6 +1,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
+import optax
 import wandb
 
 from datetime import datetime
@@ -115,6 +116,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
         pretrain_enabled=pretrain_enabled,
         num_pretrain_episodes=num_pretrain_episodes,
         pretrain_log_fn=pretrain_log_fn if pretrain_enabled else None,
+        save_path=args.q_table_path,
+        load_path=args.q_table_path,
     )
     
     # Final evaluation
@@ -249,6 +252,57 @@ def run_q_learning(args, ctx: RunContext) -> None:
             ctx.env.neighbor_mask_static[state.current_node]
         )
     
+    def simulate_policy_time(policy_fn, start, pickup, base_seed, use_discrete):
+        """Simulate a single start/pickup pair and return total travel time (seconds)."""
+        key = jax.random.PRNGKey(base_seed)
+        state = init_env(key, int(start), int(pickup), ctx.env.neighbor_mask_static)[0]
+        total_time = 0.0
+        steps = 0
+        
+        while (not bool(state.done)) and steps < ctx.max_length:
+            action = policy_fn(state)
+            if use_discrete:
+                key, step_key = jax.random.split(key)
+                next_state, reward, done, info = q_agent.step_with_discretization(
+                    state, action, step_key
+                )
+            else:
+                next_state, reward, done, info = ctx.env.step(state, action)
+            
+            total_time += float(info['travel'] + info['wait'])
+            state = next_state
+            steps += 1
+            
+            if done:
+                break
+        
+        return total_time
+    
+    def build_cost_matrix(starts, pickups, policy_fn, base_seed, use_discrete):
+        """Return a [len(starts), len(pickups)] matrix of total travel times."""
+        starts_np = np.array(starts).astype(int)
+        pickups_np = np.array(pickups).astype(int)
+        cost = np.zeros((len(starts_np), len(pickups_np)), dtype=np.float32)
+        
+        for i, start in enumerate(starts_np):
+            for j, pickup in enumerate(pickups_np):
+                pair_seed = base_seed + i * 7919 + j * 104729
+                cost[i, j] = simulate_policy_time(
+                    policy_fn, start, pickup, pair_seed, use_discrete=use_discrete
+                )
+        
+        return jnp.array(cost, dtype=jnp.float32)
+    
+    def match_pickups(starts, pickups, policy_fn, base_seed, use_discrete):
+        """Assign pickups to starts using Hungarian matching on travel-time cost."""
+        if len(starts) == 0:
+            return pickups, jnp.zeros((0, 0), dtype=jnp.float32)
+        
+        cost_matrix = build_cost_matrix(starts, pickups, policy_fn, base_seed, use_discrete)
+        _, assignment = optax.assignment.hungarian_algorithm(cost_matrix)
+        matched_pickups = jnp.take(pickups, assignment, axis=0)
+        return matched_pickups, cost_matrix
+    
     # Evaluation loop with trajectory printing
     eval_iter = 20
     eval_loop_key = jax.random.PRNGKey(args.seed + 1000)
@@ -264,6 +318,17 @@ def run_q_learning(args, ctx: RunContext) -> None:
         start_keys, pickup_keys, base_key = eval_keys[:B], eval_keys[B:2*B], eval_keys[-1]
         eval_starts = jnp.array([jax.random.choice(k, ctx.env.fixed_starts) for k in start_keys])
         eval_pickups = jnp.array([jax.random.choice(k, ctx.env.fixed_pickups) for k in pickup_keys])
+        base_seed = int(args.seed + i * 1000)
+        
+        matched_q_pickups, _ = match_pickups(
+            eval_starts, eval_pickups, q_learning_policy, base_seed, use_discrete=True
+        )
+        matched_sp_pickups_cont, _ = match_pickups(
+            eval_starts, eval_pickups, sp_policy, base_seed + 1, use_discrete=False
+        )
+        matched_sp_pickups_disc, _ = match_pickups(
+            eval_starts, eval_pickups, sp_policy, base_seed + 2, use_discrete=True
+        )
         
         def evaluate_policy_single(policy_fn, starts, pickups, use_discrete=False):
             """Evaluate policy and return times, paths, and rewards."""
@@ -302,14 +367,20 @@ def run_q_learning(args, ctx: RunContext) -> None:
             return np.array(times), paths, np.array(rewards)
         
         print(f"\nEvaluation iteration {i+1}/{eval_iter}")
-        print(f"Evaluating Q-learning policy for starts: {eval_starts} and pickups: {eval_pickups}")
-        q_times, q_paths, q_rewards = evaluate_policy_single(q_learning_policy, eval_starts, eval_pickups, use_discrete=True)
+        print(f"Evaluating Q-learning policy for starts: {eval_starts} and pickups: {matched_q_pickups}")
+        q_times, q_paths, q_rewards = evaluate_policy_single(
+            q_learning_policy, eval_starts, matched_q_pickups, use_discrete=True
+        )
         
-        print(f"Evaluating SP policy (continuous) for starts: {eval_starts} and pickups: {eval_pickups}")
-        sp_times_continuous, sp_paths_continuous, sp_rewards_continuous = evaluate_policy_single(sp_policy, eval_starts, eval_pickups, use_discrete=False)
+        print(f"Evaluating SP policy (continuous) for starts: {eval_starts} and pickups: {matched_sp_pickups_cont}")
+        sp_times_continuous, sp_paths_continuous, sp_rewards_continuous = evaluate_policy_single(
+            sp_policy, eval_starts, matched_sp_pickups_cont, use_discrete=False
+        )
         
-        print(f"Evaluating SP policy (discrete) for starts: {eval_starts} and pickups: {eval_pickups}")
-        sp_times_discrete, sp_paths_discrete, sp_rewards_discrete = evaluate_policy_single(sp_policy, eval_starts, eval_pickups, use_discrete=True)
+        print(f"Evaluating SP policy (discrete) for starts: {eval_starts} and pickups: {matched_sp_pickups_disc}")
+        sp_times_discrete, sp_paths_discrete, sp_rewards_discrete = evaluate_policy_single(
+            sp_policy, eval_starts, matched_sp_pickups_disc, use_discrete=True
+        )
         
         # Print trajectories
         print(f"\nQ-Learning Trajectories:")

@@ -8,6 +8,7 @@ from jax import vmap
 import numpy as np
 import wandb
 from typing import Tuple, Optional
+from pathlib import Path
 
 from taxi_env import TaxiState, init_env
 from training.q_learning import TabularQLearning
@@ -198,6 +199,8 @@ def train_q_learning(
     pretrain_enabled: bool = False,
     num_pretrain_episodes: int = 1000,
     pretrain_log_fn=None,
+    save_path: Optional[str] = None,
+    load_path: Optional[str] = None,
 ):
     """
     Train a tabular Q-learning agent.
@@ -226,15 +229,19 @@ def train_q_learning(
         Trained Q-learning agent
     """
     # Initialize Q-learning agent
-    q_agent = TabularQLearning(
-        env=env,
-        dt=dt,
-        learning_rate=learning_rate,
-        discount_factor=discount_factor,
-        epsilon_start=epsilon_start,
-        epsilon_end=epsilon_end,
-        epsilon_decay_steps=epsilon_decay_steps,
-    )
+    if load_path is not None and Path(load_path).exists():
+        print(f"Loading Q-table from {load_path}")
+        q_agent = TabularQLearning.load(env, load_path)
+    else:
+        q_agent = TabularQLearning(
+            env=env,
+            dt=dt,
+            learning_rate=learning_rate,
+            discount_factor=discount_factor,
+            epsilon_start=epsilon_start,
+            epsilon_end=epsilon_end,
+            epsilon_decay_steps=epsilon_decay_steps,
+        )
     
     # Initialize random key
     key = jax_random.PRNGKey(seed)
@@ -364,6 +371,9 @@ def train_q_learning(
                 })
     
     print("Q-learning training completed!")
+    if save_path is not None:
+        print(f"Saving Q-table to {save_path}")
+        q_agent.save(save_path)
     return q_agent
 
 

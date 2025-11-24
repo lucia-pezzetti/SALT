@@ -876,62 +876,71 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
     if eval_starts is None or eval_pickups is None:
         raise ValueError("Fixed evaluation set must be provided")
     
-    # Evaluation function
-    def evaluate_policy_on_fixed_set(policy_params, starts, pickups):
-        """Evaluate policy on fixed start-pickup pairs"""
-        eval_keys = jax.random.split(jax.random.PRNGKey(42), len(starts))
+    @jax.jit
+    def evaluate_policy_on_fixed_set(policy_params, starts, pickups, eval_key):
+        """Evaluate policy on fixed start-pickup pairs with a compiled rollout loop."""
+        num_eval = starts.shape[0]
+        eval_keys = jax.random.split(eval_key, num_eval)
         eval_states, _ = batch_reset(eval_keys, starts, pickups)
         
-        total_rewards = jnp.zeros(len(starts))
-        total_steps = jnp.zeros(len(starts))
-        completed = jnp.zeros(len(starts), dtype=bool)
+        total_rewards = jnp.zeros(num_eval, dtype=jnp.float32)
+        total_steps = jnp.zeros(num_eval, dtype=jnp.float32)
+        completed = jnp.zeros(num_eval, dtype=bool)
+        max_eval_steps = jnp.int32(env.max_steps)
         
-        for step in range(env.max_steps):
-            # Skip completed
-            active_mask = ~completed
+        def cond_fn(carry):
+            step, _, _, _, completed_mask = carry
+            all_done = jnp.logical_or(jnp.all(completed_mask), step >= max_eval_steps)
+            return jnp.logical_not(all_done)
+        
+        def body_fn(carry):
+            step, states, rewards_acc, steps_acc, completed_mask = carry
+            obs = obs_fn_batch(states)
+            logits = policy_apply(policy_params, obs)
+            neighbor_masks = states.neighbor_mask
+            masked_logits = jnp.where(neighbor_masks, logits, -1e8)
+            actions = jnp.argmax(masked_logits, axis=-1)
+            next_states, rewards, terminals, _ = batch_step(states, actions)
             
-            if bool(jnp.any(active_mask)):
-                # Get observations and policy logits only for active
-                obs = obs_fn_batch(eval_states)
-                logits = policy_apply(policy_params, obs)
-                
-                neighbor_masks = eval_states.neighbor_mask
-                masked_logits = jnp.where(neighbor_masks, logits, -1e8)
-                
-                actions = jnp.argmax(masked_logits, axis=-1)
-                
-                next_states, rewards, terminals, info = batch_step(eval_states, actions)
-                
-                # Note: terminals (done) is True only when reaching pickup (invalid moves error)
-                # So completed == reached_pickup
-                
-                # Only update metrics for active episodes
-                total_rewards = jnp.where(active_mask, total_rewards + rewards, total_rewards)
-                total_steps = jnp.where(active_mask, total_steps + 1, total_steps)
-                completed = completed | terminals
-                
-                # Update states
-                eval_states = next_states
-                
-                # Break if all episodes completed
-                if bool(jnp.all(completed)):
-                    break
-            else:
-                # All completed, break early
-                break
+            active = ~completed_mask
+            rewards_acc = rewards_acc + rewards * active
+            steps_acc = steps_acc + active.astype(jnp.float32)
+            completed_mask = completed_mask | terminals
+            
+            return (
+                step + jnp.int32(1),
+                next_states,
+                rewards_acc,
+                steps_acc,
+                completed_mask,
+            )
         
-        num_episodes = len(starts)
-        # completed is equivalent to reached_pickup since done only happens when reaching pickup
+        init_carry = (
+            jnp.int32(0),
+            eval_states,
+            total_rewards,
+            total_steps,
+            completed,
+        )
+        _, _, total_rewards, total_steps, completed = jax.lax.while_loop(
+            cond_fn, body_fn, init_carry
+        )
+        
         reached_pickup = completed
+        avg_reward = jnp.mean(total_rewards)
+        avg_steps = jnp.mean(total_steps)
+        completion_rate = jnp.mean(reached_pickup.astype(jnp.float32))
+        num_reached = jnp.sum(reached_pickup.astype(jnp.int32))
+        
         return {
             'total_rewards': total_rewards,
             'total_steps': total_steps,
             'reached_pickup': reached_pickup,
-            'avg_reward': jnp.mean(total_rewards),
-            'avg_steps': jnp.mean(total_steps),
-            'completion_rate': jnp.mean(completed.astype(float)),
-            'num_reached_pickup': jnp.sum(reached_pickup.astype(int)),
-            'reached_pickup_rate': float(jnp.sum(reached_pickup.astype(float)) / num_episodes) if num_episodes > 0 else 0.0
+            'avg_reward': avg_reward,
+            'avg_steps': avg_steps,
+            'completion_rate': completion_rate,
+            'num_reached_pickup': num_reached,
+            'reached_pickup_rate': completion_rate,
         }
     
     # Determine observation dimensionality for buffer allocation
@@ -1413,19 +1422,24 @@ def get_ppo_agent_loop(env, config, obs_fn_batch, obs_fn_single, policy_apply, v
                 # Entropy
                 policy_entropy = float(policy_info.get('entropy', 0.0))
                 
-        # Reset
-        state_dict["key"], subkey = jax.random.split(state_dict["key"])
-        subkeys = jax.random.split(subkey, config['batch_size'])
-        starts = jnp.stack([jax_random.choice(k, env.fixed_starts) for k in subkeys])
-        pickups = jnp.stack([jax_random.choice(k, env.fixed_pickups) for k in subkeys])
+        # Reset environment states with vectorized sampling
+        new_key, reset_key, eval_key = jax.random.split(state_dict["key"], 3)
+        num_agents = config['batch_size']
+        reset_splits = jax.random.split(reset_key, 3 * num_agents)
+        init_keys = reset_splits[:num_agents]
+        start_keys = reset_splits[num_agents:2 * num_agents]
+        pickup_keys = reset_splits[2 * num_agents:]
+        
+        starts = vmap(lambda k: jax_random.choice(k, env.fixed_starts))(start_keys)
+        pickups = vmap(lambda k: jax_random.choice(k, env.fixed_pickups))(pickup_keys)
         
         batch_init = vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
-        state_dict['env_states'], _ = batch_init(subkeys, starts, pickups)
+        state_dict['env_states'], _ = batch_init(init_keys, starts, pickups)
         state_dict['last_start'] = starts
-        state_dict['key'] = subkey
+        state_dict['key'] = new_key
         
         # Evaluation
-        eval_results = evaluate_policy_on_fixed_set(state_dict['policy_params'], eval_starts, eval_pickups)
+        eval_results = evaluate_policy_on_fixed_set(state_dict['policy_params'], eval_starts, eval_pickups, eval_key)
 
         # Metrics
         aggregated_metrics = {

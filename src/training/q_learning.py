@@ -8,6 +8,8 @@ from jax import random as jax_random
 from typing import Dict, Tuple, Optional
 import numpy as np
 from collections import defaultdict
+import pickle
+from pathlib import Path
 
 from taxi_env import TaxiState, TaxiEnv, init_env
 
@@ -261,4 +263,46 @@ class TabularQLearning:
             'avg_visits': np.mean(visit_counts) if visit_counts else 0.0,
             'max_visits': np.max(visit_counts) if visit_counts else 0.0,
         }
+
+    def state_dict(self) -> Dict:
+        """Return a serializable snapshot of the Q-table and metadata."""
+        return {
+            "dt": self.dt,
+            "learning_rate": self.learning_rate,
+            "discount_factor": self.gamma,
+            "epsilon_start": self.epsilon_start,
+            "epsilon_end": self.epsilon_end,
+            "epsilon_decay_steps": self.epsilon_decay_steps,
+            "initial_q_value": self.initial_q_value,
+            "q_table": dict(self.q_table),
+            "visit_counts": dict(self.visit_counts),
+        }
+
+    def save(self, path: str) -> None:
+        """Serialize the agent to disk."""
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        with path_obj.open("wb") as f:
+            pickle.dump(self.state_dict(), f)
+
+    @classmethod
+    def load(cls, env: TaxiEnv, path: str):
+        """Load agent state from disk."""
+        with Path(path).open("rb") as f:
+            state = pickle.load(f)
+
+        agent = cls(
+            env=env,
+            dt=state.get("dt", 5.0),
+            learning_rate=state.get("learning_rate", 0.1),
+            discount_factor=state.get("discount_factor", 0.99),
+            epsilon_start=state.get("epsilon_start", 1.0),
+            epsilon_end=state.get("epsilon_end", 0.01),
+            epsilon_decay_steps=state.get("epsilon_decay_steps", 10000),
+            initial_q_value=state.get("initial_q_value", 0.0),
+        )
+
+        agent.q_table.update(state.get("q_table", {}))
+        agent.visit_counts.update(state.get("visit_counts", {}))
+        return agent
 
