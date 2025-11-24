@@ -66,15 +66,12 @@ class GraphAwareVFunction(hk.Module):
 
         """
         Enhanced value function for lat/lon-based observations.
-        Input: obs [..., 9] = [current_pos(2), pickup_pos(2), relative_pos(2), distance(1), angle(1), time(1)]
+        Input: obs [..., 5] = [current_pos(2), pickup_pos(2), time(1)]
         """
-        # Extract features from the 9-dimensional observation
+        # Extract features from the 5-dimensional observation
         current_pos = obs[..., 0:2]      # [..., 2] - current position (lat/lon)
         pickup_pos = obs[..., 2:4]       # [..., 2] - pickup position (lat/lon)
-        # relative_pos = obs[..., 4:6]     # [..., 2] - direction vector
-        # distance = obs[..., 6:7]         # [..., 1] - distance to pickup
-        # angle = obs[..., 7:8]            # [..., 1] - direction angle
-        time = obs[..., 8:9]    
+        time = obs[..., 4:5]             # [..., 1] - time
         
         # Normalize time feature
         time = time / self.cycle_length  # Normalize by typical cycle length
@@ -87,15 +84,10 @@ class GraphAwareVFunction(hk.Module):
 
         # Combine all features
         features = jnp.concatenate([
-        #     current_emb, pickup_emb, time
-        # ], axis=-1)
             current_pos,    # [..., 2] - current position
             pickup_pos,     # [..., 2] - pickup position
-            # relative_pos,   # [..., 2] - direction vector
-            # distance,       # [..., 1] - distance
-            # angle,          # [..., 1] - angle
             time            # [..., 1] - time
-        ], axis=-1)  # Total: [..., 9]
+        ], axis=-1)  # Total: [..., 5]
         
         # Layer normalization for stability
         features = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(features)

@@ -55,8 +55,8 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
     # Map zones to nodes, then filter
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
     # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
-    zone_names = ["Upper East Side North"] #, "Yorkville West"] # , "Upper East Side South", "Lenox Hill West"] 
-    # zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"]  
+    # zone_names = ["Upper East Side North", "Yorkville West"] # , "Upper East Side South", "Lenox Hill West"] 
+    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"]  
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
     loc_ids = filtered_zones["LocationID"].tolist()
@@ -228,7 +228,7 @@ def fixed_starts_pickups(G: nx.DiGraph,
                          nodes_gdf: gpd.GeoDataFrame,
                          node_to_zone: dict,
                          zone_to_nodes: dict,
-                         all: bool = False,
+                         all: bool = True,
                          seed: int = None) -> tuple:
     """
     Choose fixed start & pickup nodes for the environment.
@@ -240,50 +240,57 @@ def fixed_starts_pickups(G: nx.DiGraph,
     """
 
     all_nodes = list(G.nodes())
-    # print(f"Number of nodes: {len(all_nodes)}")
+    print(f"Number of nodes: {len(all_nodes)}")
     node_to_idx = {n: i for i, n in enumerate(all_nodes)}
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
 
-    # Set seed if provided
-    if seed is not None:
-        random.seed(seed)
+    # # Set seed if provided
+    # if seed is not None:
+    #     random.seed(seed)
 
-    num_to_sample = 1
-    sampled_indices_starts = random.sample(range(len(all_nodes)), num_to_sample)
-    sampled_indices_pickups = random.sample(range(len(all_nodes)), num_to_sample)
-    fixed_starts = [all_nodes[idx] for idx in sampled_indices_starts]
-    fixed_pickups = [all_nodes[idx] for idx in sampled_indices_pickups]
+    # num_to_sample = 1
+    # sampled_indices_starts = random.sample(range(len(all_nodes)), num_to_sample)
+    # sampled_indices_pickups = random.sample(range(len(all_nodes)), num_to_sample)
+    # fixed_starts = [all_nodes[idx] for idx in sampled_indices_starts]
+    # fixed_pickups = [all_nodes[idx] for idx in sampled_indices_pickups]
+    # fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
+    # fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
 
-    # # Choose fixed start & pickup sets (here: all nodes)
-    # if all:
-    #     fixed_starts_idx = list(range(len(all_nodes)))
-    #     fixed_pickups_idx = list(range(len(all_nodes)))
-    # else:
-    #     # choose fixed start & pickup nodes
-    #     fixed_starts = []
-    #     fixed_pickups = []
+    # Choose fixed start & pickup sets (here: all nodes)
+    if all:
+        fixed_starts_idx = list(range(len(all_nodes)))
+        fixed_pickups_idx = list(range(len(all_nodes)))
+    else:
+        # choose exactly one representative start and pickup per zone, ensuring they differ
+        rng = random.Random(seed) if seed is not None else None
+        starts = []
+        pickups = []
 
-    #     nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
+        nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
 
-    #     # Select randomly up to 5 nodes for every zone
-    #     zone_list = list(zone_to_nodes.items())
-    #     for i, (loc_id, nodes) in enumerate(zone_list):
-    #         if nodes:
-    #             # jax.debug.print("loc_id: {loc_id}", loc_id=loc_id)
-    #             # Sample up to 5 nodes (or all nodes if fewer than 5)
-    #             num_to_sample = min(1, len(nodes))
-    #             sampled_indices_starts = random.sample(range(len(nodes)), num_to_sample)
-    #             sampled_indices_pickups = random.sample(range(len(nodes)), num_to_sample)
-    #             # jax.debug.print("sampled_indices: {sampled_indices}", sampled_indices=sampled_indices)
-    #             # Add individual nodes, not lists
-    #             for idx in sampled_indices_starts:
-    #                 fixed_starts.append(nodes[idx])
-                
-    #             for idx in sampled_indices_pickups:
-    #                 fixed_pickups.append(nodes[idx])
+        for loc_id, nodes in sorted(zone_to_nodes.items()):
+            if not nodes:
+                continue
+            if len(nodes) < 2:
+                raise ValueError(
+                    f"Zone {loc_id} has fewer than 2 nodes; cannot choose distinct start and pickup."
+                )
 
-    fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
-    fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
+            nodes_sorted = sorted(nodes)
+            if rng is not None:
+                start_idx = rng.randrange(len(nodes_sorted))
+                pickup_candidates = nodes_sorted[:start_idx] + nodes_sorted[start_idx + 1 :]
+                pickup_idx = rng.randrange(len(pickup_candidates))
+                start_node = nodes_sorted[start_idx]
+                pickup_node = pickup_candidates[pickup_idx]
+            else:
+                start_node, pickup_node = nodes_sorted[0], nodes_sorted[1]
+
+            starts.append(start_node)
+            pickups.append(pickup_node)
+
+        fixed_starts_idx = [node_to_idx[int(n)] for n in starts if int(n) in node_to_idx]
+        fixed_pickups_idx = [node_to_idx[int(n)] for n in pickups if int(n) in node_to_idx]
 
     jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
 

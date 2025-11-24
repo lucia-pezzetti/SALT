@@ -18,6 +18,9 @@ from typing import Optional
 # Map activation names
 activation_dict = {"relu": jax.nn.relu, "silu": jax.nn.silu, "elu": jax.nn.elu}
 
+# Base observation layout matches PPO networks
+BASE_OBS_DIM = 5
+
 
 class GNPPolicyNetwork(hk.Module):
     """
@@ -48,7 +51,7 @@ class GNPPolicyNetwork(hk.Module):
         Args:
             obs: [batch_size, D] where D = 5 (base) or 5+2*max_deg (with neighbor info)
               Base: [current_pos(2), pickup_pos(2), time(1)]
-              With neighbors: [current_pos(2), pickup_pos(2), time(1), 
+              With neighbors: [current_pos(2), pickup_pos(2), time(1),
                                neighbor_travel_times(max_deg), neighbor_distances(max_deg)]
             neighbor_mask: [batch_size, max_deg] - mask for valid neighbors (optional)
         
@@ -57,7 +60,7 @@ class GNPPolicyNetwork(hk.Module):
         """
         batch_size = obs.shape[0]
         obs_dim = obs.shape[-1]
-        has_neighbor_info = obs_dim > 5
+        has_neighbor_info = obs_dim > BASE_OBS_DIM
         
         # Extract base features
         current_pos = obs[:, 0:2]  # [batch_size, 2]
@@ -66,8 +69,9 @@ class GNPPolicyNetwork(hk.Module):
         
         # Get neighbor information if available
         if has_neighbor_info:
-            neighbor_travel_times = obs[:, 5:5+self.max_deg]  # [batch_size, max_deg]
-            neighbor_distances = obs[:, 5+self.max_deg:5+2*self.max_deg]  # [batch_size, max_deg]
+            start_idx = BASE_OBS_DIM
+            neighbor_travel_times = obs[:, start_idx:start_idx+self.max_deg]  # [batch_size, max_deg]
+            neighbor_distances = obs[:, start_idx+self.max_deg:start_idx+2*self.max_deg]  # [batch_size, max_deg]
             # Use provided mask or create default
             if neighbor_mask is None:
                 # Assume all are valid if no mask provided
@@ -193,7 +197,7 @@ class GNNValueNetwork(hk.Module):
         """
         batch_size = obs.shape[0]
         obs_dim = obs.shape[-1]
-        has_neighbor_info = obs_dim > 5
+        has_neighbor_info = obs_dim > BASE_OBS_DIM
         
         # Extract features
         current_pos = obs[:, 0:2]
@@ -202,8 +206,9 @@ class GNNValueNetwork(hk.Module):
         
         # Get neighbor info if available
         if has_neighbor_info:
-            neighbor_travel_times = obs[:, 5:5+self.max_deg]
-            neighbor_distances = obs[:, 5+self.max_deg:5+2*self.max_deg]
+            start_idx = BASE_OBS_DIM
+            neighbor_travel_times = obs[:, start_idx:start_idx+self.max_deg]
+            neighbor_distances = obs[:, start_idx+self.max_deg:start_idx+2*self.max_deg]
             if neighbor_mask is None:
                 neighbor_mask = jnp.ones((batch_size, self.max_deg), dtype=bool)
         else:
@@ -212,7 +217,7 @@ class GNNValueNetwork(hk.Module):
             neighbor_mask = jnp.zeros((batch_size, self.max_deg), dtype=bool)
         
         # Initial node features
-        x = jnp.concatenate([current_pos, pickup_pos, time], axis=-1)
+        x = jnp.concatenate([current_pos, pickup_pos, time], axis=-1)  # [batch_size, 5]
         x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
         
         x = hk.Linear(

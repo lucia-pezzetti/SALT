@@ -157,13 +157,29 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
                     )
                 
                 fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
-                    G, nodes_gdf, node_to_zone, zone_to_nodes, all=False, seed=seed
+                    G,
+                    nodes_gdf,
+                    node_to_zone,
+                    zone_to_nodes,
+                    all=args.all_nodes_starts_pickups,
+                    seed=seed,
                 )
                 fixed_starts_idx = jnp.array(fixed_starts_idx, dtype=jnp.int32)
                 fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
                 return data['G'], node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
             
-            return data['G'], data['node_to_idx'], data['idx_to_node'], data['fixed_starts_idx'], data['fixed_pickups_idx'], traffic_params
+            G = data['G']
+            node_to_idx = data['node_to_idx']
+            idx_to_node = data['idx_to_node']
+            fixed_starts_idx = data['fixed_starts_idx']
+            fixed_pickups_idx = data['fixed_pickups_idx']
+
+            if getattr(args, 'all_nodes_starts_pickups', False):
+                num_nodes = len(node_to_idx)
+                fixed_starts_idx = jnp.arange(num_nodes, dtype=jnp.int32)
+                fixed_pickups_idx = jnp.arange(num_nodes, dtype=jnp.int32)
+
+            return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
     
     # Build Manhattan graph
     start_time = time.time()
@@ -199,7 +215,12 @@ def build_env(args):
 
         seed = getattr(args, 'seed', None)
         fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
-            G, nodes_gdf, node_to_zone, zone_to_nodes, all = False, seed=seed
+            G,
+            nodes_gdf,
+            node_to_zone,
+            zone_to_nodes,
+            all=args.all_nodes_starts_pickups,
+            seed=seed,
         )
         fixed_starts_idx  = jnp.array(fixed_starts_idx, dtype=jnp.int32)
         fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
@@ -219,6 +240,11 @@ def build_env(args):
 
     else:
         raise ValueError(f"Unknown env_type: {args.env_type}")
+
+    if getattr(args, 'all_nodes_starts_pickups', False):
+        num_nodes = len(node_to_idx)
+        fixed_starts_idx = jnp.arange(num_nodes, dtype=jnp.int32)
+        fixed_pickups_idx = jnp.arange(num_nodes, dtype=jnp.int32)
     
     # Compute max_deg for traffic params
     max_deg = max(dict(G.out_degree()).values())
@@ -296,8 +322,8 @@ def make_obs_fn(
 ]:
     """
     Returns two functions:
-      - single_obs: TaxiState -> observation vector [9] 
-      - obs_fn_batch: batched TaxiState -> batched observation vectors [B, 9]
+      - single_obs: TaxiState -> observation vector [5] 
+      - obs_fn_batch: batched TaxiState -> batched observation vectors [B, 5]
     """
     # Precompute normalized lat/lon per node
     latlon = compute_normalized_node_coordinates(G, node_to_idx)
@@ -329,9 +355,8 @@ def make_obs_fn(
         # obs = obs.at[4:6].set(relative_pos)   # [2] - direction vector
         # obs = obs.at[6].set(distance)         # [1] - distance
         # obs = obs.at[7].set(angle)            # [1] - angle
-        # DEBUG: Commented out time for time-invariant shortest path learning
         # obs = obs.at[4].set(s.time)           # [1] - time
-        obs = obs.at[4].set(0.0)               # [1] - time (set to 0 for debugging)
+        obs = obs.at[4].set(0.0)                # [1] - time
         
         return obs
 

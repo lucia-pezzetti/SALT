@@ -18,6 +18,7 @@ from .context import RunContext
 
 
 def run_ppo(args, ctx: RunContext) -> None:
+    
     obs_fn_single, obs_fn_batch = ctx.obs_fn_single, ctx.obs_fn_batch
 
     if args.config is None:
@@ -26,11 +27,11 @@ def run_ppo(args, ctx: RunContext) -> None:
         config = json.load(f)
 
     config['batch_size'] = args.num_agents
-    config['eval_frequency'] = 10*ctx.max_length
+    config['eval_frequency'] = 3*ctx.max_length
     config['num_steps'] = args.epochs * config['eval_frequency']
     config['max_deg'] = ctx.env.max_deg
     config['cycle_length'] = args.cycle_length
-    config['max_steps'] = 5*ctx.max_length
+    config['max_steps'] = ctx.max_length
 
     init_fn = get_ppo_init_fn(ctx.env, config, obs_fn_single)
     key, policy_params, value_params, policy_apply, value_apply, policy_opt, value_opt, policy_opt_state, value_opt_state = init_fn(jax.random.PRNGKey(0))
@@ -118,6 +119,7 @@ def run_ppo(args, ctx: RunContext) -> None:
         'value_opt_state': value_opt_state,
         'opt_t': 0,
         'episode_return': jnp.zeros(config['batch_size']),
+        'cumulative_return': 0.0,
         'avg_return': 0.0,
         'num_episodes': 0,
         'env_states': env_states,
@@ -270,20 +272,9 @@ def run_ppo(args, ctx: RunContext) -> None:
             "evaluation/reached_pickup_rate": float(metrics.get('eval/reached_pickup_rate', 0.0)),  # Success rate (reached pickup / total)
             "evaluation/performance_ratio": performance_ratio,
             "evaluation/improvement_over_sp": float(1.0 - performance_ratio),
-            "value/value_update_norm": float(metrics.get('value/value_update_norm', 0.0)),
-            "value/value_param_norm": float(metrics.get('value/value_param_norm', 0.0)),
         }
-
-        node_visit_counts = metrics.get('node_visit_counts')
-        if node_visit_counts:
-            node_visit_counts_array = np.array(node_visit_counts)
-            log_metrics["exploration/node_total_visits"] = int(metrics.get('node_total_visits', 0))
-            log_metrics["exploration/node_visit_entropy"] = float(metrics.get('node_visit_entropy', 0.0))
-            log_metrics["exploration/node_visit_coverage"] = float(metrics.get('node_visit_coverage', 0.0))
-            log_metrics["exploration/node_visit_histogram"] = wandb.Histogram(node_visit_counts_array)
-            log_metrics["exploration/most_visited_node"] = int(np.argmax(node_visit_counts_array))
-
         wandb.log(log_metrics)
+
 
     final_metrics = {
         "final/total_epochs": args.epochs,
@@ -321,12 +312,12 @@ def run_ppo(args, ctx: RunContext) -> None:
     wandb.log({"training_summary": summary_table})
 
     # Greedy PPO policy
-    def ppo_policy(policy_params, state: TaxiState) -> int:
+    def ppo_policy(state: TaxiState) -> int:
         obs = obs_fn_single(state)
-        logits = policy_apply(policy_params, obs)
+        logits = policy_apply(state_dict['policy_params'], obs)
         neighbor_mask = state.neighbor_mask
-        masked_logits = jnp.where(neighbor_mask, logits, -1e8)
-        action = jnp.argmax(masked_logits, axis=-1)
+        masked_logits = jnp.where(neighbor_mask, logits, -1e-8)
+        action = jnp.argmax(masked_logits)
         return int(action)
 
     # Offline shortest path policy
@@ -375,13 +366,6 @@ def run_ppo(args, ctx: RunContext) -> None:
                 while (not bool(state.done)) and step_count < 3*ctx.max_length:
                     action = policy_fn(state)
                     state, reward, _, info = ctx.env.step(state, action)
-                    jax.debug.print("Step {step} Node {node} Action {action} Travel {travel} Wait {wait}", 
-                        step=step_count,
-                        node=int(state.current_node),
-                        action=action,
-                        travel=info['travel'],
-                        wait=info['wait']
-                    )
                     total_time += float(info['travel'] + info['wait'])
                     total_reward += float(reward)
                     traj.append(state.current_node)
@@ -392,12 +376,7 @@ def run_ppo(args, ctx: RunContext) -> None:
             return np.array(times), paths, np.array(rewards)
 
         print(f"Evaluating PPO policy for starts: {eval_starts} and pickups: {ppo_pickups}")
-        current_policy_params = state_dict['policy_params']
-        ppo_times, ppo_paths, ppo_rewards = evaluate_policy_single(
-            lambda state: ppo_policy(current_policy_params, state),
-            eval_starts,
-            ppo_pickups
-        )
+        ppo_times, ppo_paths, ppo_rewards = evaluate_policy_single(ppo_policy, eval_starts, ppo_pickups)
         
         print(f"Evaluating SP policy for starts: {eval_starts} and pickups: {sp_pickups}")
         sp_times, sp_paths, sp_rewards = evaluate_policy_single(sp_policy, eval_starts, sp_pickups)

@@ -174,14 +174,13 @@ class TaxiEnv(eqx.Module):
         t1 = state.time + travel
         
         # Signal phase & wait - use edge-based traffic params (at the end of the edge)
-        # DEBUG: Set all traffic lights to green (wait = 0) for time-invariant shortest path learning
         period_edge = self.periods[curr, action]
         offset_edge = self.offsets[curr, action]
         green_edge = self.green_durations[curr, action]
         
         cycle = (t1 + offset_edge) % period_edge
-        # wait = jnp.where(cycle < green_edge, 0.0, period_edge - cycle)  # Original traffic light logic
-        wait = 0.0  # DEBUG: All lights green - no waiting
+        wait = jnp.where(cycle < green_edge, 0.0, period_edge - cycle)  # Original traffic light logic
+        # wait = 0.0
         t2 = t1 + wait
         norm_time = t2 % period_edge
 
@@ -235,7 +234,7 @@ class TaxiEnv(eqx.Module):
 
         # Include distance shaping to guide agent toward pickup
         # Positive reward for moving closer (dist_diff > 0), negative for moving away
-        reward = - reward_scaling * total_delay/60.0 + pickup_bonus
+        reward = - reward_scaling * total_delay/60.0 + pickup_bonus + dist_shaping
         
         # Already done
         reward = jnp.where(already_done, 0.0, reward)

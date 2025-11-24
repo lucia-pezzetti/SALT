@@ -17,6 +17,7 @@ from modes.eval_only import run_eval_only
 from modes.train_dqn import run_dqn
 from modes.train_mcts import run_mcts
 from modes.train_ppo import run_ppo
+from modes.train_q_learning import run_q_learning
 
 import argparse
 
@@ -93,8 +94,9 @@ parser.add_argument("--epochs", type=int, default=100_000, help="Number of train
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
 parser.add_argument("--num_steps", type=int, default=128, help="Number of steps for training")
 parser.add_argument("--gamma", type=float, default=1.0, help="Discount factor for training")
-parser.add_argument("--epsilon_start", type=float, default=0.5, help="Initial epsilon for epsilon-greedy policy")
-parser.add_argument("--epsilon_end", type=float, default=0.1, help="Final epsilon for epsilon-greedy policy")
+parser.add_argument("--epsilon_start", type=float, default=1.0, help="Initial epsilon for epsilon-greedy policy (Q-learning default: 1.0)")
+parser.add_argument("--epsilon_end", type=float, default=0.01, help="Final epsilon for epsilon-greedy policy (Q-learning default: 0.01)")
+parser.add_argument("--epsilon_decay_fraction", type=float, default=0.5, help="Fraction of total training steps over which epsilon decays (Q-learning, default: 0.5 = 50%%)")
 parser.add_argument("--sp_bias_beta", type=float, default=2.0, help="Shortest-path bias strength for exploration (higher = more SP bias)")
 parser.add_argument("--params_dir", type=str, default=None, help="Output file for pretrained parameters")
 parser.add_argument("--pretrain_ckpt", type=str, default="pretrained_params.pkl", help="Checkpoint file for pretrained parameters")
@@ -110,7 +112,15 @@ parser.add_argument("--fixed_eval", action="store_true", help="Use fixed starts 
 parser.add_argument("--fixed_starts", nargs='+', type=int, default=None, help="Fixed start node indices for evaluation (e.g., --fixed_starts 1 2 3)")
 parser.add_argument("--fixed_pickups", nargs='+', type=int, default=None, help="Fixed pickup node indices for evaluation (e.g., --fixed_pickups 4 5 6)")
 parser.add_argument("--plot_traveling_times", action="store_true", help="Create a plot comparing traveling times between RL and shortest path for each initial-destination pair")
+parser.add_argument(
+    "--all_nodes_starts_pickups",
+    action="store_true",
+    help="Use every node in the graph as an eligible fixed start and pickup location",
+)
 parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility (affects starts/pickups selection)")
+parser.add_argument("--discrete", action="store_true", help="Use discrete time discretization (dt=5) and tabular Q-learning instead of PPO")
+parser.add_argument("--pretrain_enabled", action="store_true", help="Enable shortest path pretraining for Q-learning (discrete mode only)")
+parser.add_argument("--num_pretrain_episodes", type=int, default=10000, help="Number of pretraining episodes using shortest path rollouts (for Q-learning)")
 
 args = parser.parse_args()
 
@@ -262,6 +272,12 @@ if args.eval_only:
 
 # Early-dispatch to modular training handlers
 else:
+    # If discrete mode is enabled, use Q-learning regardless of model selection
+    if args.discrete:
+        run_q_learning(args, ctx)
+        exit(0)
+    
+    # Otherwise, route to the selected model
     if args.model == "dqn":
         run_dqn(args, ctx)
         exit(0)
