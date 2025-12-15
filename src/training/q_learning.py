@@ -14,6 +14,83 @@ from pathlib import Path
 from taxi_env import TaxiState, TaxiEnv, init_env
 
 
+@jax.jit
+def _jitted_step_with_discretization(
+    env: TaxiEnv,
+    state: TaxiState,
+    action: int,
+    discrete_travel_times: jnp.ndarray,
+    dt: float,
+):
+    """Compiled environment step matching TabularQLearning.step_with_discretization."""
+    already_done = state.done
+
+    curr = state.current_node
+    nxt = env.adj_list[curr, action]
+
+    travel = discrete_travel_times[curr, action]
+
+    reach = (curr == state.pickup_node) | (nxt == state.pickup_node)
+    step_n = state.step_count + 1
+    done = reach
+
+    t1 = state.time + travel
+
+    period_edge = env.periods[curr, action]
+    offset_edge = env.offsets[curr, action]
+    green_edge = env.green_durations[curr, action]
+
+    cycle = (t1 + offset_edge) % period_edge
+    wait = jnp.where(cycle < green_edge, 0.0, period_edge - cycle)
+    t2 = t1 + wait
+
+    discrete_t2 = jnp.round(t2 / dt) * dt
+    norm_time = jnp.mod(discrete_t2, period_edge)
+
+    total_delay = travel + wait
+    dist_curr = env.distances[curr, state.pickup_node]
+    dist_next = env.distances[nxt, state.pickup_node]
+    dist_diff = dist_curr - dist_next
+    dist_shaping = dist_diff / 60.0
+
+    pickup_bonus = jnp.where(reach, env.pickup_bonus, 0.0)
+    reward_scaling = 1.0
+    reward = -reward_scaling * total_delay / 60.0 + pickup_bonus + dist_shaping
+    reward = jnp.where(already_done, 0.0, reward)
+
+    nm = env.neighbor_mask_static[nxt]
+
+    at_pickup_before = (curr == state.pickup_node)
+    reached_pickup_this_step = reach & ~already_done
+    final_node = jnp.where(
+        already_done,
+        curr,
+        jnp.where(
+            reached_pickup_this_step,
+            jnp.where(at_pickup_before, curr, nxt),
+            nxt,
+        ),
+    )
+    final_neighbor_mask = jnp.where(already_done, state.neighbor_mask, nm)
+    final_time = jnp.where(already_done, state.time, norm_time)
+    final_step_count = jnp.where(already_done, state.step_count, jnp.where(done, 0, step_n))
+    final_done = jnp.where(already_done, True, done)
+
+    final_wait = jnp.where(already_done, 0.0, wait)
+    final_travel = jnp.where(already_done, 0.0, travel)
+
+    new_state = TaxiState(
+        current_node=final_node,
+        pickup_node=state.pickup_node,
+        done=final_done,
+        step_count=final_step_count,
+        neighbor_mask=final_neighbor_mask,
+        time=final_time,
+    )
+
+    return new_state, reward, final_done, {"wait": final_wait, "travel": final_travel}
+
+
 def discretize_time(time: float, dt: float = 5.0) -> int:
     """Discretize time to the nearest multiple of dt."""
     return int(round(time / dt))
@@ -72,6 +149,101 @@ class TabularQLearning:
         # Create a discretized copy of travel_times
         self.discrete_travel_times = jnp.round(self.env.travel_times / self.dt) * self.dt
     
+    def initialize_q_values_from_shortest_paths(
+        self,
+        use_all_time_slices: bool = False,
+        max_time_slices: int = 100,
+    ):
+        """
+        Initialize Q-table values based on shortest path travel times.
+        
+        This provides a good initialization by computing Q-values based on:
+        - Travel time for the action (negative cost)
+        - Distance shaping (progress toward pickup)
+        - Estimated future value (remaining distance to pickup)
+        - Pickup bonus if action reaches pickup
+        
+        Note: This initialization ignores time discretization and uses travel times
+        directly from the environment. It initializes Q-values for time=0 (or all
+        time slices if use_all_time_slices=True).
+        
+        Args:
+            use_all_time_slices: If True, initialize for all time slices up to max_time_slices.
+                                 If False, only initialize for time=0.
+            max_time_slices: Maximum number of time slices to initialize (if use_all_time_slices=True).
+        """
+        print(f"\nInitializing Q-table from shortest path travel times...")
+        print(f"  Using all time slices: {use_all_time_slices}")
+        if use_all_time_slices:
+            print(f"  Max time slices: {max_time_slices}")
+        
+        num_initialized = 0
+        reward_scaling = 1.0  # Match the reward scaling in step_with_discretization
+        
+        # Iterate over all nodes and pickup nodes
+        for current_node in range(self.env.num_nodes):
+            for pickup_node in range(self.env.num_nodes):
+                # Skip if already at pickup (episode would be done)
+                if current_node == pickup_node:
+                    continue
+                
+                # For each valid action from current_node
+                for action in range(self.env.max_deg):
+                    if not self.env.neighbor_mask_static[current_node, action]:
+                        continue
+                    
+                    next_node = int(self.env.adj_list[current_node, action])
+                    travel_time = float(self.env.travel_times[current_node, action])
+                    
+                    # Check if this action reaches the pickup
+                    reaches_pickup = (next_node == pickup_node)
+                    
+                    # Compute immediate reward components
+                    # 1. Travel time cost (negative, scaled by 60.0 to match reward formula)
+                    travel_cost = -reward_scaling * travel_time / 60.0
+                    
+                    # 2. Distance shaping (progress toward pickup)
+                    dist_curr = float(self.env.distances[current_node, pickup_node])
+                    dist_next = float(self.env.distances[next_node, pickup_node])
+                    dist_diff = dist_curr - dist_next
+                    dist_shaping = dist_diff / 60.0
+                    
+                    # 3. Pickup bonus if reaching pickup
+                    pickup_bonus = self.env.pickup_bonus if reaches_pickup else 0.0
+                    
+                    # 4. Estimated future value (remaining distance to pickup)
+                    # Use discounted remaining distance as estimate of future value
+                    if reaches_pickup:
+                        future_value = 0.0  # Terminal state
+                    else:
+                        # Estimate: negative of remaining distance (scaled)
+                        remaining_dist = float(self.env.distances[next_node, pickup_node])
+                        future_value = -self.gamma * remaining_dist / 60.0
+                    
+                    # Total Q-value = immediate reward + future value
+                    q_value = travel_cost + dist_shaping + pickup_bonus + future_value
+                    
+                    # Initialize for time=0 or all time slices
+                    if use_all_time_slices:
+                        for discrete_time in range(max_time_slices):
+                            q_key = (current_node, pickup_node, discrete_time, action)
+                            self.q_table[q_key] = q_value
+                            num_initialized += 1
+                    else:
+                        q_key = (current_node, pickup_node, 0, action)
+                        self.q_table[q_key] = q_value
+                        num_initialized += 1
+        
+        print(f"  Initialized {num_initialized} Q-values")
+        print(f"  Q-table size: {len(self.q_table)}")
+        
+        # Update statistics
+        stats = self.get_statistics()
+        print(f"  Avg Q-value: {stats['avg_q_value']:.4f}")
+        print(f"  Min Q-value: {stats['min_q_value']:.4f}")
+        print(f"  Max Q-value: {stats['max_q_value']:.4f}")
+        print("Q-table initialization completed!\n")
+    
     def get_epsilon(self, step: int) -> float:
         """Get epsilon value for epsilon-greedy policy at current step."""
         if step >= self.epsilon_decay_steps:
@@ -84,6 +256,12 @@ class TabularQLearning:
         state_key = state_to_discrete_key(state, self.dt)
         q_key = (*state_key, action)
         return self.q_table[q_key]
+    
+    @staticmethod
+    @jax.jit
+    def _update_q_value(current_q, reward, max_next_q, learning_rate, gamma):
+        target = reward + gamma * max_next_q
+        return current_q + learning_rate * (target - current_q)
     
     def set_q_value(self, state: TaxiState, action: int, value: float):
         """Set Q-value for a state-action pair."""
@@ -159,11 +337,19 @@ class TabularQLearning:
             
             if max_next_q == float('-inf'):
                 max_next_q = 0.0  # No valid actions
-            
-            target = reward + self.gamma * max_next_q
         
-        # Q-learning update
-        new_q = current_q + self.learning_rate * (target - current_q)
+        if done:
+            new_q = current_q + self.learning_rate * (reward - current_q)
+        else:
+            new_q = float(
+                self._update_q_value(
+                    current_q,
+                    reward,
+                    max_next_q,
+                    self.learning_rate,
+                    self.gamma,
+                )
+            )
         self.set_q_value(state, action, new_q)
     
     def step_with_discretization(self, state: TaxiState, action: int, key: jnp.ndarray) -> Tuple[TaxiState, float, bool, dict]:
@@ -171,84 +357,20 @@ class TabularQLearning:
         Environment step with discretized travel times.
         This replaces the normal env.step() when using discrete mode.
         """
-        # Already done
-        already_done = state.done
-        
-        # Base move
-        curr = state.current_node
-        nxt = self.env.adj_list[curr, action]
-        
-        # Use discretized travel time
-        travel = float(self.discrete_travel_times[curr, action])
-        
-        # Check for invalid moves
-        invalid = (nxt == -1)
-        reach = (curr == state.pickup_node) | (nxt == state.pickup_node)
-        step_n = state.step_count + 1
-        done = reach
-        
-        # Time calculations with discretization
-        t1 = state.time + travel
-        
-        # Signal phase & wait - match environment's traffic light logic
-        period_edge = float(self.env.periods[curr, action])
-        offset_edge = float(self.env.offsets[curr, action])
-        green_edge = float(self.env.green_durations[curr, action])
-        
-        cycle = (t1 + offset_edge) % period_edge
-        wait = 0.0 if cycle < green_edge else period_edge - cycle  # Match environment's wait calculation
-        t2 = t1 + wait
-        
-        # Discretize final time
-        discrete_t2 = discretize_travel_time(t2, self.dt)
-        norm_time = discrete_t2 % period_edge
-        
-        # Reward calculation (same as original)
-        total_delay = travel + wait
-        dist_curr = float(self.env.distances[curr, state.pickup_node])
-        dist_next = float(self.env.distances[nxt, state.pickup_node])
-        dist_diff = dist_curr - dist_next
-        dist_shaping = dist_diff / 60.0
-        
-        pickup_bonus = self.env.pickup_bonus if reach else 0.0
-        reward_scaling = 1.0
-        # Include distance shaping to guide agent toward pickup
-        reward = -reward_scaling * total_delay / 60.0 + pickup_bonus + dist_shaping
-        reward = 0.0 if already_done else reward
-        
-        # Neighbor mask
-        nm = self.env.neighbor_mask_static[nxt]
-        
-        # State update
-        at_pickup_before = (curr == state.pickup_node)
-        reached_pickup_this_step = reach & ~already_done
-        final_node = jnp.where(
-            already_done,
-            curr,
-            jnp.where(
-                reached_pickup_this_step,
-                jnp.where(at_pickup_before, curr, nxt),
-                nxt
-            )
+        next_state, reward, done_flag, info = _jitted_step_with_discretization(
+            self.env,
+            state,
+            action,
+            self.discrete_travel_times,
+            self.dt,
         )
-        final_neighbor_mask = jnp.where(already_done, state.neighbor_mask, nm)
-        final_time = jnp.where(already_done, state.time, jnp.array(norm_time, dtype=jnp.float32))
-        final_step_count = jnp.where(already_done, state.step_count, jnp.where(done, 0, step_n))
-        final_done = jnp.where(already_done, True, done)
-        
-        final_wait = jnp.where(already_done, 0.0, wait)
-        final_travel = jnp.where(already_done, 0.0, travel)
-        
-        new_state = TaxiState(
-            current_node=final_node,
-            pickup_node=state.pickup_node,
-            done=final_done,
-            step_count=final_step_count,
-            neighbor_mask=final_neighbor_mask,
-            time=final_time
+
+        return (
+            next_state,
+            float(reward),
+            bool(done_flag),
+            {"wait": float(info["wait"]), "travel": float(info["travel"])},
         )
-        
-        return new_state, reward, final_done, {"wait": final_wait, "travel": final_travel}
     
     def get_statistics(self) -> Dict:
         """Get statistics about the Q-table."""

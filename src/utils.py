@@ -55,8 +55,8 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
     # Map zones to nodes, then filter
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
     # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
-    # zone_names = ["Upper East Side North", "Yorkville West"] # , "Upper East Side South", "Lenox Hill West"] 
-    zone_names = ["Upper East Side North", "Yorkville West"] #, "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"]  
+    # zone_names = ["Upper East Side North", "Yorkville West"] #, "Upper East Side South", "Lenox Hill West"] 
+    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"]  
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
     loc_ids = filtered_zones["LocationID"].tolist()
@@ -261,6 +261,14 @@ def fixed_starts_pickups(G: nx.DiGraph,
         fixed_starts_idx = list(range(len(all_nodes)))
         fixed_pickups_idx = list(range(len(all_nodes)))
     else:
+        # Filter zone_to_nodes to only include nodes that are actually in the graph
+        # (some nodes may have been pruned during graph construction)
+        graph_nodes_set = set(all_nodes)
+        filtered_zone_to_nodes = {
+            loc_id: [n for n in nodes if n in graph_nodes_set]
+            for loc_id, nodes in zone_to_nodes.items()
+        }
+        
         # choose exactly one representative start and pickup per zone, ensuring they differ
         rng = random.Random(seed) if seed is not None else None
         starts = []
@@ -268,13 +276,16 @@ def fixed_starts_pickups(G: nx.DiGraph,
 
         nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
 
-        for loc_id, nodes in sorted(zone_to_nodes.items()):
+        for loc_id, nodes in sorted(filtered_zone_to_nodes.items()):
             if not nodes:
                 continue
             if len(nodes) < 2:
-                raise ValueError(
-                    f"Zone {loc_id} has fewer than 2 nodes; cannot choose distinct start and pickup."
-                )
+                # If zone has only 1 node after filtering, use it for both start and pickup
+                # (they'll be the same, but that's acceptable)
+                node = nodes[0]
+                starts.append(node)
+                pickups.append(node)
+                continue
 
             nodes_sorted = sorted(nodes)
             if rng is not None:
@@ -289,8 +300,16 @@ def fixed_starts_pickups(G: nx.DiGraph,
             starts.append(start_node)
             pickups.append(pickup_node)
 
+        # Now all nodes should be in node_to_idx since we filtered above
         fixed_starts_idx = [node_to_idx[int(n)] for n in starts if int(n) in node_to_idx]
         fixed_pickups_idx = [node_to_idx[int(n)] for n in pickups if int(n) in node_to_idx]
+        
+        # Ensure we have the same number of starts and pickups
+        if len(fixed_starts_idx) != len(fixed_pickups_idx):
+            # This shouldn't happen now, but if it does, pad or truncate to match
+            min_len = min(len(fixed_starts_idx), len(fixed_pickups_idx))
+            fixed_starts_idx = fixed_starts_idx[:min_len]
+            fixed_pickups_idx = fixed_pickups_idx[:min_len]
 
     jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
 

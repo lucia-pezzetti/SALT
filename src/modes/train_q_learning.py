@@ -8,6 +8,7 @@ from datetime import datetime
 
 from taxi_env import TaxiState, init_env
 from training.train_q_learning import train_q_learning, evaluate_q_agent
+from training.q_learning import TabularQLearning
 from utils import offline_shortest_path_action
 from evaluation.plot_agent_paths import plot_rl_vs_shortest_path
 
@@ -35,6 +36,97 @@ def run_q_learning(args, ctx: RunContext) -> None:
     eval_pickups = jnp.array(eval_pickups_combined, dtype=jnp.int32)
     
     print(f"Evaluating on {len(eval_starts)} combinations: {len(eval_starts_list)} starts × {len(eval_pickups_list)} pickups")
+
+    # Fast path: run only shortest-path baselines (continuous + discrete) and exit
+    if getattr(args, "eval_only_sp", False):
+        def evaluate_sp_continuous(env, starts, pickups, max_steps):
+            sp_times, sp_rewards, sp_steps, sp_completed = [], [], [], []
+            for start, pickup in zip(starts, pickups):
+                state = init_env(jax.random.PRNGKey(0), start, pickup, env.neighbor_mask_static)[0]
+                total_time = 0.0
+                total_reward = 0.0
+                step_count = 0
+                while not state.done and step_count < max_steps:
+                    action = offline_shortest_path_action(
+                        state.current_node, state.pickup_node,
+                        env.adj_list, env.travel_times, env.distances,
+                        env.neighbor_mask_static[state.current_node]
+                    )
+                    state, reward, done, info = env.step(state, action)
+                    total_time += float(info["travel"] + info["wait"])
+                    total_reward += float(reward)
+                    step_count += 1
+                    if done:
+                        break
+                sp_times.append(total_time)
+                sp_rewards.append(total_reward)
+                sp_steps.append(step_count)
+                sp_completed.append(bool(state.done))
+            return {
+                "avg_time": float(np.mean(sp_times)),
+                "avg_reward": float(np.mean(sp_rewards)),
+                "avg_steps": float(np.mean(sp_steps)),
+                "completion_rate": float(np.mean(sp_completed)),
+            }
+
+        def evaluate_sp_discrete(env, starts, pickups, gamma, max_steps, dt=5.0):
+            sp_times, sp_rewards, sp_steps, sp_completed = [], [], [], []
+            # Use an untrained Q-agent solely for discretized stepping
+            q_agent = TabularQLearning(
+                env=env,
+                dt=dt,
+                learning_rate=0.1,
+                discount_factor=gamma,
+                epsilon_start=0.0,
+                epsilon_end=0.0,
+                epsilon_decay_steps=1,
+                initial_q_value=0.0,
+            )
+            for idx, (start, pickup) in enumerate(zip(starts, pickups)):
+                key = jax.random.PRNGKey(idx)
+                state = init_env(key, start, pickup, env.neighbor_mask_static)[0]
+                total_time = 0.0
+                total_reward = 0.0
+                step_count = 0
+                while not state.done and step_count < max_steps:
+                    action = offline_shortest_path_action(
+                        state.current_node, state.pickup_node,
+                        env.adj_list, env.travel_times, env.distances,
+                        env.neighbor_mask_static[state.current_node]
+                    )
+                    key, step_key = jax.random.split(key)
+                    state, reward, done, info = q_agent.step_with_discretization(state, action, step_key)
+                    total_time += float(info["travel"] + info["wait"])
+                    total_reward += float(reward)
+                    step_count += 1
+                    if done:
+                        break
+                sp_times.append(total_time)
+                sp_rewards.append(total_reward)
+                sp_steps.append(step_count)
+                sp_completed.append(bool(state.done))
+            return {
+                "avg_time": float(np.mean(sp_times)),
+                "avg_reward": float(np.mean(sp_rewards)),
+                "avg_steps": float(np.mean(sp_steps)),
+                "completion_rate": float(np.mean(sp_completed)),
+            }
+
+        sp_cont = evaluate_sp_continuous(ctx.env, eval_starts, eval_pickups, ctx.max_length)
+        sp_disc = evaluate_sp_discrete(ctx.env, eval_starts, eval_pickups, args.gamma, ctx.max_length)
+
+        print("\n=== Shortest Path Baseline (Continuous - real time) ===")
+        print(f"  Avg reward: {sp_cont['avg_reward']:.2f}")
+        print(f"  Avg steps: {sp_cont['avg_steps']:.1f}")
+        print(f"  Completion rate: {sp_cont['completion_rate']:.2%}")
+        print(f"  Avg time: {sp_cont['avg_time']:.2f}")
+
+        print("\n=== Shortest Path Baseline (Discrete - dt=5, Q-learning fair) ===")
+        print(f"  Avg reward: {sp_disc['avg_reward']:.2f}")
+        print(f"  Avg steps: {sp_disc['avg_steps']:.1f}")
+        print(f"  Completion rate: {sp_disc['completion_rate']:.2%}")
+        print(f"  Avg time: {sp_disc['avg_time']:.2f}")
+        return
     
     # Initialize wandb
     wandb.init(
@@ -65,6 +157,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
             "timestamp": datetime.now().isoformat(),
             "pretrain_enabled": getattr(args, 'pretrain_enabled', False),
             "num_pretrain_episodes": getattr(args, 'num_pretrain_episodes', 1000),
+            "init_from_shortest_paths": getattr(args, 'init_from_shortest_paths', False),
+            "init_all_time_slices": getattr(args, 'init_all_time_slices', False),
             "epsilon_start": getattr(args, 'epsilon_start', 1.0),
             "epsilon_end": getattr(args, 'epsilon_end', 0.01),
             "epsilon_decay_fraction": getattr(args, 'epsilon_decay_fraction', 0.5),
@@ -90,12 +184,38 @@ def run_q_learning(args, ctx: RunContext) -> None:
     # Check if pretraining is enabled
     pretrain_enabled = getattr(args, 'pretrain_enabled', False)
     num_pretrain_episodes = getattr(args, 'num_pretrain_episodes', 1000)
+    pretrain_learning_rate = getattr(args, 'pretrain_learning_rate', None)
+    
+    # Check if shortest path initialization is enabled
+    init_from_shortest_paths = getattr(args, 'init_from_shortest_paths', False)
+    init_all_time_slices = getattr(args, 'init_all_time_slices', False)
+    
+    # If initialization is used and pretraining is enabled, use a lower learning rate for pretraining
+    # to avoid overwriting good initialization values
+    if init_from_shortest_paths and pretrain_enabled and pretrain_learning_rate is None:
+        pretrain_learning_rate = 0.01  # Lower learning rate to preserve initialization
+        print(f"\n⚠️  Using lower pretraining learning rate ({pretrain_learning_rate}) to preserve initialization values")
+        print(f"   (You can override with --pretrain_learning_rate)\n")
     
     # Create logging function for pretraining metrics
     def pretrain_log_fn(log_dict, step):
         """Log pretraining metrics to wandb"""
         if wandb.run is not None:
-            wandb.log(log_dict, step=step)
+            # Ensure all values are Python native types for WandB
+            log_dict_clean = {}
+            for key, value in log_dict.items():
+                if isinstance(value, (jnp.ndarray, np.ndarray)):
+                    log_dict_clean[key] = float(value) if value.size == 1 else value.tolist()
+                elif isinstance(value, (jnp.integer, np.integer)):
+                    log_dict_clean[key] = int(value)
+                elif isinstance(value, (jnp.floating, np.floating)):
+                    log_dict_clean[key] = float(value)
+                else:
+                    log_dict_clean[key] = value
+            wandb.log(log_dict_clean, step=int(step), commit=True)
+    
+    # Use optimistic initialization with positive large value to favor exploration
+    initial_q_value = 10.0  # Positive large value for optimistic initialization
     
     q_agent = train_q_learning(
         env=ctx.env,
@@ -103,7 +223,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         fixed_pickups=ctx.env.fixed_pickups,
         num_episodes=args.epochs,
         max_steps_per_episode=ctx.max_length,
-        dt=1.0,
+        dt=5.0,
         learning_rate=0.1,
         discount_factor=args.gamma,
         epsilon_start=epsilon_start,
@@ -118,6 +238,10 @@ def run_q_learning(args, ctx: RunContext) -> None:
         pretrain_log_fn=pretrain_log_fn if pretrain_enabled else None,
         save_path=args.q_table_path,
         load_path=args.q_table_path,
+        initial_q_value=initial_q_value,
+        init_from_shortest_paths=init_from_shortest_paths,
+        init_all_time_slices=init_all_time_slices,
+        pretrain_learning_rate=pretrain_learning_rate,
     )
     
     # Final evaluation
@@ -331,13 +455,15 @@ def run_q_learning(args, ctx: RunContext) -> None:
         )
         
         def evaluate_policy_single(policy_fn, starts, pickups, use_discrete=False):
-            """Evaluate policy and return times, paths, and rewards."""
-            times, paths, rewards = [], [], []
+            """Evaluate policy and return times, paths, rewards, step rewards, and step times."""
+            times, paths, rewards, step_rewards_list, step_times_list = [], [], [], [], []
             for start, pickup in zip(np.array(starts).tolist(), np.array(pickups).tolist()):
                 total_time, total_reward = 0.0, 0.0
                 step_count = 0
                 state = init_env(jax.random.PRNGKey(0), start, pickup, ctx.env.neighbor_mask_static)[0]
                 traj = [int(state.current_node)]
+                step_rewards = []
+                step_times = []
                 
                 while (not bool(state.done)) and step_count < 3*ctx.max_length:
                     action = policy_fn(state)
@@ -351,8 +477,12 @@ def run_q_learning(args, ctx: RunContext) -> None:
                         # Use normal step for shortest path
                         next_state, reward, done, info = ctx.env.step(state, action)
                     
-                    total_time += float(info['travel'] + info['wait'])
-                    total_reward += float(reward)
+                    step_time = float(info['travel'] + info['wait'])
+                    total_time += step_time
+                    step_reward = float(reward)
+                    total_reward += step_reward
+                    step_rewards.append(step_reward)
+                    step_times.append(step_time)
                     traj.append(int(next_state.current_node))
                     step_count += 1
                     state = next_state
@@ -363,54 +493,77 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 times.append(total_time)
                 rewards.append(total_reward)
                 paths.append(traj)
+                step_rewards_list.append(step_rewards)
+                step_times_list.append(step_times)
             
-            return np.array(times), paths, np.array(rewards)
+            return np.array(times), paths, np.array(rewards), step_rewards_list, step_times_list
         
         print(f"\nEvaluation iteration {i+1}/{eval_iter}")
         print(f"Evaluating Q-learning policy for starts: {eval_starts} and pickups: {matched_q_pickups}")
-        q_times, q_paths, q_rewards = evaluate_policy_single(
+        q_times, q_paths, q_rewards, q_step_rewards, q_step_times = evaluate_policy_single(
             q_learning_policy, eval_starts, matched_q_pickups, use_discrete=True
         )
         
         print(f"Evaluating SP policy (continuous) for starts: {eval_starts} and pickups: {matched_sp_pickups_cont}")
-        sp_times_continuous, sp_paths_continuous, sp_rewards_continuous = evaluate_policy_single(
+        sp_times_continuous, sp_paths_continuous, sp_rewards_continuous, sp_step_rewards_continuous, sp_step_times_continuous = evaluate_policy_single(
             sp_policy, eval_starts, matched_sp_pickups_cont, use_discrete=False
         )
         
         print(f"Evaluating SP policy (discrete) for starts: {eval_starts} and pickups: {matched_sp_pickups_disc}")
-        sp_times_discrete, sp_paths_discrete, sp_rewards_discrete = evaluate_policy_single(
+        sp_times_discrete, sp_paths_discrete, sp_rewards_discrete, sp_step_rewards_discrete, sp_step_times_discrete = evaluate_policy_single(
             sp_policy, eval_starts, matched_sp_pickups_disc, use_discrete=True
         )
         
-        # Print trajectories
+        # Print trajectories with step rewards and step times
         print(f"\nQ-Learning Trajectories:")
-        for agent_idx, (start, pickup, path, time, reward) in enumerate(zip(eval_starts, eval_pickups, q_paths, q_times, q_rewards)):
+        for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
+            zip(eval_starts, matched_q_pickups, q_paths, q_times, q_rewards, q_step_rewards, q_step_times)
+        ):
             print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
             print(f"    Path: {' -> '.join(map(str, path))}")
-            print(f"    Time: {time:.2f}s, Reward: {reward:.2f}, Steps: {len(path)-1}")
+            print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
+            print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
+            print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
         
         print(f"\nShortest Path Trajectories (Continuous - Real World):")
-        for agent_idx, (start, pickup, path, time, reward) in enumerate(zip(eval_starts, eval_pickups, sp_paths_continuous, sp_times_continuous, sp_rewards_continuous)):
+        for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
+            zip(eval_starts, matched_sp_pickups_cont, sp_paths_continuous, sp_times_continuous, sp_rewards_continuous, sp_step_rewards_continuous, sp_step_times_continuous)
+        ):
             print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
             print(f"    Path: {' -> '.join(map(str, path))}")
-            print(f"    Time: {time:.2f}s, Reward: {reward:.2f}, Steps: {len(path)-1}")
+            print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
+            print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
+            print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
         
         print(f"\nShortest Path Trajectories (Discrete - Fair Comparison):")
-        for agent_idx, (start, pickup, path, time, reward) in enumerate(zip(eval_starts, eval_pickups, sp_paths_discrete, sp_times_discrete, sp_rewards_discrete)):
+        for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
+            zip(eval_starts, matched_sp_pickups_disc, sp_paths_discrete, sp_times_discrete, sp_rewards_discrete, sp_step_rewards_discrete, sp_step_times_discrete)
+        ):
             print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
             print(f"    Path: {' -> '.join(map(str, path))}")
-            print(f"    Time: {time:.2f}s, Reward: {reward:.2f}, Steps: {len(path)-1}")
+            print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
+            print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
+            print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
         
         # Plot comparison: Q-learning vs SP discrete (fair comparison)
         q_paths_list = [list(map(int, path)) for path in q_paths]
         sp_paths_discrete_list = [list(map(int, path)) for path in sp_paths_discrete]
-        fig = plot_rl_vs_shortest_path(q_paths_list, sp_paths_discrete_list, ctx.G, ctx.node_to_idx, ctx.idx_to_node, eval_starts, eval_pickups)
-        fig.savefig(f"qlearning_vs_sp_discrete_{np.array(eval_starts).tolist()}_{np.array(eval_pickups).tolist()}.png")
+        fig = plot_rl_vs_shortest_path(
+            q_paths_list,
+            sp_paths_discrete_list,
+            ctx.G,
+            ctx.node_to_idx,
+            ctx.idx_to_node,
+            eval_starts,
+            matched_q_pickups,
+        )
+        matched_pickups_list = np.array(matched_q_pickups).tolist()
+        fig.savefig(f"qlearning_vs_sp_discrete_{np.array(eval_starts).tolist()}_{matched_pickups_list}.png")
         
         print(f"\nQ-learning avg time: {np.mean(q_times):.2f}")
         print(f"SP (continuous) avg time: {np.mean(sp_times_continuous):.2f}")
         print(f"SP (discrete) avg time: {np.mean(sp_times_discrete):.2f}")
-        print(f"Saved plot: qlearning_vs_sp_discrete_{np.array(eval_starts).tolist()}_{np.array(eval_pickups).tolist()}.png")
+        print(f"Saved plot: qlearning_vs_sp_discrete_{np.array(eval_starts).tolist()}_{matched_pickups_list}.png")
         
         # Log metrics for both comparisons
         final_eval_metrics = {

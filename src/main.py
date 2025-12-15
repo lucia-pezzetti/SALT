@@ -96,7 +96,7 @@ parser.add_argument("--num_steps", type=int, default=128, help="Number of steps 
 parser.add_argument("--gamma", type=float, default=1.0, help="Discount factor for training")
 parser.add_argument("--epsilon_start", type=float, default=1.0, help="Initial epsilon for epsilon-greedy policy (Q-learning default: 1.0)")
 parser.add_argument("--epsilon_end", type=float, default=0.01, help="Final epsilon for epsilon-greedy policy (Q-learning default: 0.01)")
-parser.add_argument("--epsilon_decay_fraction", type=float, default=0.5, help="Fraction of total training steps over which epsilon decays (Q-learning, default: 0.5 = 50%%)")
+parser.add_argument("--epsilon_decay_fraction", type=float, default=0.9, help="Fraction of total training steps over which epsilon decays (Q-learning, default: 0.5 = 50%%)")
 parser.add_argument("--sp_bias_beta", type=float, default=2.0, help="Shortest-path bias strength for exploration (higher = more SP bias)")
 parser.add_argument("--params_dir", type=str, default=None, help="Output file for pretrained parameters")
 parser.add_argument(
@@ -127,6 +127,10 @@ parser.add_argument("--seed", type=int, default=1, help="Random seed for reprodu
 parser.add_argument("--discrete", action="store_true", help="Use discrete time discretization (dt=5) and tabular Q-learning instead of PPO")
 parser.add_argument("--pretrain_enabled", action="store_true", help="Enable shortest path pretraining for Q-learning (discrete mode only)")
 parser.add_argument("--num_pretrain_episodes", type=int, default=10000, help="Number of pretraining episodes using shortest path rollouts (for Q-learning)")
+parser.add_argument("--pretrain_learning_rate", type=float, default=None, help="Learning rate for pretraining (default: None = use agent's LR). Recommended: 0.01-0.05 when using --init_from_shortest_paths")
+parser.add_argument("--init_from_shortest_paths", action="store_true", help="Initialize Q-table from shortest path travel times (discrete mode only)")
+parser.add_argument("--init_all_time_slices", action="store_true", help="Initialize Q-table for all time slices (up to 100) instead of just time=0 (requires --init_from_shortest_paths)")
+parser.add_argument("--eval_only_sp", action="store_true", help="Run shortest-path baselines (continuous + discrete) and exit (discrete/Q-learning pipeline)")
 
 args = parser.parse_args()
 
