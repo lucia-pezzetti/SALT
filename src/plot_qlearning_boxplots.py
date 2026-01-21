@@ -12,9 +12,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def extract_times(filepath: Path) -> Tuple[List[float], List[float], List[float]]:
-    """Extract Q-learning, SP continuous, and SP discrete avg times."""
-    q_times: List[float] = []
+def extract_times(filepath: Path) -> Tuple[List[float], List[float], List[float], List[float]]:
+    """Extract Q-learning continuous, Q-learning discrete, SP continuous, and SP discrete avg times."""
+    q_cont_times: List[float] = []
+    q_disc_times: List[float] = []
     sp_cont_times: List[float] = []
     sp_disc_times: List[float] = []
 
@@ -24,9 +25,21 @@ def extract_times(filepath: Path) -> Tuple[List[float], List[float], List[float]
             if not line:
                 continue
 
+            # Try new format first: "Q-learning avg time (continuous):" or "Q-learning avg time (discrete):"
+            q_cont_match = re.search(r"Q-learning avg time \(continuous\):\s*([\d.]+)", line)
+            if q_cont_match:
+                q_cont_times.append(float(q_cont_match.group(1)))
+                continue
+
+            q_disc_match = re.search(r"Q-learning avg time \(discrete\):\s*([\d.]+)", line)
+            if q_disc_match:
+                q_disc_times.append(float(q_disc_match.group(1)))
+                continue
+
+            # Fallback to old format: "Q-learning avg time:" (assume continuous for backward compatibility)
             q_match = re.search(r"Q-learning avg time:\s*([\d.]+)", line)
             if q_match:
-                q_times.append(float(q_match.group(1)))
+                q_cont_times.append(float(q_match.group(1)))
                 continue
 
             sp_cont_match = re.search(r"SP \(continuous\) avg time:\s*([\d.]+)", line)
@@ -39,37 +52,61 @@ def extract_times(filepath: Path) -> Tuple[List[float], List[float], List[float]
                 sp_disc_times.append(float(sp_disc_match.group(1)))
                 continue
 
-    if not q_times:
+    if not q_cont_times and not q_disc_times:
         raise ValueError(f"No Q-learning avg times found in {filepath}")
     if not sp_disc_times and not sp_cont_times:
         raise ValueError(f"No SP avg times found in {filepath}")
 
-    return q_times, sp_cont_times, sp_disc_times
+    return q_cont_times, q_disc_times, sp_cont_times, sp_disc_times
 
 
 def create_boxplot(
-    q_times: List[float],
+    q_cont_times: List[float],
+    q_disc_times: List[float],
     sp_cont_times: List[float],
     sp_disc_times: List[float],
     output_path: Path,
 ) -> None:
     """Create and save a boxplot comparing the extracted times."""
-    data = [q_times]
-    labels = ["Q-learning"]
-    colors = ["#2ecc71"]
+    data = []
+    labels = []
+    colors = []
 
-    if sp_cont_times:
-        data.append(sp_cont_times)
+    # Filter out zero values from each series
+    q_cont_filtered = [t for t in q_cont_times if t > 0]
+    q_disc_filtered = [t for t in q_disc_times if t > 0]
+    sp_cont_filtered = [t for t in sp_cont_times if t > 0]
+    sp_disc_filtered = [t for t in sp_disc_times if t > 0]
+
+    # Add Q-learning continuous if available
+    if q_cont_filtered:
+        data.append(q_cont_filtered)
+        labels.append("Q-learning (continuous)")
+        colors.append("#2ecc71")  # Green
+
+    # Add Q-learning discrete if available
+    if q_disc_filtered:
+        data.append(q_disc_filtered)
+        labels.append("Q-learning (discrete)")
+        colors.append("#27ae60")  # Darker green
+
+    # Add SP continuous if available
+    if sp_cont_filtered:
+        data.append(sp_cont_filtered)
         labels.append("SP (continuous)")
-        colors.append("#3498db")
+        colors.append("#3498db")  # Blue
 
-    if sp_disc_times:
-        data.append(sp_disc_times)
+    # Add SP discrete if available
+    if sp_disc_filtered:
+        data.append(sp_disc_filtered)
         labels.append("SP (discrete)")
-        colors.append("#e74c3c")
+        colors.append("#e74c3c")  # Red
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    box = ax.boxplot(data, patch_artist=True, tick_labels=labels)
+    if not data:
+        raise ValueError("No data to plot")
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    box = ax.boxplot(data, patch_artist=True, tick_labels=labels, showmeans=True, meanline=True)
 
     for patch, color in zip(box["boxes"], colors):
         patch.set_facecolor(color)
@@ -77,11 +114,13 @@ def create_boxplot(
 
     plt.setp(box["whiskers"], color="black")
     plt.setp(box["caps"], color="black")
-    plt.setp(box["medians"], color="black")
+    plt.setp(box["medians"], visible=False)  # Hide median line
+    plt.setp(box["means"], color="black", linewidth=2)  # Show mean as line (same style as median)
     plt.setp(box["fliers"], markeredgecolor="black")
 
     ax.set_ylabel("Average time (s)")
     ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=45, ha="right")
 
     stats_lines = []
     for label, series in zip(labels, data):
@@ -94,7 +133,7 @@ def create_boxplot(
         "\n".join(stats_lines),
         transform=ax.transAxes,
         va="top",
-        fontsize=10,
+        fontsize=9,
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.6),
     )
 
@@ -102,6 +141,146 @@ def create_boxplot(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Saved boxplot to {output_path}")
+
+
+def create_scatter_plot(
+    q_cont_times: List[float],
+    sp_cont_times: List[float],
+    output_path: Path,
+    labels: List[str] = None,
+) -> None:
+    """Create a scatter plot comparing Q-learning (continuous) vs SP (continuous) times."""
+    # Filter out zero values (pairwise) and keep corresponding labels
+    if labels:
+        filtered_data = [(q, s, l) for q, s, l in zip(q_cont_times, sp_cont_times, labels) if q > 0 and s > 0]
+        q_vals = [d[0] for d in filtered_data]
+        sp_vals = [d[1] for d in filtered_data]
+        filtered_labels = [d[2] for d in filtered_data]
+    else:
+        filtered_data = [(q, s) for q, s in zip(q_cont_times, sp_cont_times) if q > 0 and s > 0]
+        q_vals = [d[0] for d in filtered_data]
+        sp_vals = [d[1] for d in filtered_data]
+        filtered_labels = None
+    
+    if not q_vals:
+        raise ValueError("No non-zero pairs found after filtering")
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Create scatter plot
+    if filtered_labels and len(set(filtered_labels)) > 1:
+        # If we have labels (e.g., from different files), use different colors
+        unique_labels = sorted(list(set(filtered_labels)))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+        for i, label in enumerate(unique_labels):
+            indices = [j for j, l in enumerate(filtered_labels) if l == label]
+            ax.scatter([q_vals[j] for j in indices], [sp_vals[j] for j in indices],
+                      label=label, alpha=0.6, s=50, color=colors[i], zorder=2)
+    else:
+        ax.scatter(q_vals, sp_vals, alpha=0.6, s=50, color='#2ecc71', zorder=2)
+    
+    # Add diagonal line (y = x) for reference
+    max_val = max(max(q_vals), max(sp_vals))
+    min_val = min(min(q_vals), min(sp_vals))
+    ax.plot([min_val, max_val], [min_val, max_val], 
+            'r--', linewidth=2, label='y=x (equal performance)', alpha=0.7, zorder=1)
+    
+    ax.set_xlabel('Q-learning (continuous) avg time (s)', fontsize=12)
+    ax.set_ylabel('SP (continuous) avg time (s)', fontsize=12)
+    ax.set_title('Q-learning vs Shortest Path (Continuous)', fontsize=14, fontweight='bold')
+    ax.grid(alpha=0.3)
+    ax.legend()
+    
+    # Add statistics text
+    mean_q = np.mean(q_vals)
+    mean_sp = np.mean(sp_vals)
+    improvement = ((mean_sp - mean_q) / mean_sp) * 100 if mean_sp > 0 else 0
+    stats_text = f"Mean Q-learning: {mean_q:.2f}s\nMean SP: {mean_sp:.2f}s\nQ-learning improvement: {improvement:.1f}%"
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            va='top', fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"Saved scatter plot to {output_path}")
+
+
+def create_improvement_histogram(
+    q_cont_times: List[float],
+    sp_cont_times: List[float],
+    output_path: Path,
+    labels: List[str] = None,
+) -> None:
+    """Create a histogram of Q-learning improvement over SP (Q-learning - SP)."""
+    # Filter out zero values (pairwise) and keep corresponding labels
+    if labels:
+        filtered_data = [(q, s, l) for q, s, l in zip(q_cont_times, sp_cont_times, labels) if q > 0 and s > 0]
+        q_vals = [d[0] for d in filtered_data]
+        sp_vals = [d[1] for d in filtered_data]
+        filtered_labels = [d[2] for d in filtered_data]
+    else:
+        filtered_data = [(q, s) for q, s in zip(q_cont_times, sp_cont_times) if q > 0 and s > 0]
+        q_vals = [d[0] for d in filtered_data]
+        sp_vals = [d[1] for d in filtered_data]
+        filtered_labels = None
+    
+    if not q_vals:
+        raise ValueError("No non-zero pairs found after filtering")
+    
+    # Calculate improvement (negative = Q-learning is better/faster)
+    improvements = [q - s for q, s in zip(q_vals, sp_vals)]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Create histogram
+    if filtered_labels and len(set(filtered_labels)) > 1:
+        # If we have labels (e.g., from different files), use different colors
+        unique_labels = sorted(list(set(filtered_labels)))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+        
+        # Create histogram for each label
+        bins = np.linspace(min(improvements), max(improvements), 30)
+        for i, label in enumerate(unique_labels):
+            indices = [j for j, l in enumerate(filtered_labels) if l == label]
+            label_improvements = [improvements[j] for j in indices]
+            ax.hist(label_improvements, bins=bins, alpha=0.6, label=label, 
+                   color=colors[i], edgecolor='black', linewidth=0.5)
+        ax.legend()
+    else:
+        ax.hist(improvements, bins=30, alpha=0.7, color='#2ecc71', 
+               edgecolor='black', linewidth=0.5)
+    
+    # Add vertical line at zero
+    ax.axvline(0, color='red', linestyle='--', linewidth=2, 
+              label='Equal performance (Q-learning = SP)', zorder=10)
+    
+    ax.set_xlabel('Q-learning improvement (Q-learning - SP) time (s)', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_title('Q-learning Improvement over Shortest Path (Continuous)', 
+                fontsize=14, fontweight='bold')
+    ax.grid(alpha=0.3, axis='y')
+    
+    # Add statistics text
+    mean_improvement = np.mean(improvements)
+    median_improvement = np.median(improvements)
+    better_count = sum(1 for imp in improvements if imp < 0)
+    better_pct = (better_count / len(improvements)) * 100
+    
+    stats_text = (f"Mean improvement: {mean_improvement:.2f}s\n"
+                 f"Median improvement: {median_improvement:.2f}s\n"
+                 f"Q-learning better: {better_count}/{len(improvements)} ({better_pct:.1f}%)\n"
+                 f"Note: Negative values = Q-learning is faster")
+    
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            va='top', fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax.legend()
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"Saved improvement histogram to {output_path}")
 
 
 def main():
@@ -120,59 +299,149 @@ def main():
     )
     parser.add_argument(
         "--normalize_to",
-        choices=["sp_cont", "sp_disc"],
+        choices=["sp_cont", "sp_disc", "q_disc"],
         default=None,
-        help="If set, plot only Q-learning times normalized by the mean SP baseline "
-             "(continuous or discrete).",
+        help="If set, plot normalized times. Options: 'sp_cont' or 'sp_disc' normalizes "
+             "Q-learning (continuous) by SP baseline; 'q_disc' normalizes Q-learning (continuous) "
+             "by Q-learning (discrete).",
+    )
+    parser.add_argument(
+        "--scatter",
+        action="store_true",
+        help="Create a scatter plot comparing Q-learning (continuous) vs SP (continuous) times.",
+    )
+    parser.add_argument(
+        "--improvement",
+        action="store_true",
+        help="Create a histogram of Q-learning improvement over SP (Q-learning - SP times).",
     )
     args = parser.parse_args()
 
-    all_q, all_spc, all_spd = [], [], []
+    all_q_cont, all_q_disc, all_spc, all_spd = [], [], [], []
+    file_labels = []  # Track which file each data point comes from
     for log_path in args.log_paths:
         if not log_path.exists():
             raise FileNotFoundError(f"{log_path} does not exist")
-        q_times, sp_cont_times, sp_disc_times = extract_times(log_path)
-        all_q.extend(q_times)
+        q_cont_times, q_disc_times, sp_cont_times, sp_disc_times = extract_times(log_path)
+        all_q_cont.extend(q_cont_times)
+        all_q_disc.extend(q_disc_times)
         all_spc.extend(sp_cont_times)
         all_spd.extend(sp_disc_times)
+        # Create labels for scatter plot (extract offset or use filename)
+        if len(args.log_paths) > 1:
+            # Extract offset from filename if possible
+            offset_match = re.search(r'offset([\d.]+)', str(log_path))
+            if offset_match:
+                label = f"offset {offset_match.group(1)}"
+            else:
+                label = log_path.stem
+            file_labels.extend([label] * len(q_cont_times))
+        else:
+            file_labels.extend([None] * len(q_cont_times))
 
     # Default output: if multiple files, append '_combined_boxplot'
     if args.output is None:
         if len(args.log_paths) == 1:
-            output_path = args.log_paths[0].with_name(f"{args.log_paths[0].stem}_boxplot.png")
+            if args.scatter:
+                output_path = args.log_paths[0].with_name(f"{args.log_paths[0].stem}_scatter.png")
+            elif args.improvement:
+                output_path = args.log_paths[0].with_name(f"{args.log_paths[0].stem}_improvement.png")
+            else:
+                output_path = args.log_paths[0].with_name(f"{args.log_paths[0].stem}_boxplot.png")
         else:
             first = args.log_paths[0]
-            output_path = first.with_name(f"{first.stem}_combined_boxplot.png")
+            if args.scatter:
+                output_path = first.with_name(f"{first.stem}_combined_scatter.png")
+            elif args.improvement:
+                output_path = first.with_name(f"{first.stem}_combined_improvement.png")
+            else:
+                output_path = first.with_name(f"{first.stem}_combined_boxplot.png")
     else:
         output_path = args.output
 
-    # Normalized mode: plot only Q-learning times normalized by chosen SP baseline
+    # Scatter plot mode: compare Q-learning vs SP
+    if args.scatter:
+        if not all_q_cont or not all_spc:
+            raise ValueError("Need both Q-learning (continuous) and SP (continuous) times for scatter plot")
+        if len(all_q_cont) != len(all_spc):
+            raise ValueError(f"Mismatch: {len(all_q_cont)} Q-cont values vs {len(all_spc)} SP-cont values")
+        
+        labels = file_labels if len(args.log_paths) > 1 else None
+        create_scatter_plot(all_q_cont, all_spc, output_path, labels)
+        return
+
+    # Improvement histogram mode: Q-learning - SP
+    if args.improvement:
+        if not all_q_cont or not all_spc:
+            raise ValueError("Need both Q-learning (continuous) and SP (continuous) times for improvement histogram")
+        if len(all_q_cont) != len(all_spc):
+            raise ValueError(f"Mismatch: {len(all_q_cont)} Q-cont values vs {len(all_spc)} SP-cont values")
+        
+        labels = file_labels if len(args.log_paths) > 1 else None
+        create_improvement_histogram(all_q_cont, all_spc, output_path, labels)
+        return
+
+    # Normalized mode: plot normalized times
     if args.normalize_to is not None:
         import numpy as np  # local import to keep dependency explicit
 
         if args.normalize_to == "sp_cont":
             if not all_spc:
                 raise ValueError("No SP (continuous) times found to normalize against")
-            base_mean = float(np.mean(all_spc))
+            if not all_q_cont:
+                raise ValueError("No Q-learning (continuous) times found")
+            if len(all_q_cont) != len(all_spc):
+                raise ValueError(f"Mismatch: {len(all_q_cont)} Q-cont values vs {len(all_spc)} SP-cont values")
             base_label = "SP (continuous)"
-        else:  # sp_disc
+            # Pairwise normalization: each Q-cont / corresponding SP-cont, filter out zeros
+            norm_q = [q / s for q, s in zip(all_q_cont, all_spc) if q > 0 and s > 0]
+            if not norm_q:
+                raise ValueError("No non-zero pairs found after filtering")
+            data = [norm_q]
+            labels = [f"Q-learning (continuous) / {base_label}"]
+            colors = ["#2ecc71"]
+        elif args.normalize_to == "sp_disc":
             if not all_spd:
                 raise ValueError("No SP (discrete) times found to normalize against")
-            base_mean = float(np.mean(all_spd))
+            if not all_q_cont:
+                raise ValueError("No Q-learning (continuous) times found")
+            if len(all_q_cont) != len(all_spd):
+                raise ValueError(f"Mismatch: {len(all_q_cont)} Q-cont values vs {len(all_spd)} SP-disc values")
             base_label = "SP (discrete)"
-
-        norm_q = [t / base_mean for t in all_q]
+            # Pairwise normalization: each Q-cont / corresponding SP-disc, filter out zeros
+            norm_q = [q / s for q, s in zip(all_q_cont, all_spd) if q > 0 and s > 0]
+            if not norm_q:
+                raise ValueError("No non-zero pairs found after filtering")
+            data = [norm_q]
+            labels = [f"Q-learning (continuous) / {base_label}"]
+            colors = ["#2ecc71"]
+        else:  # q_disc
+            if not all_q_disc:
+                raise ValueError("No Q-learning (discrete) times found to normalize against")
+            if not all_q_cont:
+                raise ValueError("No Q-learning (continuous) times found")
+            if len(all_q_cont) != len(all_q_disc):
+                raise ValueError(f"Mismatch: {len(all_q_cont)} Q-cont values vs {len(all_q_disc)} Q-disc values")
+            base_label = "Q-learning (discrete)"
+            # Pairwise normalization: each Q-cont / corresponding Q-disc, filter out zeros
+            norm_q = [q / s for q, s in zip(all_q_cont, all_q_disc) if q > 0 and s > 0]
+            if not norm_q:
+                raise ValueError("No non-zero pairs found after filtering")
+            data = [norm_q]
+            labels = [f"Q-learning (continuous) / {base_label}"]
+            colors = ["#2ecc71"]
 
         fig, ax = plt.subplots(figsize=(6, 5))
-        box = ax.boxplot([norm_q], patch_artist=True, tick_labels=[f"Q-learning / {base_label}"])
-        box["boxes"][0].set_facecolor("#2ecc71")
+        box = ax.boxplot(data, patch_artist=True, tick_labels=labels, showmeans=True, meanline=True)
+        box["boxes"][0].set_facecolor(colors[0])
         box["boxes"][0].set_alpha(0.7)
         plt.setp(box["whiskers"], color="black")
         plt.setp(box["caps"], color="black")
-        plt.setp(box["medians"], color="black")
+        plt.setp(box["medians"], visible=False)  # Hide median line
+        plt.setp(box["means"], color="black", linewidth=2)  # Show mean as line (same style as median)
 
         ax.axhline(1.0, color="gray", linestyle="--", linewidth=1)
-        ax.set_ylabel("Normalized time (ratio to baseline mean)")
+        ax.set_ylabel("Normalized time (ratio to baseline, pairwise)")
         ax.grid(axis="y", alpha=0.3)
 
         mean_val = float(np.mean(norm_q))
@@ -193,8 +462,8 @@ def main():
         print(f"Saved normalized boxplot to {output_path}")
         return
 
-    # Default: 3-series boxplot (Q, SP continuous, SP discrete)
-    create_boxplot(all_q, all_spc, all_spd, output_path)
+    # Default: 4-series boxplot (Q-continuous, Q-discrete, SP-continuous, SP-discrete)
+    create_boxplot(all_q_cont, all_q_disc, all_spc, all_spd, output_path)
 
 
 if __name__ == "__main__":

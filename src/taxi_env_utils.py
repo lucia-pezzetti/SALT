@@ -123,14 +123,14 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
             data = pickle.load(f)
             traffic_params = data['traffic_params']
             
-            # Check if traffic_params is in old format and needs conversion
+            # Check if traffic_params is in wrong format and needs conversion
             if isinstance(traffic_params, dict):
-                # Rebuild traffic params in new format
+                # Rebuild traffic params in correct format
                 G = data['G']
                 node_to_idx = data['node_to_idx']
                 max_deg = max(dict(G.out_degree()).values())
                 periods, green_durations, offsets = build_traffic_params(
-                    G, node_to_idx, args.cycle_length, args.offset, seed=42, max_deg=max_deg
+                    G, node_to_idx, args.cycle_length, args.offset, seed=42, max_deg=max_deg, random_offsets=getattr(args, 'random_offsets', False)
                 )
                 traffic_params = (periods, green_durations, offsets)
                 # Update cache
@@ -150,11 +150,24 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
                 
                 # If we don't have the metadata, reload it
                 if nodes_gdf is None or node_to_zone is None or zone_to_nodes is None:
-                    G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(
+                    G, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(
                         place_name=args.place_name, 
                         zone_shp=args.zone_shp, 
                         no_congestion=args.no_congestion
                     )
+                else:
+                    # Get zone_name_to_locationID from cache or reload if needed
+                    zone_name_to_locationID = data.get('zone_name_to_locationID')
+                    if zone_name_to_locationID is None:
+                        # Reload just to get the mapping
+                        _, _, _, _, zone_name_to_locationID = load_graph(
+                            place_name=args.place_name, 
+                            zone_shp=args.zone_shp, 
+                            no_congestion=args.no_congestion
+                        )
+                
+                start_zones = getattr(args, 'start_zones', None)
+                pickup_zones = getattr(args, 'pickup_zones', None)
                 
                 fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
                     G,
@@ -163,6 +176,9 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
                     zone_to_nodes,
                     all=args.all_nodes_starts_pickups,
                     seed=seed,
+                    start_zones=start_zones,
+                    pickup_zones=pickup_zones,
+                    zone_name_to_locationID=zone_name_to_locationID,
                 )
                 fixed_starts_idx = jnp.array(fixed_starts_idx, dtype=jnp.int32)
                 fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
@@ -181,25 +197,50 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
 
             return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
     
-    # Build Manhattan graph
+    # If not cached, build the graph
     start_time = time.time()
     
     G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params = build_env(args)
     
     build_time = time.time() - start_time
 
-    # Cache the graph
+    # If specified, cache the graph
     if cache_file is not None:
+        # Get zone metadata for caching (if Manhattan env)
+        # We need to get this from build_env, but since build_env is called separately,
+        # we'll reload it here for caching purposes
+        nodes_gdf = None
+        node_to_zone = None
+        zone_to_nodes = None
+        zone_name_to_locationID = None
+        if args.env_type == 'manhattan':
+            # Reload to get zone metadata for caching
+            _, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(
+                place_name=args.place_name,
+                zone_shp=args.zone_shp,
+                no_congestion=args.no_congestion
+            )
+        
         # Cache graph
         with open(cache_file, 'wb') as f:
-            pickle.dump({
+            cache_data = {
                 'G': G,
                 'node_to_idx': node_to_idx,
                 'idx_to_node': idx_to_node,
                 'fixed_starts_idx': fixed_starts_idx,
                 'fixed_pickups_idx': fixed_pickups_idx,
                 'traffic_params': traffic_params
-            }, f)
+            }
+            # Add zone metadata if available
+            if nodes_gdf is not None:
+                cache_data['nodes_gdf'] = nodes_gdf
+            if node_to_zone is not None:
+                cache_data['node_to_zone'] = node_to_zone
+            if zone_to_nodes is not None:
+                cache_data['zone_to_nodes'] = zone_to_nodes
+            if zone_name_to_locationID is not None:
+                cache_data['zone_name_to_locationID'] = zone_name_to_locationID
+            pickle.dump(cache_data, f)
     
     return G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params
 
@@ -211,9 +252,12 @@ def build_env(args):
     """
     if args.env_type == 'manhattan':
         # --- Load and preprocess Manhattan graph ---
-        G, nodes_gdf, node_to_zone, zone_to_nodes = load_graph(place_name = args.place_name, zone_shp = args.zone_shp, no_congestion= args.no_congestion)
+        G, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(place_name = args.place_name, zone_shp = args.zone_shp, no_congestion= args.no_congestion)
 
         seed = getattr(args, 'seed', None)
+        start_zones = getattr(args, 'start_zones', None)
+        pickup_zones = getattr(args, 'pickup_zones', None)
+                
         fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node = fixed_starts_pickups(
             G,
             nodes_gdf,
@@ -221,6 +265,9 @@ def build_env(args):
             zone_to_nodes,
             all=args.all_nodes_starts_pickups,
             seed=seed,
+            start_zones=start_zones,
+            pickup_zones=pickup_zones,
+            zone_name_to_locationID=zone_name_to_locationID,
         )
         fixed_starts_idx  = jnp.array(fixed_starts_idx, dtype=jnp.int32)
         fixed_pickups_idx = jnp.array(fixed_pickups_idx, dtype=jnp.int32)
@@ -249,7 +296,7 @@ def build_env(args):
     # Compute max_deg for traffic params
     max_deg = max(dict(G.out_degree()).values())
     periods, green_durations, offsets = build_traffic_params(
-        G, node_to_idx, args.cycle_length, args.offset, seed=42, max_deg=max_deg
+        G, node_to_idx, args.cycle_length, args.offset, seed=42, max_deg=max_deg, random_offsets=getattr(args, 'random_offsets', False)
     )
     traffic_params = (periods, green_durations, offsets)
 
@@ -428,6 +475,7 @@ def build_traffic_params(G: nx.DiGraph,
                          offset: float = 0.0,
                          seed: int = 0,
                          max_deg: int = None,
+                         random_offsets: bool = False,
                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     For each edge (at the end of each edge), look at the highway type of that edge
@@ -438,6 +486,10 @@ def build_traffic_params(G: nx.DiGraph,
       • Tertiary:        cycle/green = 60/60 (always green)
       • Residential/Living street: cycle/green = 60/18 (30% green)
       • Otherwise:       cycle/green = 60/60 (always green)
+    
+    Args:
+        random_offsets: If True, each traffic light gets a random offset between 0 and cycle_length.
+                       If False, all traffic lights use the same offset value.
     
     Returns arrays of shape [num_nodes, max_deg] for periods, green_durations, and offsets.
     """
@@ -450,6 +502,10 @@ def build_traffic_params(G: nx.DiGraph,
     periods = np.zeros((num_nodes, max_deg), dtype=np.float32)
     green_durations = np.zeros((num_nodes, max_deg), dtype=np.float32)
     offsets_arr = np.zeros((num_nodes, max_deg), dtype=np.float32)
+    
+    # Initialize random number generator for random offsets if needed
+    if random_offsets:
+        rng = np.random.RandomState(seed)
     
     for i, node in enumerate(node_list):
         neighbors = list(G.successors(node))
@@ -480,7 +536,11 @@ def build_traffic_params(G: nx.DiGraph,
             
             periods[i, j] = cycle
             green_durations[i, j] = green
-            offsets_arr[i, j] = offset
+            if random_offsets:
+                # Generate random integer offset between 0 and cycle_length (exclusive)
+                offsets_arr[i, j] = float(rng.randint(0, int(cycle_length)))
+            else:
+                offsets_arr[i, j] = offset
         
         # Pad with first edge's params if needed (same as adj_list padding)
         if 0 < n_neighbors < max_deg:
