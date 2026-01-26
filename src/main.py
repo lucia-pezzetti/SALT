@@ -78,8 +78,7 @@ parser.add_argument("--env_type", type=str, choices=["manhattan", "simple"], def
 parser.add_argument("--num_layers", type=int, default=4, help="Number of layers in the customised grid environment")
 parser.add_argument("--layer_width", type=int, default=3, help="Width of each layer in the customised grid environment")
 parser.add_argument("--offset", type=float, default=0.0, help="Offset for the customised grid environment")
-parser.add_argument("--random_offsets", action="store_true", help="Use random offsets for each traffic light instead of uniform offset")
-parser.add_argument("--cycle_length", type=int, default=90, help="Cycle length for the customised grid environment")
+parser.add_argument("--cycle_length", type=int, default=200, help="Cycle length for the customised grid environment")
 parser.add_argument("--no_congestion", type=bool, default=False, help="different types of roads have different congestion levels")
 parser.add_argument("--place_name", type=str, default="Manhattan, New York City, New York, USA", help="Place name for the graph (used for Manhattan)")
 parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zones.shp", help="Path to the shapefile for zones (used for Manhattan)")
@@ -106,12 +105,6 @@ parser.add_argument(
     default=None,
     help="Path to save/load tabular Q-learning state when --discrete is set",
 )
-parser.add_argument(
-    "--init_q_table_path",
-    type=str,
-    default=None,
-    help="Path to a saved Q-table file to use for initialization (discrete mode only). The Q-table will be loaded to initialize the agent, but hyperparameters will be taken from current arguments.",
-)
 parser.add_argument("--pretrain_ckpt", type=str, default="pretrained_params.pkl", help="Checkpoint file for pretrained parameters")
 parser.add_argument("--model", type=str, default="ppo", choices=["dqn", "mcts", "ppo"])
 parser.add_argument("--config", "-c", type=str, default="config.json", help="Path to configuration file")
@@ -130,28 +123,14 @@ parser.add_argument(
     action="store_true",
     help="Use every node in the graph as an eligible fixed start and pickup location",
 )
-parser.add_argument(
-    "--start_zones",
-    nargs='+',
-    default=None,
-    help="One or more zones to use for start points only. Can be LocationIDs (integers) or zone names (strings). Example: --start_zones 100 or --start_zones 'Upper East Side North' 'Yorkville West'. If not provided, all nodes are used. If only --start_zones is provided, all nodes are used for pickups.",
-)
-parser.add_argument(
-    "--pickup_zones",
-    nargs='+',
-    default=None,
-    help="One or more zones to use for pickup points only. Can be LocationIDs (integers) or zone names (strings). Example: --pickup_zones 200 or --pickup_zones 'Lenox Hill West' 'Upper East Side South'. If not provided, all nodes are used. If only --pickup_zones is provided, all nodes are used for starts.",
-)
 parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility (affects starts/pickups selection)")
-parser.add_argument("--discrete", action="store_true", help="Use discrete time discretization and tabular Q-learning instead of PPO")
-parser.add_argument("--dt", type=float, default=1.0, help="Time discretization step in seconds (default: 1.0, used when --discrete is set)")
+parser.add_argument("--discrete", action="store_true", help="Use discrete time discretization (dt=5) and tabular Q-learning instead of PPO")
 parser.add_argument("--pretrain_enabled", action="store_true", help="Enable shortest path pretraining for Q-learning (discrete mode only)")
 parser.add_argument("--num_pretrain_episodes", type=int, default=10000, help="Number of pretraining episodes using shortest path rollouts (for Q-learning)")
 parser.add_argument("--pretrain_learning_rate", type=float, default=None, help="Learning rate for pretraining (default: None = use agent's LR). Recommended: 0.01-0.05 when using --init_from_shortest_paths")
 parser.add_argument("--init_from_shortest_paths", action="store_true", help="Initialize Q-table from shortest path travel times (discrete mode only)")
 parser.add_argument("--init_all_time_slices", action="store_true", help="Initialize Q-table for all time slices (up to 100) instead of just time=0 (requires --init_from_shortest_paths)")
 parser.add_argument("--eval_only_sp", action="store_true", help="Run shortest-path baselines (continuous + discrete) and exit (discrete/Q-learning pipeline)")
-parser.add_argument("--sample_starts_from_three_fixed", action="store_true", help="Sample starting nodes with repetition from three randomly chosen fixed nodes (chosen at start of training and kept fixed). Pickups still sampled from all nodes.")
 
 args = parser.parse_args()
 
@@ -161,34 +140,7 @@ if args.fixed_eval:
         raise ValueError("When using --fixed_eval, both --fixed_starts and --fixed_pickups must be provided")
     if len(args.fixed_starts) != len(args.fixed_pickups):
         raise ValueError("--fixed_starts and --fixed_pickups must have the same length")
-
-# Validate zone-based filtering parameters
-# Default: both None (all nodes)
-# If only one is provided, the other defaults to None (all nodes)
-# If both are provided, use both as specified
-
-# Convert string numbers to integers if they look like numbers
-def convert_zone(zone):
-    """Convert zone to appropriate type (int if numeric, str otherwise)."""
-    if isinstance(zone, str):
-        # Try to convert to int if it's a numeric string
-        try:
-            return int(zone)
-        except ValueError:
-            # It's a zone name, keep as string
-            return zone
-    return zone
-
-# Validate and convert zones if provided
-if args.start_zones is not None:
-    if len(args.start_zones) < 1:
-        raise ValueError("--start_zones must contain at least 1 zone (LocationIDs or zone names)")
-    args.start_zones = [convert_zone(z) for z in args.start_zones]
-
-if args.pickup_zones is not None:
-    if len(args.pickup_zones) < 1:
-        raise ValueError("--pickup_zones must contain at least 1 zone (LocationIDs or zone names)")
-    args.pickup_zones = [convert_zone(z) for z in args.pickup_zones]
+    # print(f"Fixed evaluation mode: starts={args.fixed_starts}, pickups={args.fixed_pickups}")
 
 # Optimize JAX configuration
 optimize_jax_config()
@@ -211,7 +163,6 @@ if args.params_dir is None:
 
 # --- Load or build the environment with caching ---
 if args.env_type == "manhattan":
-    # if specified, load the graph from the cache file
     # graph_cache_file = os.path.join(args.cache_dir, "manhattan_graph_4zones_1pair.pkl")
     graph_cache_file = None
 else:
@@ -232,7 +183,7 @@ adj_list = jax.device_put(jnp.array(adj_list, dtype=jnp.int32))
 travel_times = jax.device_put(jnp.array(travel_times, dtype=jnp.float32))
 neighbor_mask_static = jax.device_put(jnp.array(neighbor_mask_static, dtype=bool))
 
-# Precompute shortest-path distance matrix
+# --- Precompute shortest-path distance matrix with parallel processing ---
 if args.env_type == "manhattan":
     # distance_cache_file = os.path.join(args.cache_dir, "manhattan_distances_4zones_1pair.pkl")
     distance_cache_file = None
@@ -242,34 +193,17 @@ dist_mat, hop_dist_mat, max_length, paths_dict = load_or_compute_distance_matrix
     G, node_to_idx, distance_cache_file, args.num_workers
 )
 
-# Place distance matrices on GPU
+# Place distance matrices on GPU for faster access
 distances = jax.device_put(jnp.array(dist_mat, dtype=jnp.float32))
 hop_distances = jax.device_put(jnp.array(hop_dist_mat, dtype=jnp.float32))
+# print(f"Max shortest path: {max_length}")
 
-# Handle restricted starts sampling if flag is enabled (BEFORE creating environment)
-if getattr(args, 'sample_starts_from_three_fixed', False):
-    # Randomly select 3 nodes from all available nodes
-    all_nodes_list = list(node_to_idx.keys())
-    if len(all_nodes_list) < 3:
-        raise ValueError(f"Not enough nodes in graph ({len(all_nodes_list)}). Need at least 3 nodes for --sample_starts_from_three_fixed.")
-    
-    # Use JAX permutation for selection
-    rng_key = jax_random.PRNGKey(args.seed)
-    # Permute indices and take first 3
-    permuted_indices = jax_random.permutation(rng_key, jnp.arange(len(all_nodes_list)))
-    selected_indices = permuted_indices[:3]
-    fixed_starts_idx = [node_to_idx[all_nodes_list[int(idx)]] for idx in selected_indices]
-    print(f"Restricted starts (3 fixed nodes): {fixed_starts_idx}")
-
-# Ensure all fixed arrays are on GPU with consistent dtypes
-fixed_starts_idx = jax.device_put(jnp.array(fixed_starts_idx, dtype=jnp.int32))
-fixed_pickups_idx = jax.device_put(jnp.array(fixed_pickups_idx, dtype=jnp.int32))
-
-# Compute normalized node coordinates for Euclidean distance in reward
+# --- Compute normalized node coordinates for Euclidean distance in reward ---
 from taxi_env_utils import compute_normalized_node_coordinates
 node_coordinates = compute_normalized_node_coordinates(G, node_to_idx)
 
-# Create environment
+# --- Create environment ---
+# print("Creating environment...")
 env = TaxiEnv(
     adj_list=adj_list,
     travel_times=travel_times,
@@ -287,10 +221,10 @@ env = TaxiEnv(
     gamma=args.gamma,   
 )
 
-# Observation function
+# --- Observation function ---
 obs_fn_single, obs_fn_batch = make_obs_fn(env, G, node_to_idx)
 
-# Initialize batched environment states for metrics logging and evaluation
+# --- Initialize batched environment states for metrics logging and evaluation ---
 num_envs = args.num_agents
 key = jax_random.PRNGKey(args.seed)
 key1, key2 = jax_random.split(key)
@@ -305,6 +239,7 @@ pickup_idxs = jax.device_put(sample_pickup)
 
 @jax.jit
 def init_env_batch(keys, starts, pickups, neighbor_mask_static):
+    # now vmap over *three* varying axes
     states, info = jax.vmap(
         init_env,
         in_axes=(0, 0, 0, None),
@@ -321,6 +256,10 @@ batched_states = init_env_batch(
 
 # Pre-compute this once outside the training loop
 estimate_state = EstimateReturnsState.create(rollout_steps=10, gamma=args.gamma)
+
+# Ensure all fixed arrays are on GPU with consistent dtypes
+fixed_starts_idx = jax.device_put(jnp.array(fixed_starts_idx, dtype=jnp.int32))
+fixed_pickups_idx = jax.device_put(jnp.array(fixed_pickups_idx, dtype=jnp.int32))
 
 # Modular early-dispatch for eval-only (keeps legacy block below unreachable)
 ctx = RunContext(

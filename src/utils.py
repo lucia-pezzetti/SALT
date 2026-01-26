@@ -53,10 +53,10 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
     apply_congestion_model(G_scc, multipliers)
 
     # Map zones to nodes, then filter
-    locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf, zone_name_to_locationID = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
+    locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
     # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
     # zone_names = ["Upper East Side North", "Yorkville West"] #, "Upper East Side South", "Lenox Hill West"] 
-    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"] #, "Central Harlem", "Central Harlem North", "Manhattanville", "Hamlton Heights", "Morningside Heights", "Sutton Place/Turtle Bay North", "Manhattan Valley", "Upper West Side North", "Lincoln Square Easr", "Lincoln Square West", "Clinton East", "Clinton West", "Central Park", "Bloomingdale", "Upper West Side South", "Sutton Place/Turtle Bay South", "Midtown East", "Midtown North", "Midtown Center"]   
+    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"]  
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
     loc_ids = filtered_zones["LocationID"].tolist()
@@ -75,7 +75,7 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
     largest_cc = max(nx.strongly_connected_components(G_scc), key=len)
     G_scc = G_scc.subgraph(largest_cc).copy()
 
-    return G_scc, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID
+    return G_scc, nodes_gdf, node_to_zone, zone_to_nodes
 
 
 def load_taxi_data(rides_path: str,
@@ -111,7 +111,6 @@ def compute_zone_mappings(G_scc: nx.DiGraph,
     """
     Build mappings from LocationID → list of node IDs and node → zone.
     Also returns the nodes GeoDataFrame (with 'zone' column).
-    Returns zone_name_to_locationID mapping for converting zone names to LocationIDs.
     """
     # Nodes as GeoDataFrame
     nodes = ox.graph_to_gdfs(G_scc, nodes=True, edges=False)
@@ -122,28 +121,6 @@ def compute_zone_mappings(G_scc: nx.DiGraph,
 
     # Load taxi zones shapefile
     gdf_zones = gpd.read_file(zone_shp_path).to_crs("EPSG:4326")
-
-    # Build mapping from zone name to LocationID
-    # The shapefile should have both 'zone' (name) and 'LocationID' columns
-    zone_name_to_locationID = {}
-    if 'zone' in gdf_zones.columns and 'LocationID' in gdf_zones.columns:
-        for _, row in gdf_zones.iterrows():
-            zone_name = row['zone']
-            loc_id = row['LocationID']
-            zone_name_to_locationID[zone_name] = loc_id
-    else:
-        # Fallback: if zone column doesn't exist, try other common column names
-        zone_col = None
-        for col in ['zone', 'Zone', 'ZONE', 'zone_name', 'ZoneName']:
-            if col in gdf_zones.columns:
-                zone_col = col
-                break
-        
-        if zone_col and 'LocationID' in gdf_zones.columns:
-            for _, row in gdf_zones.iterrows():
-                zone_name = row[zone_col]
-                loc_id = row['LocationID']
-                zone_name_to_locationID[zone_name] = loc_id
 
     # Spatial join
     nodes_in_zones = gpd.sjoin(
@@ -165,7 +142,7 @@ def compute_zone_mappings(G_scc: nx.DiGraph,
     }
     nodes_gdf['zone'] = nodes_gdf.index.map(node_to_zone)
 
-    return locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf, zone_name_to_locationID
+    return locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf
 
 
 def apply_congestion_model(G_scc: nx.DiGraph,
@@ -252,123 +229,20 @@ def fixed_starts_pickups(G: nx.DiGraph,
                          node_to_zone: dict,
                          zone_to_nodes: dict,
                          all: bool = True,
-                         seed: int = None,
-                         start_zones: list = None,
-                         pickup_zones: list = None,
-                         zone_name_to_locationID: dict = None) -> tuple:
+                         seed: int = None) -> tuple:
     """
     Choose fixed start & pickup nodes for the environment.
     If all=True, use all nodes as starts/pickups.
-    If start_zones and pickup_zones are provided, filter nodes by zones.
     Otherwise, use one node per zone.
     
     Args:
         seed: Random seed for reproducibility. If None, uses current random state.
-        start_zones: List of LocationIDs (zones) or zone names to use for start points only.
-        pickup_zones: List of LocationIDs (zones) or zone names to use for pickup points only.
-        zone_name_to_locationID: Optional mapping from zone names to LocationIDs for conversion.
     """
 
     all_nodes = list(G.nodes())
     print(f"Number of nodes: {len(all_nodes)}")
     node_to_idx = {n: i for i, n in enumerate(all_nodes)}
     idx_to_node = [n for n, _ in sorted(node_to_idx.items(), key=lambda x: x[1])]
-
-    # Zone-based filtering for starts and pickups (takes precedence over 'all' flag)
-    # Handle cases: both provided, only start_zones, only pickup_zones, or neither
-    if start_zones is not None or pickup_zones is not None:
-        # Convert zone names to LocationIDs if needed
-        def convert_to_locationID(zone_input, zone_name_to_locationID):
-            """Convert zone input (name or LocationID) to LocationID."""
-            if isinstance(zone_input, str):
-                # It's a zone name, try to convert
-                if zone_name_to_locationID is None:
-                    raise ValueError(f"Zone name '{zone_input}' provided but zone_name_to_locationID mapping not available")
-                if zone_input not in zone_name_to_locationID:
-                    raise ValueError(f"Zone name '{zone_input}' not found in zone mapping. Available zones: {list(zone_name_to_locationID.keys())[:10]}...")
-                return zone_name_to_locationID[zone_input]
-            elif isinstance(zone_input, int):
-                # It's already a LocationID
-                return zone_input
-            else:
-                raise ValueError(f"Zone must be either a string (zone name) or integer (LocationID), got {type(zone_input)}")
-        
-        # Filter zone_to_nodes to only include nodes that are actually in the graph
-        graph_nodes_set = set(all_nodes)
-        filtered_zone_to_nodes = {
-            loc_id: [n for n in nodes if n in graph_nodes_set]
-            for loc_id, nodes in zone_to_nodes.items()
-        }
-        
-        # Process start zones if provided
-        if start_zones is not None:
-            if len(start_zones) < 1:
-                raise ValueError("start_zones must contain at least 1 zone (LocationIDs or zone names)")
-            
-            # Convert start zones
-            start_location_ids = []
-            for zone in start_zones:
-                try:
-                    loc_id = convert_to_locationID(zone, zone_name_to_locationID)
-                    start_location_ids.append(loc_id)
-                except ValueError as e:
-                    raise ValueError(f"Error processing start zone '{zone}': {e}")
-            
-            # Collect all nodes from start zones
-            start_nodes = []
-            for zone_id in start_location_ids:
-                if zone_id in filtered_zone_to_nodes:
-                    start_nodes.extend(filtered_zone_to_nodes[zone_id])
-                else:
-                    print(f"Warning: Zone {zone_id} not found in graph, skipping...")
-            
-            if not start_nodes:
-                raise ValueError(f"No nodes found in start zones {start_zones} (LocationIDs: {start_location_ids})")
-            
-            # Convert to indices
-            fixed_starts_idx = [node_to_idx[int(n)] for n in start_nodes if int(n) in node_to_idx]
-            print(f"Selected {len(fixed_starts_idx)} start nodes from zones {start_zones} (LocationIDs: {start_location_ids})")
-        else:
-            # Use all nodes for starts
-            fixed_starts_idx = list(range(len(all_nodes)))
-            print(f"Using all {len(fixed_starts_idx)} nodes for starts")
-        
-        # Process pickup zones if provided
-        if pickup_zones is not None:
-            if len(pickup_zones) < 1:
-                raise ValueError("pickup_zones must contain at least 1 zone (LocationIDs or zone names)")
-            
-            # Convert pickup zones
-            pickup_location_ids = []
-            for zone in pickup_zones:
-                try:
-                    loc_id = convert_to_locationID(zone, zone_name_to_locationID)
-                    pickup_location_ids.append(loc_id)
-                except ValueError as e:
-                    raise ValueError(f"Error processing pickup zone '{zone}': {e}")
-            
-            # Collect all nodes from pickup zones
-            pickup_nodes = []
-            for zone_id in pickup_location_ids:
-                if zone_id in filtered_zone_to_nodes:
-                    pickup_nodes.extend(filtered_zone_to_nodes[zone_id])
-                else:
-                    print(f"Warning: Zone {zone_id} not found in graph, skipping...")
-            
-            if not pickup_nodes:
-                raise ValueError(f"No nodes found in pickup zones {pickup_zones} (LocationIDs: {pickup_location_ids})")
-            
-            # Convert to indices
-            fixed_pickups_idx = [node_to_idx[int(n)] for n in pickup_nodes if int(n) in node_to_idx]
-            print(f"Selected {len(fixed_pickups_idx)} pickup nodes from zones {pickup_zones} (LocationIDs: {pickup_location_ids})")
-        else:
-            # Use all nodes for pickups
-            fixed_pickups_idx = list(range(len(all_nodes)))
-            print(f"Using all {len(fixed_pickups_idx)} nodes for pickups")
-        
-        jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
-        
-        return fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node
 
     # # Set seed if provided
     # if seed is not None:
@@ -609,53 +483,6 @@ def offline_shortest_path_action(current_node, target_node, adj_list, travel_tim
     
     # Local travel time + remaining distance to target
     total_costs = neighbor_travel_times + distances[neighbors, target_node]
-    # Mask invalid neighbors using provided neighbor_mask
-    total_costs = jnp.where(neighbor_mask, total_costs, jnp.inf)
-    return jnp.argmin(total_costs)
-
-# Discrete shortest path actions (with epsilon for zero-time edges to break ties)
-@jax.jit
-def offline_shortest_path_action_discrete(current_node, target_node, adj_list, travel_times, distances, neighbor_mask, epsilon=1e-6):
-    """
-    Computes offline shortest path actions using discretized travel times.
-    Adds a small epsilon to zero-time edges to break ties deterministically.
-    
-    Args:
-        current_node: Current node index
-        target_node: Target node index  
-        adj_list: Adjacency list [N, max_deg]
-        travel_times: Travel times [N, max_deg] (should be discretized)
-        distances: Precomputed travel time distances [N, N]
-        neighbor_mask: Mask indicating valid neighbors [max_deg]
-        epsilon: Small value to add to zero-time edges (default: 1e-6)
-    
-    Returns:
-        action: Index of the shortest path neighbor
-    """
-    neighbors = adj_list[current_node]
-    neighbor_travel_times = travel_times[current_node]
-    
-    # Add epsilon to zero-time edges to break ties
-    # This prevents infinite loops when zero-cost edges exist
-    neighbor_travel_times = jnp.where(
-        neighbor_travel_times == 0.0,
-        epsilon,
-        neighbor_travel_times
-    )
-    
-    # Local travel time + remaining distance to target
-    total_costs = neighbor_travel_times + distances[neighbors, target_node]
-    
-    # Break ties deterministically to prevent infinite loops
-    # Use a small epsilon-based tie-breaker that prefers:
-    # 1. Nodes closer to target (primary tie-breaker)
-    # 2. Nodes with smaller indices (secondary tie-breaker for true ties)
-    epsilon1 = 1e-6
-    epsilon2 = 1e-9
-    tie_breaker1 = epsilon1 * distances[neighbors, target_node]
-    tie_breaker2 = epsilon2 * neighbors.astype(jnp.float32)  # Prefer smaller node indices
-    total_costs = total_costs + tie_breaker1 + tie_breaker2
-    
     # Mask invalid neighbors using provided neighbor_mask
     total_costs = jnp.where(neighbor_mask, total_costs, jnp.inf)
     return jnp.argmin(total_costs)
