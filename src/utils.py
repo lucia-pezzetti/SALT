@@ -60,7 +60,8 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
     loc_ids = filtered_zones["LocationID"].tolist()
-    jax.debug.print("loc_ids: {loc_ids}", loc_ids=loc_ids)
+    # Use regular print instead of jax.debug.print to avoid CPU backend requirement
+    # print(f"Selected location IDs: {loc_ids}")
     selected_nodes = [n for loc_id in loc_ids for n in zone_to_nodes.get(loc_id, [])]
     G_scc = G_scc.subgraph(selected_nodes).copy()
 
@@ -366,7 +367,8 @@ def fixed_starts_pickups(G: nx.DiGraph,
             fixed_pickups_idx = list(range(len(all_nodes)))
             print(f"Using all {len(fixed_pickups_idx)} nodes for pickups")
         
-        jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
+        # Use regular print instead of jax.debug.print to avoid CPU backend requirement
+        # print(f"Fixed starts: {fixed_starts_idx}, fixed pickups: {fixed_pickups_idx}")
         
         return fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node
 
@@ -437,7 +439,8 @@ def fixed_starts_pickups(G: nx.DiGraph,
             fixed_starts_idx = fixed_starts_idx[:min_len]
             fixed_pickups_idx = fixed_pickups_idx[:min_len]
 
-    jax.debug.print("fixed starts: {fixed_starts}, fixed pickups: {fixed_pickups}", fixed_starts=fixed_starts_idx, fixed_pickups=fixed_pickups_idx)
+        # Use regular print instead of jax.debug.print to avoid CPU backend requirement
+        # print(f"Fixed starts: {fixed_starts_idx}, fixed pickups: {fixed_pickups_idx}")
 
     return fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node
 

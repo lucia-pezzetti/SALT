@@ -344,7 +344,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         all_pickup_sets.append(pickup_set)
     
     print(f"Sampled {num_start_sets} sets of {B} starts and {num_pickup_sets} sets of {B} pickups")
-    print(f"Evaluating {num_start_sets} × {num_pickup_sets} = {num_start_sets * num_pickup_sets} combinations with Hungarian matching")
+    print(f"Evaluating {num_start_sets} × {num_pickup_sets} = {num_start_sets * num_pickup_sets} combinations with Hungarian matching (using Q-table estimation, same as training)")
     
     # Create Q-learning greedy policy (needed for matching)
     def q_learning_policy(state: TaxiState) -> int:
@@ -405,19 +405,44 @@ def run_q_learning(args, ctx: RunContext) -> None:
         return jnp.array(cost, dtype=jnp.float32)
     
     def match_pickups(starts, pickups, policy_fn, base_seed, use_discrete):
-        """Assign pickups to starts using Hungarian matching on travel-time cost."""
+        """Assign pickups to starts using Hungarian matching on Q-table estimated returns (same as training)."""
         if len(starts) == 0:
             return pickups, jnp.zeros((0, 0), dtype=jnp.float32)
         
-        cost_matrix = build_cost_matrix(starts, pickups, policy_fn, base_seed, use_discrete)
+        # Use the same fast Q-table-based estimation as during training (not slow simulations)
+        from training.q_learning import _estimate_returns_batch_q_table_direct
+        
+        starts_jax = jnp.array(starts, dtype=jnp.int32)
+        pickups_jax = jnp.array(pickups, dtype=jnp.int32)
+        num_starts = len(starts)
+        num_pickups = len(pickups)
+        
+        # Create all combinations (same as training)
+        starts_expanded = jnp.repeat(starts_jax, num_pickups)
+        pickups_expanded = jnp.tile(pickups_jax, num_starts)
+        
+        # Estimate returns directly from Q-table (batched, fast!)
+        returns_flat = _estimate_returns_batch_q_table_direct(
+            q_agent.q_table,
+            starts_expanded,
+            pickups_expanded,
+            ctx.env.num_nodes,
+            ctx.env,
+        )
+        
+        # Reshape to [num_starts, num_pickups] and convert to cost (negative return)
+        returns_matrix = returns_flat.reshape(num_starts, num_pickups)
+        cost_matrix = -returns_matrix  # Negative because Hungarian minimizes cost
+        
+        # Hungarian algorithm (same as training)
         _, assignment = optax.assignment.hungarian_algorithm(cost_matrix)
-        matched_pickups = jnp.take(pickups, assignment, axis=0)
+        matched_pickups = jnp.take(pickups_jax, assignment, axis=0)
         return matched_pickups, cost_matrix
     
-    # Evaluate all 25 combinations
-    all_rewards = []
-    all_steps = []
-    all_completions = []
+    # Collect all start-pickup pairs first (after matching)
+    all_eval_starts = []
+    all_eval_pickups = []
+    all_eval_seeds = []
     
     for start_set_idx, start_set in enumerate(all_start_sets):
         for pickup_set_idx, pickup_set in enumerate(all_pickup_sets):
@@ -428,48 +453,111 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 start_set, pickup_set, q_learning_policy, base_seed, use_discrete=True
             )
             
-            # Evaluate matched pairs
+            # Collect pairs for batched evaluation
             for start, pickup in zip(start_set, matched_pickups):
-                episode_reward = 0.0
-                episode_steps = 0
-                episode_done = False
-                
-                state = init_env(jax.random.PRNGKey(base_seed), int(start), int(pickup), ctx.env.neighbor_mask_static)[0]
-                
-                # Run episode with greedy policy (epsilon=0) in continuous time
-                for step in range(2 * ctx.max_length):
-                    if state.done:
-                        episode_done = True
-                        break
-                    
-                    # Discretize state time for Q-table lookup
-                    dt = q_agent.dt
-                    discretized_time = dt * round(state.time / dt)
-                    state_for_policy = TaxiState(
-                        current_node=state.current_node,
-                        pickup_node=state.pickup_node,
-                        done=state.done,
-                        step_count=state.step_count,
-                        neighbor_mask=state.neighbor_mask,
-                        time=discretized_time,
-                    )
-                    
-                    action = q_learning_policy(state_for_policy)
-                    
-                    # Use continuous environment step
-                    next_state, reward, done, info = ctx.env.step(state, action)
-                    
-                    episode_reward += float(reward)
-                    episode_steps += 1
-                    state = next_state
-                    
-                    if done:
-                        episode_done = True
-                        break
-                
-                all_rewards.append(episode_reward)
-                all_steps.append(episode_steps)
-                all_completions.append(1.0 if episode_done else 0.0)
+                all_eval_starts.append(int(start))
+                all_eval_pickups.append(int(pickup))
+                all_eval_seeds.append(base_seed)
+    
+    # Convert to JAX arrays for batched evaluation
+    eval_starts_arr = jnp.array(all_eval_starts, dtype=jnp.int32)
+    eval_pickups_arr = jnp.array(all_eval_pickups, dtype=jnp.int32)
+    eval_seeds_arr = jnp.array(all_eval_seeds, dtype=jnp.uint32)
+    
+    # Create batched, JIT-compiled evaluation function
+    @jax.jit
+    def evaluate_batch_episodes(starts, pickups, seeds, q_table, dt, max_time_slices, num_nodes, env, max_steps):
+        """Batched, JIT-compiled evaluation of multiple episodes in parallel."""
+        num_episodes = starts.shape[0]
+        
+        # Initialize states for all episodes using seeds
+        keys = jax.vmap(lambda s: jax.random.PRNGKey(s))(seeds)
+        batch_init = jax.vmap(lambda k, s, p: init_env(k, s, p, env.neighbor_mask_static), in_axes=(0, 0, 0))
+        states, _ = batch_init(keys, starts, pickups)
+        
+        # Initialize tracking arrays
+        episode_rewards = jnp.zeros(num_episodes, dtype=jnp.float32)
+        episode_steps = jnp.zeros(num_episodes, dtype=jnp.int32)
+        episode_dones = jnp.zeros(num_episodes, dtype=jnp.bool_)
+        
+        max_eval_steps = jnp.int32(max_steps)
+        
+        def cond_fn(carry):
+            step, _, _, _, completed_mask = carry
+            all_done = jnp.logical_or(jnp.all(completed_mask), step >= max_eval_steps)
+            return jnp.logical_not(all_done)
+        
+        def body_fn(carry):
+            step, states, rewards_acc, steps_acc, completed_mask = carry
+            
+            # Discretize state time for Q-table lookup (greedy policy, epsilon=0)
+            discretized_times = dt * jnp.round(states.time / dt)
+            
+            # Get state indices for Q-table lookup
+            curr = jnp.clip(states.current_node, 0, num_nodes - 1)
+            pickup = jnp.clip(states.pickup_node, 0, num_nodes - 1)
+            t_idx = jnp.clip(jnp.int32(discretized_times / dt), 0, max_time_slices - 1)
+            
+            # Get Q-values for all actions: [num_episodes, max_deg]
+            q_values = q_table[curr, pickup, t_idx, :]  # [num_episodes, max_deg]
+            
+            # Mask invalid actions
+            valid_mask = states.neighbor_mask  # [num_episodes, max_deg]
+            q_masked = jnp.where(valid_mask, q_values, -jnp.inf)
+            
+            # Greedy action (epsilon=0)
+            actions = jnp.argmax(q_masked, axis=-1)  # [num_episodes]
+            
+            # Take step in continuous environment
+            batch_step = jax.vmap(env.step, in_axes=(0, 0))
+            next_states, rewards, terminals, _ = batch_step(states, actions)
+            
+            # Update accumulators only for active episodes
+            active = ~completed_mask
+            rewards_acc = rewards_acc + rewards * active
+            steps_acc = steps_acc + active.astype(jnp.int32)
+            completed_mask = completed_mask | terminals
+            
+            return (
+                step + jnp.int32(1),
+                next_states,
+                rewards_acc,
+                steps_acc,
+                completed_mask,
+            )
+        
+        init_carry = (
+            jnp.int32(0),
+            states,
+            episode_rewards,
+            episode_steps,
+            episode_dones,
+        )
+        
+        _, final_states, total_rewards, total_steps, completed = jax.lax.while_loop(
+            cond_fn, body_fn, init_carry
+        )
+        
+        return total_rewards, total_steps, completed
+    
+    # Run batched evaluation
+    print(f"Running batched evaluation for {len(all_eval_starts)} episodes...")
+    all_rewards, all_steps, all_completions = evaluate_batch_episodes(
+        eval_starts_arr,
+        eval_pickups_arr,
+        eval_seeds_arr,
+        q_agent.q_table,
+        q_agent.dt,
+        q_agent.max_time_slices,
+        ctx.env.num_nodes,
+        ctx.env,
+        2 * ctx.max_length
+    )
+    
+    # Convert to numpy for final processing
+    all_rewards = np.array(all_rewards)
+    all_steps = np.array(all_steps)
+    all_completions = np.array(all_completions)
     
     final_eval = {
         'avg_reward': np.mean(all_rewards),
@@ -675,9 +763,26 @@ def run_q_learning(args, ctx: RunContext) -> None:
         eval_pickups = jnp.array([jax.random.choice(k, ctx.env.fixed_pickups) for k in pickup_keys])
         base_seed = int(args.seed + i * 1000)
         
-        matched_q_pickups, _ = match_pickups(
-            eval_starts, eval_pickups, q_learning_policy, base_seed, use_discrete=True
+        # Use fast Q-table-based matching for Q-learning (same as training)
+        from training.q_learning import _estimate_returns_batch_q_table_direct
+        starts_jax = jnp.array(eval_starts, dtype=jnp.int32)
+        pickups_jax = jnp.array(eval_pickups, dtype=jnp.int32)
+        num_starts = len(eval_starts)
+        num_pickups = len(eval_pickups)
+        
+        # Q-learning matching: use Q-table estimation (fast)
+        starts_expanded = jnp.repeat(starts_jax, num_pickups)
+        pickups_expanded = jnp.tile(pickups_jax, num_starts)
+        returns_flat = _estimate_returns_batch_q_table_direct(
+            q_agent.q_table, starts_expanded, pickups_expanded,
+            ctx.env.num_nodes, ctx.env
         )
+        returns_matrix = returns_flat.reshape(num_starts, num_pickups)
+        cost_matrix_q = -returns_matrix
+        _, assignment_q = optax.assignment.hungarian_algorithm(cost_matrix_q)
+        matched_q_pickups = jnp.take(pickups_jax, assignment_q, axis=0)
+        
+        # Shortest path matching: use simulation-based (original implementation)
         matched_sp_pickups_cont, _ = match_pickups(
             eval_starts, eval_pickups, sp_policy, base_seed + 1, use_discrete=False
         )

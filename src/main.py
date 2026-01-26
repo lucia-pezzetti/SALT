@@ -11,7 +11,7 @@ jax.config.update('jax_compilation_cache_dir', None)  # Will be set by environme
 
 from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn, load_or_compute_distance_matrix_parallel, load_or_build_graph
 from taxi_env import TaxiEnv, init_env
-from utils import EstimateReturnsState
+from utils import EstimateReturnsState, load_graph
 from modes.context import RunContext
 from modes.eval_only import run_eval_only
 from modes.train_dqn import run_dqn
@@ -38,16 +38,17 @@ def optimize_jax_config():
     
     # Reduce compilation memory usage
     # This helps prevent LLVM from trying to allocate large contiguous memory blocks
-    try:
-        jax.config.update('jax_platform_name', 'cpu')  # Ensure we're using CPU backend
-    except:
-        pass  # Ignore if already set
+    # Note: Platform is set via JAX_PLATFORMS environment variable (CPU/GPU)
+    # try:
+    #     jax.config.update('jax_platform_name', 'cpu')  # Ensure we're using CPU backend
+    # except:
+    #     pass  # Ignore if already set
     
     # Set memory preallocation (respect environment variables if set)
     if 'XLA_PYTHON_CLIENT_PREALLOCATE' not in os.environ:
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     if 'XLA_PYTHON_CLIENT_MEM_FRACTION' not in os.environ:
-        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.3'  # Reduced to prevent OOM
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '1.0'  # 80% memory for GPU
     if 'XLA_PYTHON_CLIENT_ALLOCATOR' not in os.environ:
         os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # Use platform allocator
     
@@ -58,8 +59,9 @@ def optimize_jax_config():
     
     # Add flags to reduce memory pressure during compilation
     # Only use valid XLA flags to avoid crashes
+    # Note: CPU-specific flag removed for GPU compatibility
     flags_to_add = [
-        '--xla_cpu_enable_fast_math=false',  # Disable fast math to reduce memory usage
+        # '--xla_cpu_enable_fast_math=false',  # CPU-specific, disabled for GPU
     ]
     
     for flag in flags_to_add:
@@ -151,7 +153,8 @@ parser.add_argument("--pretrain_learning_rate", type=float, default=None, help="
 parser.add_argument("--init_from_shortest_paths", action="store_true", help="Initialize Q-table from shortest path travel times (discrete mode only)")
 parser.add_argument("--init_all_time_slices", action="store_true", help="Initialize Q-table for all time slices (up to 100) instead of just time=0 (requires --init_from_shortest_paths)")
 parser.add_argument("--eval_only_sp", action="store_true", help="Run shortest-path baselines (continuous + discrete) and exit (discrete/Q-learning pipeline)")
-parser.add_argument("--sample_starts_from_three_fixed", action="store_true", help="Sample starting nodes with repetition from three randomly chosen fixed nodes (chosen at start of training and kept fixed). Pickups still sampled from all nodes.")
+parser.add_argument("--sample_starts_from_three_fixed", action="store_true", help="Sample starting nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Pickups still sampled from all nodes.")
+parser.add_argument("--three_fixed_selection_method", type=str, default="random", choices=["random", "degree", "closeness", "betweenness"], help="Method to select the 3 fixed nodes: 'random' (default), 'degree' (degree centrality), 'closeness' (closeness centrality), 'betweenness' (betweenness centrality)")
 
 args = parser.parse_args()
 
@@ -248,18 +251,274 @@ hop_distances = jax.device_put(jnp.array(hop_dist_mat, dtype=jnp.float32))
 
 # Handle restricted starts sampling if flag is enabled (BEFORE creating environment)
 if getattr(args, 'sample_starts_from_three_fixed', False):
-    # Randomly select 3 nodes from all available nodes
+    import networkx as nx
+    import pickle
+    from utils import load_graph
+    
     all_nodes_list = list(node_to_idx.keys())
     if len(all_nodes_list) < 3:
         raise ValueError(f"Not enough nodes in graph ({len(all_nodes_list)}). Need at least 3 nodes for --sample_starts_from_three_fixed.")
     
-    # Use JAX permutation for selection
-    rng_key = jax_random.PRNGKey(args.seed)
-    # Permute indices and take first 3
-    permuted_indices = jax_random.permutation(rng_key, jnp.arange(len(all_nodes_list)))
-    selected_indices = permuted_indices[:3]
-    fixed_starts_idx = [node_to_idx[all_nodes_list[int(idx)]] for idx in selected_indices]
-    print(f"Restricted starts (3 fixed nodes): {fixed_starts_idx}")
+    # Get node_to_zone mapping to ensure nodes come from different zones
+    node_to_zone = None
+    if args.env_type == "manhattan":
+        # Try to get from cache first (check the same cache file used for graph loading)
+        # For manhattan, graph_cache_file is typically None, so we'll need to recompute
+        # But first check if there's a cached version we can use
+        potential_cache_files = [
+            os.path.join(args.cache_dir, "manhattan_graph.pkl"),
+            os.path.join(args.cache_dir, f"manhattan_graph_{args.place_name.replace(' ', '_').replace(',', '')}.pkl"),
+        ]
+        
+        for cache_file in potential_cache_files:
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'rb') as f:
+                        data = pickle.load(f)
+                        node_to_zone = data.get('node_to_zone')
+                        if node_to_zone is not None:
+                            # Filter to only nodes in our graph
+                            graph_nodes_set = set(all_nodes_list)
+                            node_to_zone = {node: zone for node, zone in node_to_zone.items() if node in graph_nodes_set}
+                            print(f"Loaded zone mapping from cache: {len(node_to_zone)} nodes mapped to zones")
+                            break
+                except Exception as e:
+                    print(f"Could not load zone mapping from {cache_file}: {e}")
+                    continue
+        
+        # If not in cache, recompute it (only for manhattan graphs)
+        if node_to_zone is None:
+            print("Loading zone mapping to ensure nodes from different zones...")
+            # We need to get the zone mapping, but load_graph returns a filtered graph
+            # So we need to get it from the graph that was already loaded
+            # The zone mapping should be in the graph's node attributes or we need to recompute it
+            # Let's try to get it from the already loaded graph by checking node attributes
+            # or by loading the full graph temporarily
+            try:
+                # Try to get zone info from graph node attributes if available
+                sample_node = list(G.nodes())[0] if len(G.nodes()) > 0 else None
+                if sample_node and 'zone' in G.nodes[sample_node]:
+                    # Zones are stored in node attributes
+                    node_to_zone = {node: G.nodes[node].get('zone') for node in all_nodes_list if 'zone' in G.nodes[node]}
+                    print(f"Found zone mapping in graph attributes: {len(node_to_zone)} nodes mapped")
+                else:
+                    # Need to recompute by loading the graph
+                    print("Recomputing zone mapping from shapefile...")
+                    _, _, node_to_zone_temp, _, _ = load_graph(
+                        place_name=args.place_name,
+                        zone_shp=args.zone_shp,
+                        no_congestion=args.no_congestion
+                    )
+                    # Filter to only nodes in our graph
+                    graph_nodes_set = set(all_nodes_list)
+                    node_to_zone = {node: zone for node, zone in node_to_zone_temp.items() if node in graph_nodes_set}
+                    print(f"Computed zone mapping: {len(node_to_zone)} nodes mapped to zones")
+            except Exception as e:
+                print(f"Warning: Could not load zone mapping: {e}")
+                node_to_zone = None
+        
+        # Debug: Print zone distribution
+        if node_to_zone is not None and len(node_to_zone) > 0:
+            zone_counts = {}
+            for node in all_nodes_list:
+                zone = node_to_zone.get(node)
+                if zone is not None:
+                    zone_counts[zone] = zone_counts.get(zone, 0) + 1
+            print(f"Zone distribution: {len(zone_counts)} unique zones, {sum(zone_counts.values())} nodes with zones")
+            print(f"  Top zones by node count: {sorted(zone_counts.items(), key=lambda x: x[1], reverse=True)[:5]}")
+        else:
+            print("Warning: No zone mapping available. Cannot ensure nodes from different zones.")
+    
+    selection_method = getattr(args, 'three_fixed_selection_method', 'random')
+    
+    # Helper function to select nodes ensuring different zones
+    def select_nodes_from_different_zones(candidate_nodes_with_scores, node_to_zone_mapping):
+        """
+        Select 3 nodes ensuring they come from different zones.
+        candidate_nodes_with_scores: list of (node, score) tuples, sorted by score (descending)
+        Returns: list of 3 nodes from different zones
+        """
+        selected_nodes = []
+        selected_zones = set()
+        
+        if node_to_zone_mapping is None or len(node_to_zone_mapping) == 0:
+            print("  Warning: No zone mapping available. Selecting top 3 nodes without zone constraint.")
+            # No zone mapping available (e.g., simple graph), just take top 3
+            for node, score in candidate_nodes_with_scores:
+                selected_nodes.append(node)
+                if len(selected_nodes) == 3:
+                    break
+            return selected_nodes, set()
+        
+        # Debug: show zone distribution in top candidates
+        print(f"  Checking zones for top candidates...")
+        zone_counts = {}
+        for node, score in candidate_nodes_with_scores[:20]:  # Check top 20
+            zone = node_to_zone_mapping.get(node)
+            if zone is not None:
+                zone_counts[zone] = zone_counts.get(zone, 0) + 1
+        
+        print(f"  Zones in top 20 candidates: {len(zone_counts)} unique zones")
+        if len(zone_counts) > 0:
+            print(f"  Top zones: {sorted(zone_counts.items(), key=lambda x: x[1], reverse=True)[:5]}")
+        
+        for node, score in candidate_nodes_with_scores:
+            # Check if node has a zone and if we need a node from that zone
+            node_zone = node_to_zone_mapping.get(node)
+            if node_zone is not None and node_zone not in selected_zones:
+                selected_nodes.append(node)
+                selected_zones.add(node_zone)
+                print(f"  Selected node {node} from zone {node_zone} (score: {score:.6f})")
+                if len(selected_nodes) == 3:
+                    break
+            elif node_zone is None:
+                # Node doesn't have a zone, skip it for now (we want nodes with zones)
+                continue
+        
+        if len(selected_nodes) < 3:
+            # Fallback: if we can't find 3 nodes from different zones, use what we have
+            print(f"  Warning: Only found {len(selected_nodes)} nodes from different zones.")
+            # Fill remaining slots with any available nodes (even if same zone)
+            for node, score in candidate_nodes_with_scores:
+                if node not in selected_nodes:
+                    node_zone = node_to_zone_mapping.get(node, "unknown")
+                    selected_nodes.append(node)
+                    selected_zones.add(node_zone)
+                    print(f"  Fallback: Selected node {node} from zone {node_zone} (score: {score:.6f})")
+                    if len(selected_nodes) == 3:
+                        break
+        
+        print(f"  Final selection: {len(selected_zones)} unique zones: {sorted(selected_zones)}")
+        return selected_nodes, selected_zones
+    
+    if selection_method == "random":
+        # Randomly select 3 nodes from different zones
+        if node_to_zone is not None:
+            # Group nodes by zone
+            zone_to_nodes = {}
+            for node in all_nodes_list:
+                zone = node_to_zone.get(node)
+                if zone is not None:
+                    if zone not in zone_to_nodes:
+                        zone_to_nodes[zone] = []
+                    zone_to_nodes[zone].append(node)
+            
+            # Randomly select one node from each of 3 different zones
+            available_zones = list(zone_to_nodes.keys())
+            if len(available_zones) < 3:
+                print(f"  Warning: Only {len(available_zones)} zones available. Some nodes may be from the same zone.")
+            
+            rng_key = jax_random.PRNGKey(args.seed)
+            permuted_zone_indices = jax_random.permutation(rng_key, jnp.arange(len(available_zones)))
+            selected_zones_list = [available_zones[int(idx)] for idx in permuted_zone_indices[:3]]
+            
+            selected_nodes = []
+            for zone in selected_zones_list:
+                zone_nodes = zone_to_nodes[zone]
+                node_idx = jax_random.randint(rng_key, (1,), 0, len(zone_nodes))[0]
+                selected_nodes.append(zone_nodes[int(node_idx)])
+                rng_key = jax_random.split(rng_key, 1)[0]
+            
+            print(f"Selected 3 nodes using random selection (one per zone): {selected_nodes}")
+            print(f"  Zones: {[node_to_zone.get(n, 'unknown') for n in selected_nodes]}")
+        else:
+            # No zone mapping, use original random selection
+            rng_key = jax_random.PRNGKey(args.seed)
+            permuted_indices = jax_random.permutation(rng_key, jnp.arange(len(all_nodes_list)))
+            selected_indices = permuted_indices[:3]
+            selected_nodes = [all_nodes_list[int(idx)] for idx in selected_indices]
+            print(f"Selected 3 nodes using random selection: {selected_nodes}")
+        
+    elif selection_method == "degree":
+        # Select top node from each of 3 different zones by degree centrality
+        print("Computing degree centrality...")
+        degree_centrality = nx.degree_centrality(G)
+        sorted_nodes = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)
+        selected_nodes, selected_zones = select_nodes_from_different_zones(sorted_nodes, node_to_zone)
+        print(f"Selected 3 nodes using degree centrality (one per zone): {selected_nodes}")
+        centrality_values = [f"{degree_centrality[n]:.4f}" for n in selected_nodes]
+        print(f"  Degree centrality values: {centrality_values}")
+        if node_to_zone:
+            print(f"  Zones: {[node_to_zone.get(n, 'unknown') for n in selected_nodes]}")
+        
+    elif selection_method == "closeness":
+        # Select top node from each of 3 different zones by closeness centrality
+        print("Computing closeness centrality (this may take a moment for large graphs)...")
+        closeness_centrality = nx.closeness_centrality(G)
+        valid_nodes = [(node, cent) for node, cent in closeness_centrality.items() if cent > 0]
+        if len(valid_nodes) < 3:
+            print(f"  Warning: Only {len(valid_nodes)} nodes have non-zero closeness centrality. Using all nodes.")
+            valid_nodes = list(closeness_centrality.items())
+        sorted_nodes = sorted(valid_nodes, key=lambda x: x[1], reverse=True)
+        selected_nodes, selected_zones = select_nodes_from_different_zones(sorted_nodes, node_to_zone)
+        print(f"Selected 3 nodes using closeness centrality (one per zone): {selected_nodes}")
+        centrality_values = [f"{closeness_centrality[n]:.4f}" for n in selected_nodes]
+        print(f"  Closeness centrality values: {centrality_values}")
+        if node_to_zone:
+            print(f"  Zones: {[node_to_zone.get(n, 'unknown') for n in selected_nodes]}")
+        
+    elif selection_method == "betweenness":
+        # Select top node from each of 3 different zones by betweenness centrality
+        print("Computing betweenness centrality (this may take a while for large graphs)...")
+        betweenness_centrality = nx.betweenness_centrality(G)
+        sorted_nodes = sorted(betweenness_centrality.items(), key=lambda x: x[1], reverse=True)
+        selected_nodes, selected_zones = select_nodes_from_different_zones(sorted_nodes, node_to_zone)
+        print(f"Selected 3 nodes using betweenness centrality (one per zone): {selected_nodes}")
+        centrality_values = [f"{betweenness_centrality[n]:.4f}" for n in selected_nodes]
+        print(f"  Betweenness centrality values: {centrality_values}")
+        if node_to_zone:
+            print(f"  Zones: {[node_to_zone.get(n, 'unknown') for n in selected_nodes]}")
+    
+    else:
+        raise ValueError(f"Unknown selection method: {selection_method}")
+    
+    # Verify that nodes are from different zones
+    if node_to_zone is not None and len(node_to_zone) > 0:
+        selected_node_zones = [node_to_zone.get(node, None) for node in selected_nodes]
+        unique_zones = set(z for z in selected_node_zones if z is not None)
+        print(f"\nZone verification:")
+        print(f"  Selected nodes: {selected_nodes}")
+        print(f"  Their zones: {selected_node_zones}")
+        print(f"  Unique zones: {len(unique_zones)} ({sorted(unique_zones) if unique_zones else 'None'})")
+        if len(unique_zones) < 3:
+            print(f"  WARNING: Only {len(unique_zones)} unique zones found! Some nodes may be from the same zone.")
+            # Try to fix by selecting from different zones more aggressively
+            if len(unique_zones) < 3 and selection_method != "random":
+                print(f"  Attempting to fix by selecting from different zones...")
+                # Group nodes by zone and select top from each zone
+                zone_to_top_node = {}
+                if selection_method == "degree":
+                    centrality_dict = nx.degree_centrality(G)
+                elif selection_method == "closeness":
+                    centrality_dict = nx.closeness_centrality(G)
+                elif selection_method == "betweenness":
+                    centrality_dict = nx.betweenness_centrality(G)
+                else:
+                    centrality_dict = None
+                
+                if centrality_dict:
+                    for node in all_nodes_list:
+                        zone = node_to_zone.get(node)
+                        if zone is not None:
+                            if zone not in zone_to_top_node:
+                                zone_to_top_node[zone] = (node, centrality_dict.get(node, 0))
+                            else:
+                                current_score = centrality_dict.get(node, 0)
+                                if current_score > zone_to_top_node[zone][1]:
+                                    zone_to_top_node[zone] = (node, current_score)
+                    
+                    # Select top node from each of 3 different zones
+                    sorted_zones = sorted(zone_to_top_node.items(), key=lambda x: x[1][1], reverse=True)
+                    selected_nodes = [zone_to_top_node[zone][0] for zone, _ in sorted_zones[:3]]
+                    selected_node_zones = [node_to_zone.get(node, None) for node in selected_nodes]
+                    unique_zones = set(z for z in selected_node_zones if z is not None)
+                    print(f"  After fix: {len(unique_zones)} unique zones: {sorted(unique_zones)}")
+    
+    # Convert selected nodes to indices
+    fixed_starts_idx = [node_to_idx[node] for node in selected_nodes if node in node_to_idx]
+    if len(fixed_starts_idx) != 3:
+        raise ValueError(f"Failed to select 3 nodes. Got {len(fixed_starts_idx)} nodes: {fixed_starts_idx}")
+    print(f"Restricted starts (3 fixed nodes, indices): {fixed_starts_idx}")
 
 # Ensure all fixed arrays are on GPU with consistent dtypes
 fixed_starts_idx = jax.device_put(jnp.array(fixed_starts_idx, dtype=jnp.int32))

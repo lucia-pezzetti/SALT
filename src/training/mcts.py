@@ -556,12 +556,12 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         # IMPORTANT: Include done states in training with target 0 so value function learns V(terminal) = 0
         value_targets = jnp.where(active_mask, value_targets, 0.0)
 
-        jax.debug.print(
-            "[targets] mean={mt:.4f} std={st:.4f} min={mn:.4f} max={mx:.4f} V_pred_mean={mp:.4f}",
-            mt=jnp.mean(value_targets), st=jnp.std(value_targets),
-            mn=jnp.min(value_targets), mx=jnp.max(value_targets),
-            mp=jnp.mean(V),
-        )
+        # jax.debug.print(
+        #     "[targets] mean={mt:.4f} std={st:.4f} min={mn:.4f} max={mx:.4f} V_pred_mean={mp:.4f}",
+        #     mt=jnp.mean(value_targets), st=jnp.std(value_targets),
+        #     mn=jnp.min(value_targets), mx=jnp.max(value_targets),
+        #     mp=jnp.mean(V),
+        # )
 
         # Include done states in training with target 0 to teach value function that V(terminal) = 0
         # Use all states (not just active_mask) so done states are included
@@ -571,15 +571,15 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         # Debug: print loss components and mask info
         num_done = jnp.sum(state_dict['env_states'].done.astype(jnp.int32))
         num_active = jnp.sum(active_mask.astype(jnp.int32))
-        jax.debug.print(
-            "MCTS Loss | loss={loss:.6f} active={active}/{total} done={done} value_targets={targets} V_pred={vpred}",
-            loss=loss,
-            active=num_active,
-            total=active_mask.shape[0],
-            done=num_done,
-            targets=value_targets,
-            vpred=batch_V(V_params, obs)
-        )
+        # jax.debug.print(
+        #     "MCTS Loss | loss={loss:.6f} active={active}/{total} done={done} value_targets={targets} V_pred={vpred}",
+        #     loss=loss,
+        #     active=num_active,
+        #     total=active_mask.shape[0],
+        #     done=num_done,
+        #     targets=value_targets,
+        #     vpred=batch_V(V_params, obs)
+        # )
 
         # Update value function
         V_updates, state_dict['V_opt_state'] = V_opt_update(V_grads, state_dict['V_opt_state'], V_params)
@@ -629,11 +629,11 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         state_dict["key"], subkey = jax.random.split(state_dict["key"])
         subkeys = jax.random.split(subkey, num=config['batch_size'])
         should_reset = terminals & ~reached_pickup  # Reset for timeout/invalid, but not for reaching pickup
-        jax.debug.print(
-            "[reset] term={term} reached_pickup={rp} should_reset={sr} resets={nres}",
-            term=terminals, rp=reached_pickup, sr=should_reset,
-            nres=jnp.sum(should_reset.astype(jnp.int32)),
-        )
+        # jax.debug.print(
+        #     "[reset] term={term} reached_pickup={rp} should_reset={sr} resets={nres}",
+        #     term=terminals, rp=reached_pickup, sr=should_reset,
+        #     nres=jnp.sum(should_reset.astype(jnp.int32)),
+        # )
         state_dict['env_states'] = jax.tree_util.tree_map(
             lambda reset, current: jnp.where(
                 jnp.reshape(should_reset, [should_reset.shape[0]] + [1] * (len(current.shape) - 1)),
@@ -660,12 +660,12 @@ def get_agent_loop(env, config, obs_fn_batch, V_apply, recurrent_fn, V_opt_updat
         term_mask = new_episode_termination
         term_count = jnp.sum(term_mask)
         term_sum = jnp.sum(jnp.where(term_mask, state_dict['episode_return'], 0.0))
-        jax.debug.print(
-            "[avg_return] term_count={tc} batch_mean={bm:.4f} true_mean_over_terms={tm:.4f}",
-            tc=term_count,
-            bm=jnp.mean(jnp.where(term_mask, state_dict['episode_return'], 0.0)),
-            tm=term_sum / jnp.maximum(1.0, term_count),
-        )
+        # jax.debug.print(
+        #     "[avg_return] term_count={tc} batch_mean={bm:.4f} true_mean_over_terms={tm:.4f}",
+        #     tc=term_count,
+        #     bm=jnp.mean(jnp.where(term_mask, state_dict['episode_return'], 0.0)),
+        #     tm=term_sum / jnp.maximum(1.0, term_count),
+        # )
 
         # update statistics - only count new episode terminations (not already-done agents)
         # Episode return accumulates for all agents (adding zero doesn't change it for done agents)

@@ -496,9 +496,8 @@ def train_q_learning(
                 print(f"✅ Q-table successfully updated: {stats_before['num_states']} -> {stats_after['num_states']} states")
     
     # Training loop
-    episode_rewards = []
-    episode_lengths = []
-    episode_completions = []
+    # No need to store episode history - we'll use current batch averages directly for logging
+    # This prevents any memory accumulation from Python lists
     
     if num_episodes == 0:
         print(f"\n{'='*60}")
@@ -819,6 +818,22 @@ def train_q_learning(
                 if (episode + 1) % 100000 == 0 or episode == 0:
                     q_agent.q_table.block_until_ready()
                 
+                # Periodic GPU memory cleanup to prevent fragmentation
+                # Force synchronization and clear any cached intermediate arrays
+                # This is critical for long runs on GPU to prevent memory exhaustion
+                if (episode + 1) % 10000 == 0:  # More frequent cleanup for GPU
+                    import gc
+                    # Force synchronization of all pending operations
+                    # This ensures JAX completes all operations and can free intermediate arrays
+                    q_agent.q_table.block_until_ready()
+                    states.current_node.block_until_ready()
+                    states.pickup_node.block_until_ready()
+                    # Trigger Python garbage collection (helps with Python object references)
+                    gc.collect()
+                    # Note: JAX doesn't have explicit GPU memory clearing, but blocking helps
+                    # ensure operations complete and memory can be freed. GPU memory fragmentation
+                    # is a known issue with JAX when creating many temporary arrays.
+                
                 # Debug print episode completion (every 100000 steps)
                 if training_step % 100000 == 0 or episode == 0:
                     episode_rewards_batch.block_until_ready()
@@ -842,9 +857,7 @@ def train_q_learning(
                     avg_episode_reward = float(jnp.mean(episode_rewards_batch))
                     avg_episode_length = float(jnp.mean(episode_lengths_batch))
                     completion_rate = float(jnp.mean(episode_dones_batch))
-                    episode_rewards.append(avg_episode_reward)
-                    episode_lengths.append(avg_episode_length)
-                    episode_completions.append(completion_rate)
+                    # No longer storing in lists - we'll use current batch average directly for logging
                 else:
                     # Don't compute or append when not needed (avoid blocking)
                     avg_episode_reward = 0.0  # Placeholder
@@ -854,9 +867,14 @@ def train_q_learning(
             # Logging
             if (episode + 1) % 1000 == 0:
                 with profiler.time_block("logging"):
-                    avg_reward = np.mean(episode_rewards[-100:])
-                    avg_length = np.mean(episode_lengths[-100:])
-                    completion_rate = np.mean(episode_completions[-100:])
+                    # Use current batch average directly (no need for rolling average)
+                    # Block to get current values
+                    episode_rewards_batch.block_until_ready()
+                    episode_lengths_batch.block_until_ready()
+                    episode_dones_batch.block_until_ready()
+                    avg_reward = float(jnp.mean(episode_rewards_batch))
+                    avg_length = float(jnp.mean(episode_lengths_batch))
+                    completion_rate = float(jnp.mean(episode_dones_batch))
                     # Use the last training step from the episode
                     last_training_step = (episode + 1) * max_steps_per_episode
                     epsilon = q_agent.get_epsilon(last_training_step)
