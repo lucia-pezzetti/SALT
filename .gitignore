@@ -104,3 +104,11 @@ src/create_boxplots.py
 src/training/mcts_sp.py
 src/training/gnn_networks.py
 plot_evaluation_results.py
+src/plot_*.py
+src/analyze_*.py
+src/compare_*.py
+*.html
+src/iframe_figures/
+src/analyze_*.py
+src/brute_force.py
+test/

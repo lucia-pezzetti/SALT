@@ -221,10 +221,11 @@ class TaxiEnv(eqx.Module):
         # )
         # Scale the hop-based shaping term by the average travel time per hop
         # hop_shaping = (avg_travel_time_per_hop / 60.0) * hop_dist_diff
-        dist_curr = self.distances[curr, state.pickup_node]
-        dist_next = self.distances[nxt, state.pickup_node]
-        dist_diff = dist_curr - dist_next
-        dist_shaping = dist_diff / 60.0
+        # Distance shaping commented out
+        # dist_curr = self.distances[curr, state.pickup_node]
+        # dist_next = self.distances[nxt, state.pickup_node]
+        # dist_diff = dist_curr - dist_next
+        # dist_shaping = dist_diff / 60.0
         
         # Pickup bonus
         pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
@@ -232,9 +233,9 @@ class TaxiEnv(eqx.Module):
         # Reward scaling (we want to make the reward between -1 and 1)
         reward_scaling = 1.0 #5e-3
 
-        # Include distance shaping to guide agent toward pickup
+        # Distance shaping commented out - no longer guiding agent toward pickup
         # Positive reward for moving closer (dist_diff > 0), negative for moving away
-        reward = - reward_scaling * total_delay/60.0 + pickup_bonus + dist_shaping
+        reward = - reward_scaling * total_delay/60.0 + pickup_bonus # + dist_shaping
         
         # Already done
         reward = jnp.where(already_done, 0.0, reward)

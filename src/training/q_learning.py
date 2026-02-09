@@ -49,13 +49,14 @@ def _jitted_step_with_discretization(
     norm_time = jnp.mod(discrete_t2, period_edge)
 
     total_delay = travel + wait
-    dist_curr = env.distances[curr, state.pickup_node]
-    dist_next = env.distances[nxt, state.pickup_node]
-    dist_diff = dist_curr - dist_next
-    dist_shaping = dist_diff / 60.0
+    # Distance shaping commented out
+    # dist_curr = env.distances[curr, state.pickup_node]
+    # dist_next = env.distances[nxt, state.pickup_node]
+    # dist_diff = dist_curr - dist_next
+    # dist_shaping = dist_diff / 60.0
 
     pickup_bonus = jnp.where(reach, env.pickup_bonus, 0.0)
-    reward = -total_delay / 60.0 + pickup_bonus + dist_shaping
+    reward = -total_delay / 60.0 + pickup_bonus # + dist_shaping
     reward = jnp.where(already_done, 0.0, reward)
 
     nm = env.neighbor_mask_static[nxt]
@@ -253,18 +254,30 @@ def _estimate_return_q_table_direct(
     q_table: jnp.ndarray,
     start: jnp.int32,
     pickup: jnp.int32,
+    time_idx: jnp.int32,
     num_nodes: int,
+    max_time_slices: int,
     env: TaxiEnv,
 ) -> jnp.float32:
     """
     JIT-compiled function to estimate return for a start-pickup pair using Q-table directly.
     Much faster than rollouts - just uses max Q-value at initial state.
+    
+    Args:
+        q_table: Q-table array
+        start: Start node index
+        pickup: Pickup node index
+        time_idx: Time slice index (0 to max_time_slices-1)
+        num_nodes: Number of nodes in the graph
+        max_time_slices: Maximum number of time slices
+        env: TaxiEnv instance
+        
     Returns: estimated return (negative cost for matching)
     """
-    # Get state indices for initial state (time=0)
+    # Get state indices for initial state at given time
     curr = jnp.clip(jnp.int32(start), 0, num_nodes - 1)
     pickup_idx = jnp.clip(jnp.int32(pickup), 0, num_nodes - 1)
-    t_idx = jnp.int32(0)  # Start at time 0
+    t_idx = jnp.clip(jnp.int32(time_idx), 0, max_time_slices - 1)
     
     # Get Q-values for all actions at this state
     q_row = q_table[curr, pickup_idx, t_idx, :]  # [max_deg]
@@ -278,9 +291,10 @@ def _estimate_return_q_table_direct(
 
 
 # Batched version for multiple start-pickup pairs
+# time_idx is shared across all pairs (same time for all agents), so in_axes=None for it
 _estimate_returns_batch_q_table_direct = jax.vmap(
     _estimate_return_q_table_direct,
-    in_axes=(None, 0, 0, None, None),
+    in_axes=(None, 0, 0, None, None, None, None),  # q_table, start, pickup, time_idx, num_nodes, max_time_slices, env
     out_axes=0
 )
 
@@ -427,7 +441,7 @@ class TabularQLearning:
         This provides a good initialization by computing Q-values based on:
         - Travel time for the action (negative cost)
         - Distance shaping (progress toward pickup)
-        - Estimated future value (remaining distance to pickup)
+        # - Estimated future value (remaining distance to pickup)
         - Pickup bonus if action reaches pickup
         
         Note: This initialization ignores time discretization and uses travel times
@@ -490,27 +504,27 @@ class TabularQLearning:
             # Get travel times
             travel_times_broadcast = travel_times[curr_broadcast, action_broadcast]  # [num_nodes, num_nodes, max_deg]
             
-            # Get distances
-            dist_curr = distances[curr_broadcast, pickup_broadcast]  # [num_nodes, num_nodes, max_deg]
+            # Distance computations for future value estimation
             dist_next = distances[next_nodes, pickup_broadcast]  # [num_nodes, num_nodes, max_deg]
             
             # Compute reward components (vectorized)
             travel_cost = -reward_scaling * travel_times_broadcast / 60.0
-            dist_diff = dist_curr - dist_next
-            dist_shaping = dist_diff / 60.0
+            
             reaches_pickup = (next_nodes == pickup_broadcast)
             pickup_bonus_broadcast = jnp.where(reaches_pickup, pickup_bonus, 0.0)
             
-            # Estimated future value
-            remaining_dist = distances[next_nodes, pickup_broadcast]
+            # Estimated future value: Q(s,a) = r + gamma * V(s')
+            # For shortest path initialization, V(s') = -remaining_distance (negative because it's a cost)
+            # This ensures actions leading to shorter remaining distance have higher Q-values
+            remaining_dist = dist_next  # Distance from next_node to pickup
             future_value = jnp.where(
                 reaches_pickup,
-                0.0,
-                -gamma * remaining_dist / 60.0
+                0.0,  # No future cost if we reach the pickup
+                -gamma * remaining_dist / 60.0  # Negative of remaining distance (scaled)
             )
             
-            # Compute Q-values
-            q_values = travel_cost + dist_shaping + pickup_bonus_broadcast + future_value
+            # Compute Q-values: immediate reward + discounted future value
+            q_values = travel_cost + pickup_bonus_broadcast + future_value
             
             # Mask invalid entries:
             # 1. Skip if curr == pickup
@@ -685,6 +699,7 @@ class TabularQLearning:
         self,
         starts: jnp.ndarray,
         pickups: jnp.ndarray,
+        time_idx: jnp.int32 = 0,
         rollout_steps: int = 10,  # Ignored - kept for API compatibility
         key: jnp.ndarray = None,  # Ignored - kept for API compatibility
     ) -> jnp.ndarray:
@@ -695,6 +710,7 @@ class TabularQLearning:
         Args:
             starts: Array of start node indices [num_agents]
             pickups: Array of pickup node indices [num_agents]
+            time_idx: Time slice index for Q-table lookup (same for all agents)
             rollout_steps: Ignored (kept for API compatibility)
             key: Ignored (kept for API compatibility)
             
@@ -713,7 +729,9 @@ class TabularQLearning:
             self.q_table,
             starts_expanded,
             pickups_expanded,
+            jnp.int32(time_idx),
             self.env.num_nodes,
+            self.max_time_slices,
             self.env,
         )
         

@@ -54,9 +54,9 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
 
     # Map zones to nodes, then filter
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf, zone_name_to_locationID = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
-    # zone_names = ["Financial District South", "Financial District North", "Battery Park", "Battery Park City", "World Trade Center", "Seaport", "TriBeCa/Civic Center", "Chinatown", "Lower East Side", "Two Bridges/Seward Park", "Little Italy/NoLiTa", "SoHo", "Hudson Sq", "Alphabet City", "East Village", "Greenwich Village South", "Greenwich Village North", "West Village", "Meatpacking/West Village West"] 
-    # zone_names = ["Upper East Side North", "Yorkville West"] #, "Upper East Side South", "Lenox Hill West"] 
-    zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"] #, "Central Harlem", "Central Harlem North", "Manhattanville", "Hamlton Heights", "Morningside Heights", "Sutton Place/Turtle Bay North", "Manhattan Valley", "Upper West Side North", "Lincoln Square Easr", "Lincoln Square West", "Clinton East", "Clinton West", "Central Park", "Bloomingdale", "Upper West Side South", "Sutton Place/Turtle Bay South", "Midtown East", "Midtown North", "Midtown Center"]   
+    zone_names = ["Alphabet City", "Battery Park", "Battery Park City", "Chinatown", "Clinton East", "Clinton West", "East Chelsea", "East Village", "Financial District North", "Financial District South", "Flatiron", "Garment District", "Gramercy", "Greenwich Village North", "Greenwich Village South", "Hudson Sq", "Kips Bay", "Little Italy/NoLiTa", "Lower East Side", "Meatpacking/West Village West", "Midtown Center" , "Midtown East", "Midtown North", "Midtown South","Murray Hill", "Penn Station/Madison Sq West", "Seaport", "SoHo", "Stuy Town/Peter Cooper Village", "Sutton Place/Turtle Bay North", "Times Sq/Theatre District", "TriBeCa/Civic Center", "Two Bridges/Seward Park", "UN/Turtle Bay South", "Union Sq", "West Chelsea/Hudson Yards", "West Village", "World Trade Center"]
+    # zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West"] 
+    # zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"] #, "Central Harlem", "Central Harlem North", "Manhattanville", "Hamlton Heights", "Morningside Heights", "Sutton Place/Turtle Bay North", "Manhattan Valley", "Upper West Side North", "Lincoln Square Easr", "Lincoln Square West", "Clinton East", "Clinton West", "Central Park", "Bloomingdale", "Upper West Side South", "Sutton Place/Turtle Bay South", "Midtown East", "Midtown North", "Midtown Center"]   
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
     loc_ids = filtered_zones["LocationID"].tolist()
@@ -666,3 +666,5 @@ def offline_shortest_path_action_discrete(current_node, target_node, adj_list, t
 # Batch
 offline_shortest_path_action_batch = jax.jit(jax.vmap(offline_shortest_path_action, 
                                                in_axes=(0, 0, None, None, None, 0)))
+offline_shortest_path_action_discrete_batch = jax.jit(jax.vmap(offline_shortest_path_action_discrete,
+                                                       in_axes=(0, 0, None, None, None, 0, None)))

@@ -315,7 +315,7 @@ def train_q_learning(
     pretrain_log_fn=None,
     save_path: Optional[str] = None,
     load_path: Optional[str] = None,
-    initial_q_value: float = 10.0,
+    initial_q_value: float = 0.0,
     init_from_shortest_paths: bool = False,
     init_all_time_slices: bool = False,
     pretrain_learning_rate: Optional[float] = None,
@@ -344,7 +344,7 @@ def train_q_learning(
         pretrain_enabled: Whether to use shortest path pretraining
         num_pretrain_episodes: Number of pretraining episodes (if pretrain_enabled)
         pretrain_log_fn: Optional logging function for pretraining metrics
-        initial_q_value: Initial Q-value for optimistic initialization (default 10.0)
+        initial_q_value: Initial Q-value (default 0.0, no optimistic initialization)
         init_from_shortest_paths: Whether to initialize Q-table from shortest path travel times
         init_all_time_slices: If True, initialize for all time slices (up to 100). 
                               If False, only initialize for time=0.
@@ -548,11 +548,20 @@ def train_q_learning(
         """
         JIT-compiled epsilon-greedy matching.
         Uses cond to only compute optimal matching when needed.
+        
+        Samples a random initial time (same for all agents) to evaluate Q-values,
+        rather than always assuming time=0. This provides better coverage of the
+        time-varying Q-table during matching.
         """
         def random_matching(pickups, key):
             return jax_random.permutation(key, pickups)
         
         def optimal_matching(starts, pickups, q_table, key, dt, max_time_slices, num_nodes, env):
+            # Sample a random time index (same for all agents in this matching)
+            # This is an integer between 0 and max_time_slices-1
+            key, time_key = jax_random.split(key)
+            time_idx = jax_random.randint(time_key, (), 0, max_time_slices)
+            
             # Estimate returns directly from Q-table
             num_starts = starts.shape[0]
             num_pickups = pickups.shape[0]
@@ -561,13 +570,15 @@ def train_q_learning(
             starts_expanded = jnp.repeat(starts, num_pickups)
             pickups_expanded = jnp.tile(pickups, num_starts)
             
-            # Estimate returns directly from Q-table (batched)
+            # Estimate returns directly from Q-table (batched) at the sampled time
             from training.q_learning import _estimate_returns_batch_q_table_direct
             returns_flat = _estimate_returns_batch_q_table_direct(
                 q_table,
                 starts_expanded,
                 pickups_expanded,
+                time_idx,
                 num_nodes,
+                max_time_slices,
                 env,
             )
             
@@ -720,7 +731,9 @@ def train_q_learning(
     # Skip training loop if num_episodes=0 (evaluation-only mode)
     if num_episodes > 0:
         # Precompute total training steps once (optimization: avoid recomputing every episode)
-        total_training_steps = num_episodes * max_steps_per_episode
+        # Each episode runs 2*num_agents agents in parallel (forward + return trips)
+        # Training steps count per agent, so we still double the steps
+        total_training_steps = num_episodes * 2 * max_steps_per_episode
         matching_epsilon_start = 1.0
         matching_epsilon_end = 0.1
         
@@ -746,58 +759,107 @@ def train_q_learning(
                 pickups_list = pickups.tolist() if hasattr(pickups, 'tolist') else list(pickups)
                 print(f"[SAMPLING] Starts: {starts_list} | Pickups: {pickups_list}")
             
+            # OPTIMIZED: Compute matching epsilon once and reuse for both trips
             # Epsilon-greedy matching: random with prob epsilon, optimal with prob (1-epsilon)
             if num_agents > 1:
                 with profiler.time_block("matching"):
-                    # Linear decay over all training steps (convert to JAX array first for efficiency)
+                    # Compute matching epsilon once (reused for both forward and return trips)
                     progress = jnp.minimum(jnp.float32(training_step) / jnp.float32(total_training_steps), 1.0)
                     matching_epsilon = matching_epsilon_start * (1.0 - progress) + matching_epsilon_end * progress
                     
-                    # Decide: random matching (epsilon) or optimal matching (1-epsilon)
-                    key, match_key = jax_random.split(key)
-                    do_random_matching = jax_random.uniform(match_key) < matching_epsilon
+                    # Split keys upfront for both matching operations (more efficient)
+                    key, forward_match_key, return_match_key = jax_random.split(key, 3)
                     
-                    # JIT-compiled matching (only computes optimal matching when needed)
+                    # Forward trip matching
+                    do_random_forward_matching = jax_random.uniform(forward_match_key) < matching_epsilon
                     matched_pickups = match_pickups_jit(
                         starts,
                         pickups,
                         q_agent.q_table,
-                        do_random_matching,
-                        key,
+                        do_random_forward_matching,
+                        forward_match_key,
                         q_agent.dt,
                         q_agent.max_time_slices,
                         q_agent.env.num_nodes,
                         q_agent.env,
                     )
-                    # Only block if we need values for debug prints
+                    
+                    # RETURN TRIP MATCHING: Match return pickups (original starts) to return starts (pickup locations)
+                    return_starts = matched_pickups  # Where forward trip ends (pickup locations)
+                    return_pickups = starts  # Original start locations become the new pickups
+                    
+                    # Return trip matching (using same epsilon, independent random decision)
+                    do_random_return_matching = jax_random.uniform(return_match_key) < matching_epsilon
+                    matched_return_pickups = match_pickups_jit(
+                        return_starts,  # Where agents are (pickup locations)
+                        return_pickups,  # Where agents need to go (original starts)
+                        q_agent.q_table,
+                        do_random_return_matching,
+                        return_match_key,
+                        q_agent.dt,
+                        q_agent.max_time_slices,
+                        q_agent.env.num_nodes,
+                        q_agent.env,
+                    )
+                    
+                    # Only block if we need values for debug prints (lazy evaluation)
                     if training_step % 100000 == 0 or episode == 0:
                         matched_pickups.block_until_ready()
-                        do_random_matching.block_until_ready()
-                    
-                    # Debug print matching result (every 100000 steps)
-                    if training_step % 100000 == 0 or episode == 0:
-                        # Only convert to Python when actually printing (avoid unnecessary conversion)
+                        matched_return_pickups.block_until_ready()
+                        do_random_forward_matching.block_until_ready()
+                        do_random_return_matching.block_until_ready()
+                        
+                        # Debug print matching results (every 100000 steps)
                         matched_list = matched_pickups.tolist() if hasattr(matched_pickups, 'tolist') else list(matched_pickups)
-                        do_random_val = bool(do_random_matching.item() if hasattr(do_random_matching, 'item') else do_random_matching)
-                        print(f"[MATCHING] Epsilon: {matching_epsilon:.3f} | Random: {do_random_val} | Matched pickups: {matched_list}")
+                        matched_return_list = matched_return_pickups.tolist() if hasattr(matched_return_pickups, 'tolist') else list(matched_return_pickups)
+                        do_random_forward_val = bool(do_random_forward_matching.item() if hasattr(do_random_forward_matching, 'item') else do_random_forward_matching)
+                        do_random_return_val = bool(do_random_return_matching.item() if hasattr(do_random_return_matching, 'item') else do_random_return_matching)
+                        print(f"[MATCHING] Epsilon: {matching_epsilon:.3f} | "
+                              f"Forward: Random={do_random_forward_val}, Matched={matched_list} | "
+                              f"Return: Random={do_random_return_val}, Matched={matched_return_list}")
             else:
                 matched_pickups = pickups
+                return_starts = matched_pickups
+                return_pickups = starts
+                matched_return_pickups = return_pickups
             
-            # Initialize all agents in parallel
+            # PARALLEL EXECUTION: Run 2*num_agents agents in parallel
+            # First num_agents: forward trip (starts -> pickups)
+            # Next num_agents: return trip (pickups -> starts)
+            # Both update the same Q-table in parallel (updates to different state-action pairs are independent)
             with profiler.time_block("initialization"):
+                # Prepare all starts and pickups for 2*num_agents agents
+                # Forward trip: starts -> matched_pickups
+                # Return trip: return_starts -> matched_return_pickups
+                all_starts = jnp.concatenate([starts, return_starts])  # [2*num_agents]
+                all_pickups = jnp.concatenate([matched_pickups, matched_return_pickups])  # [2*num_agents]
+                
+                # Split keys for all agents
                 key, init_key = jax_random.split(key)
-                init_keys = jax_random.split(init_key, num_agents)
-                states, _ = batched_init(init_keys, starts, matched_pickups)
+                all_init_keys = jax_random.split(init_key, 2 * num_agents)
+                
+                # Initialize all agents in one batch (2*num_agents agents)
+                all_states, _ = batched_init(all_init_keys, all_starts, all_pickups)
             
-            # Run episode for all agents in parallel (fully JIT-compiled with scan)
+            # PARALLEL EXECUTION: Run all 2*num_agents agents in a single batch
+            # This is more efficient than sequential execution
             with profiler.time_block("episode_execution"):
                 episode_step_base = training_step
+                
                 # Debug print every 100000 steps
                 if training_step % 100000 == 0 or episode == 0:
-                    print(f"[EPISODE EXECUTION START] Episode {episode + 1} | Base step: {episode_step_base} | Max steps: {max_steps_per_episode}")
+                    print(f"[EPISODE EXECUTION START] Episode {episode + 1} | "
+                          f"Running {2 * num_agents} agents in parallel | "
+                          f"Step: {episode_step_base} | Max steps: {max_steps_per_episode}")
                 
-                states, episode_rewards_batch, episode_lengths_batch, episode_dones_batch, q_agent.q_table, key = run_episode_batch(
-                    states,
+                # Split key for episode execution
+                key, episode_key = jax_random.split(key)
+                
+                # Run all agents in parallel (2*num_agents agents in one batch)
+                # All agents use the same Q-table and update it in parallel
+                # Since they update different state-action pairs, this is safe and efficient
+                all_states, all_rewards_batch, all_lengths_batch, all_dones_batch, q_agent.q_table, _ = run_episode_batch(
+                    all_states,
                     q_agent.q_table,
                     episode_step_base,
                     q_agent.epsilon_start,
@@ -811,13 +873,23 @@ def train_q_learning(
                     q_agent.discrete_travel_times,
                     q_agent.env,
                     max_steps_per_episode,
-                    key,
+                    episode_key,
                 )
-                # Only block when we need values (for debug prints or statistics aggregation)
-                # Q-table only needs blocking for debug prints (it's updated in-place in JAX)
-                if (episode + 1) % 100000 == 0 or episode == 0:
-                    q_agent.q_table.block_until_ready()
                 
+                # Split results back into forward and return trips
+                forward_rewards_batch = all_rewards_batch[:num_agents]
+                forward_lengths_batch = all_lengths_batch[:num_agents]
+                forward_dones_batch = all_dones_batch[:num_agents]
+                # Use jax.tree_util.tree_map for compatibility with all JAX versions
+                from jax import tree_util
+                forward_states = tree_util.tree_map(lambda x: x[:num_agents], all_states)
+                
+                return_rewards_batch = all_rewards_batch[num_agents:]
+                return_lengths_batch = all_lengths_batch[num_agents:]
+                return_dones_batch = all_dones_batch[num_agents:]
+                return_states = tree_util.tree_map(lambda x: x[num_agents:], all_states)
+                
+                # OPTIMIZED: Only block when absolutely necessary (lazy evaluation)
                 # Periodic GPU memory cleanup to prevent fragmentation
                 # Force synchronization and clear any cached intermediate arrays
                 # This is critical for long runs on GPU to prevent memory exhaustion
@@ -826,57 +898,96 @@ def train_q_learning(
                     # Force synchronization of all pending operations
                     # This ensures JAX completes all operations and can free intermediate arrays
                     q_agent.q_table.block_until_ready()
-                    states.current_node.block_until_ready()
-                    states.pickup_node.block_until_ready()
+                    all_states.current_node.block_until_ready()
                     # Trigger Python garbage collection (helps with Python object references)
                     gc.collect()
                     # Note: JAX doesn't have explicit GPU memory clearing, but blocking helps
                     # ensure operations complete and memory can be freed. GPU memory fragmentation
                     # is a known issue with JAX when creating many temporary arrays.
                 
-                # Debug print episode completion (every 100000 steps)
+                # Debug print episode completion (every 100000 steps) - statistics kept separate
+                # OPTIMIZED: Block only when we actually need to print (lazy evaluation)
                 if training_step % 100000 == 0 or episode == 0:
-                    episode_rewards_batch.block_until_ready()
-                    episode_lengths_batch.block_until_ready()
-                    episode_dones_batch.block_until_ready()
-                    avg_reward = float(jnp.mean(episode_rewards_batch))
-                    avg_length = float(jnp.mean(episode_lengths_batch))
-                    completion = float(jnp.mean(episode_dones_batch))
+                    # Block all needed values at once (more efficient than multiple blocks)
+                    forward_rewards_batch.block_until_ready()
+                    forward_lengths_batch.block_until_ready()
+                    forward_dones_batch.block_until_ready()
+                    return_rewards_batch.block_until_ready()
+                    return_lengths_batch.block_until_ready()
+                    return_dones_batch.block_until_ready()
+                    q_agent.q_table.block_until_ready()  # Only block Q-table when printing
+                    
+                    avg_forward_reward = float(jnp.mean(forward_rewards_batch))
+                    avg_forward_length = float(jnp.mean(forward_lengths_batch))
+                    avg_forward_completion = float(jnp.mean(forward_dones_batch))
+                    avg_return_reward = float(jnp.mean(return_rewards_batch))
+                    avg_return_length = float(jnp.mean(return_lengths_batch))
+                    avg_return_completion = float(jnp.mean(return_dones_batch))
                     print(f"[EPISODE EXECUTION END] Episode {episode + 1} | "
-                          f"Avg Reward: {avg_reward:.2f} | Avg Length: {avg_length:.1f} | Completion: {completion:.2%}")
+                          f"Forward: Reward={avg_forward_reward:.2f}, Length={avg_forward_length:.1f}, Completion={avg_forward_completion:.2%} | "
+                          f"Return: Reward={avg_return_reward:.2f}, Length={avg_return_length:.1f}, Completion={avg_return_completion:.2%}")
+            
+            # Keep statistics separate (not combined) for better insights
+            # Forward trip statistics
+            episode_rewards_batch = forward_rewards_batch
+            episode_lengths_batch = forward_lengths_batch
+            episode_dones_batch = forward_dones_batch
+            # Return trip statistics (kept separate)
+            # These are available as: return_rewards_batch, return_lengths_batch, return_dones_batch
             
             # Aggregate statistics across agents (convert to Python only for logging)
+            # Keep forward and return trip statistics separate
             # Only block when we need the values (for logging every 1000 episodes)
             need_values = (episode + 1) % 1000 == 0 or (episode + 1) == num_episodes
             with profiler.time_block("statistics_aggregation"):
                 if need_values:
                     # Block only when we need to log (converting to float will implicitly block, but explicit is clearer)
+                    # Forward trip statistics
                     episode_rewards_batch.block_until_ready()
                     episode_lengths_batch.block_until_ready()
                     episode_dones_batch.block_until_ready()
                     avg_episode_reward = float(jnp.mean(episode_rewards_batch))
                     avg_episode_length = float(jnp.mean(episode_lengths_batch))
                     completion_rate = float(jnp.mean(episode_dones_batch))
+                    # Return trip statistics (separate)
+                    return_rewards_batch.block_until_ready()
+                    return_lengths_batch.block_until_ready()
+                    return_dones_batch.block_until_ready()
+                    avg_return_reward = float(jnp.mean(return_rewards_batch))
+                    avg_return_length = float(jnp.mean(return_lengths_batch))
+                    return_completion_rate = float(jnp.mean(return_dones_batch))
                     # No longer storing in lists - we'll use current batch average directly for logging
                 else:
                     # Don't compute or append when not needed (avoid blocking)
                     avg_episode_reward = 0.0  # Placeholder
                     avg_episode_length = 0.0
                     completion_rate = 0.0
+                    avg_return_reward = 0.0
+                    avg_return_length = 0.0
+                    return_completion_rate = 0.0
             
             # Logging
             if (episode + 1) % 1000 == 0:
                 with profiler.time_block("logging"):
                     # Use current batch average directly (no need for rolling average)
-                    # Block to get current values
+                    # Block to get current values (keep statistics separate)
                     episode_rewards_batch.block_until_ready()
                     episode_lengths_batch.block_until_ready()
                     episode_dones_batch.block_until_ready()
+                    return_rewards_batch.block_until_ready()
+                    return_lengths_batch.block_until_ready()
+                    return_dones_batch.block_until_ready()
+                    # Forward trip statistics
                     avg_reward = float(jnp.mean(episode_rewards_batch))
                     avg_length = float(jnp.mean(episode_lengths_batch))
                     completion_rate = float(jnp.mean(episode_dones_batch))
+                    # Return trip statistics (separate)
+                    avg_return_reward = float(jnp.mean(return_rewards_batch))
+                    avg_return_length = float(jnp.mean(return_lengths_batch))
+                    return_completion_rate = float(jnp.mean(return_dones_batch))
                     # Use the last training step from the episode
-                    last_training_step = (episode + 1) * max_steps_per_episode
+                    # Each episode runs 2*num_agents agents in parallel, so we count 2x steps per episode
+                    last_training_step = (episode + 1) * 2 * max_steps_per_episode
                     epsilon = q_agent.get_epsilon(last_training_step)
                     # Only compute expensive statistics every 10000 episodes (or at end)
                     compute_stats = (episode + 1) % 10000 == 0 or (episode + 1) == num_episodes
@@ -889,13 +1000,22 @@ def train_q_learning(
                     #       f"Epsilon={epsilon:.3f}, "
                     #       f"Q-table size={stats['num_states']}")
                     
-                    # Wandb logging
+                    # Wandb logging - separate statistics for forward and return trips
                     if wandb.run is not None:
                         wandb.log({
                             'training/episode': episode + 1,
-                            'training/avg_reward': avg_reward,
-                            'training/avg_length': avg_length,
-                            'training/completion_rate': completion_rate,
+                            # Forward trip statistics
+                            'training/forward_avg_reward': avg_reward,
+                            'training/forward_avg_length': avg_length,
+                            'training/forward_completion_rate': completion_rate,
+                            # Return trip statistics (separate)
+                            'training/return_avg_reward': avg_return_reward,
+                            'training/return_avg_length': avg_return_length,
+                            'training/return_completion_rate': return_completion_rate,
+                            # Combined statistics (for comparison)
+                            'training/combined_avg_reward': avg_reward + avg_return_reward,
+                            'training/combined_avg_length': avg_length + avg_return_length,
+                            'training/combined_completion_rate': completion_rate * return_completion_rate,  # Both must complete
                             'training/epsilon': epsilon,
                             'q_learning/q_table_size': stats['num_states'],
                             'q_learning/avg_q_value': stats['avg_q_value'],
@@ -946,9 +1066,15 @@ def train_q_learning(
                         all_steps_disc = []
                         all_completions_disc = []
                         
-                        for start_set, pickup_set in zip(eval_start_sets, eval_pickup_sets):
-                            # Perform Hungarian matching using Q-table
-                            returns_matrix = q_agent.estimate_returns_for_matching(start_set, pickup_set)
+                        for set_idx, (start_set, pickup_set) in enumerate(zip(eval_start_sets, eval_pickup_sets)):
+                            # Sample a random start time (same for all agents in this set)
+                            # This is an integer between 0 and max_time_slices-1
+                            subkey, time_key = jax_random.split(subkey)
+                            start_time_idx = int(jax_random.randint(time_key, (), 0, q_agent.max_time_slices))
+                            start_time = float(start_time_idx * q_agent.dt)  # Convert to continuous time
+                            
+                            # Perform Hungarian matching using Q-table at the sampled time
+                            returns_matrix = q_agent.estimate_returns_for_matching(start_set, pickup_set, time_idx=start_time_idx)
                             _, assignment = optax.assignment.hungarian_algorithm(-returns_matrix)
                             matched_pickups = pickup_set[assignment]
                             
@@ -960,6 +1086,15 @@ def train_q_learning(
                                 
                                 # start and pickup are already integers from JAX arrays
                                 state = init_env(jax_random.PRNGKey(0), start, pickup, env.neighbor_mask_static)[0]
+                                # Set the initial time to the sampled start time
+                                state = TaxiState(
+                                    current_node=state.current_node,
+                                    pickup_node=state.pickup_node,
+                                    done=state.done,
+                                    step_count=state.step_count,
+                                    neighbor_mask=state.neighbor_mask,
+                                    time=jnp.array(start_time, dtype=jnp.float32),
+                                )
                                 
                                 for step in range(max_steps_per_episode):
                                     if state.done:
@@ -1013,6 +1148,15 @@ def train_q_learning(
                                 
                                 # start and pickup are already integers from JAX arrays
                                 state = init_env(jax_random.PRNGKey(0), start, pickup, env.neighbor_mask_static)[0]
+                                # Set the initial time to the sampled start time
+                                state = TaxiState(
+                                    current_node=state.current_node,
+                                    pickup_node=state.pickup_node,
+                                    done=state.done,
+                                    step_count=state.step_count,
+                                    neighbor_mask=state.neighbor_mask,
+                                    time=jnp.array(start_time, dtype=jnp.float32),
+                                )
                                 
                                 for step in range(max_steps_per_episode):
                                     if state.done:

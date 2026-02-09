@@ -18,7 +18,36 @@ def parse_log_file(log_file_path):
     sp_times_cont = []
     sp_times_disc = []
     
-    with open(log_file_path, 'r') as f:
+    # Check if file is actually a text file (not binary like PNG, etc.)
+    log_file_path = Path(log_file_path)
+    if log_file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.svg']:
+        print(f"Warning: Skipping non-text file: {log_file_path}")
+        return {
+            'ql_continuous': [],
+            'ql_discrete': [],
+            'sp_continuous': [],
+            'sp_discrete': [],
+        }
+    
+    # Try to detect binary files by reading first few bytes
+    try:
+        with open(log_file_path, 'rb') as f:
+            first_bytes = f.read(8)
+            # PNG files start with \x89PNG\r\n\x1a\n
+            # JPEG files start with \xff\xd8\xff
+            # GIF files start with GIF89a or GIF87a
+            if first_bytes.startswith(b'\x89PNG') or first_bytes.startswith(b'\xff\xd8') or first_bytes.startswith(b'GIF'):
+                print(f"Warning: Skipping binary file (image): {log_file_path}")
+                return {
+                    'ql_continuous': [],
+                    'ql_discrete': [],
+                    'sp_continuous': [],
+                    'sp_discrete': [],
+                }
+    except Exception as e:
+        print(f"Warning: Could not check file type for {log_file_path}: {e}")
+    
+    with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
         content = f.read()
     
     # Pattern for Q-learning avg time (continuous)
@@ -162,8 +191,13 @@ def main():
         log_dir = Path(args.log_dir)
         log_files.extend(glob.glob(str(log_dir / args.pattern)))
     
+    # Filter out non-text files (images, etc.)
+    text_extensions = {'.txt', '.log', '.out', '.dat'}
+    log_files = [f for f in log_files if Path(f).suffix.lower() in text_extensions or Path(f).suffix == '']
+    
     if not log_files:
         print("Error: No log files found. Please provide --log_files or --log_dir")
+        print("Note: Only text files (.txt, .log, .out, .dat) are processed. Image files are automatically skipped.")
         return
     
     print(f"Parsing {len(log_files)} log file(s)...")

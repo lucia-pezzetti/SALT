@@ -67,7 +67,7 @@ class QConfig:
 def make_q_table(
     env: TaxiEnv,
     cfg: QConfig,
-    initial_q_value: float = 10.0,
+    initial_q_value: float = 0.0,
 ) -> jnp.ndarray:
     """
     Create a dense Q-table with shape [num_nodes, num_nodes, max_time_slices, max_deg].
@@ -254,7 +254,7 @@ def train_q_learning_jax(
     num_episodes: int,
     max_steps_per_episode: int,
     cfg: QConfig,
-    initial_q_value: float = 10.0,
+    initial_q_value: float = 0.0,
     seed: int = 0,
 ) -> Tuple[jnp.ndarray, Dict[str, np.ndarray]]:
     """

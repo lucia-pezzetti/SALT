@@ -9,7 +9,7 @@ from datetime import datetime
 from taxi_env import TaxiState, init_env
 from training.train_q_learning import train_q_learning, evaluate_q_agent
 from training.q_learning import TabularQLearning
-from utils import offline_shortest_path_action, offline_shortest_path_action_discrete
+from utils import offline_shortest_path_action, offline_shortest_path_action_discrete, offline_shortest_path_action_batch, offline_shortest_path_action_discrete_batch
 # from evaluation.plot_agent_paths import plot_rl_vs_shortest_path  # Disabled: trajectory plots removed
 
 from .context import RunContext
@@ -286,7 +286,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
             wandb.log(log_dict_clean, step=int(step), commit=True)
     
     # Use optimistic initialization with positive large value to favor exploration
-    initial_q_value = 10.0  # Positive large value for optimistic initialization
+    initial_q_value = 0.0  # No optimistic initialization - use explicit init methods
     
     q_agent = train_q_learning(
         env=ctx.env,
@@ -421,12 +421,18 @@ def run_q_learning(args, ctx: RunContext) -> None:
         starts_expanded = jnp.repeat(starts_jax, num_pickups)
         pickups_expanded = jnp.tile(pickups_jax, num_starts)
         
+        # Sample a random time index (same for all agents, consistent with training)
+        key = jax.random.PRNGKey(base_seed)
+        time_idx = jax.random.randint(key, (), 0, q_agent.max_time_slices)
+        
         # Estimate returns directly from Q-table (batched, fast!)
         returns_flat = _estimate_returns_batch_q_table_direct(
             q_agent.q_table,
             starts_expanded,
             pickups_expanded,
+            time_idx,
             ctx.env.num_nodes,
+            q_agent.max_time_slices,
             ctx.env,
         )
         
@@ -695,63 +701,259 @@ def run_q_learning(args, ctx: RunContext) -> None:
             ctx.env.neighbor_mask_static[state.current_node]
         )
     
-    def simulate_policy_time(policy_fn, start, pickup, base_seed, use_discrete):
-        """Simulate a single start/pickup pair and return total travel time (seconds)."""
-        key = jax.random.PRNGKey(base_seed)
-        state = init_env(key, int(start), int(pickup), ctx.env.neighbor_mask_static)[0]
-        total_time = 0.0
-        steps = 0
-        
-        while (not bool(state.done)) and steps < 2 * ctx.max_length:
-            action = policy_fn(state)
-            if use_discrete:
-                key, step_key = jax.random.split(key)
-                next_state, reward, done, info = q_agent.step_with_discretization(
-                    state, action, step_key
-                )
-            else:
-                next_state, reward, done, info = ctx.env.step(state, action)
-            
-            total_time += float(info['travel'] + info['wait'])
-            state = next_state
-            steps += 1
-            
-            if done:
-                break
-        
-        return total_time
-    
-    def build_cost_matrix(starts, pickups, policy_fn, base_seed, use_discrete):
-        """Return a [len(starts), len(pickups)] matrix of total travel times."""
-        starts_np = np.array(starts).astype(int)
-        pickups_np = np.array(pickups).astype(int)
-        cost = np.zeros((len(starts_np), len(pickups_np)), dtype=np.float32)
-        
-        for i, start in enumerate(starts_np):
-            for j, pickup in enumerate(pickups_np):
-                pair_seed = base_seed + i * 7919 + j * 104729
-                cost[i, j] = simulate_policy_time(
-                    policy_fn, start, pickup, pair_seed, use_discrete=use_discrete
-                )
-        
-        return jnp.array(cost, dtype=jnp.float32)
+    @jax.jit
+    def build_cost_matrix_from_distances(starts, pickups, distances):
+        """Fast: Build cost matrix using precomputed distance lookups."""
+        # Use advanced indexing: distances[start[i], pickup[j]] for all i, j
+        # This creates a [len(starts), len(pickups)] matrix
+        starts_jax = jnp.array(starts, dtype=jnp.int32)
+        pickups_jax = jnp.array(pickups, dtype=jnp.int32)
+        cost_matrix = distances[jnp.ix_(starts_jax, pickups_jax)]  # Advanced indexing
+        return cost_matrix
     
     def match_pickups(starts, pickups, policy_fn, base_seed, use_discrete):
-        """Assign pickups to starts using Hungarian matching on travel-time cost."""
+        """
+        Fast: Assign pickups to starts using Hungarian matching on precomputed distances.
+        Uses offline distance matrix lookup instead of slow simulation.
+        """
         if len(starts) == 0:
             return pickups, jnp.zeros((0, 0), dtype=jnp.float32)
         
-        cost_matrix = build_cost_matrix(starts, pickups, policy_fn, base_seed, use_discrete)
+        # Fast: Just use precomputed distance matrix (no simulation needed!)
+        cost_matrix = build_cost_matrix_from_distances(starts, pickups, ctx.env.distances)
         _, assignment = optax.assignment.hungarian_algorithm(cost_matrix)
-        matched_pickups = jnp.take(pickups, assignment, axis=0)
+        matched_pickups = jnp.take(jnp.array(pickups, dtype=jnp.int32), assignment, axis=0)
         return matched_pickups, cost_matrix
     
-    # Evaluation loop with trajectory printing
+    # Batch operations for evaluation
+    batch_step_continuous = jax.jit(jax.vmap(ctx.env.step, in_axes=(0, 0)))
+    # Use JIT-compatible function directly (not the wrapper that calls float())
+    from training.q_learning import _jitted_step_with_discretization
+    # Note: _jitted_step_with_discretization doesn't use the key, so we ignore it
+    batch_step_discrete_fn = jax.vmap(
+        lambda s, a, k: _jitted_step_with_discretization(ctx.env, s, a, q_agent.discrete_travel_times, q_agent.dt),
+        in_axes=(0, 0, 0)
+    )
+    batch_step_discrete = jax.jit(batch_step_discrete_fn)
+    batch_reset = jax.jit(jax.vmap(lambda k, s, p: init_env(k, s, p, ctx.env.neighbor_mask_static), in_axes=(0, 0, 0)))
+    
+    def evaluate_q_learning_batched_impl(q_table, starts, pickups, eval_key, dt, max_time_slices, num_nodes, max_steps, use_continuous_eval):
+        """Batched GPU evaluation of Q-learning policy with path tracking."""
+        num_eval = starts.shape[0]
+        eval_keys = jax.random.split(eval_key, num_eval)
+        eval_states, _ = batch_reset(eval_keys, starts, pickups)
+        
+        total_times = jnp.zeros(num_eval, dtype=jnp.float32)
+        total_rewards = jnp.zeros(num_eval, dtype=jnp.float32)
+        completed = jnp.zeros(num_eval, dtype=bool)
+        max_eval_steps = max_steps  # Now static, so can use directly
+        
+        # Track paths, step rewards, and step times (fixed-size buffers)
+        path_buffer = jnp.zeros((num_eval, max_eval_steps + 1), dtype=jnp.int32)
+        step_rewards_buffer = jnp.zeros((num_eval, max_eval_steps), dtype=jnp.float32)
+        step_times_buffer = jnp.zeros((num_eval, max_eval_steps), dtype=jnp.float32)
+        path_lengths = jnp.zeros(num_eval, dtype=jnp.int32)
+        path_buffer = path_buffer.at[:, 0].set(eval_states.current_node)
+        path_lengths = path_lengths + 1
+        
+        def cond_fn(carry):
+            step, _, _, _, _, completed_mask, _, _, _, _, _ = carry
+            max_steps_jax = jnp.int32(max_eval_steps)  # Convert static int to JAX int32 for comparison
+            all_done = jnp.logical_or(jnp.all(completed_mask), step >= max_steps_jax)
+            return jnp.logical_not(all_done)
+        
+        def body_fn(carry):
+            step, states, times_acc, rewards_acc, completed_mask, path_buf, step_rewards_buf, step_times_buf, path_lens, step_keys, _ = carry
+            
+            # Discretize state time for Q-table lookup
+            discretized_times = dt * jnp.round(states.time / dt)
+            curr = jnp.clip(states.current_node, 0, num_nodes - 1)
+            pickup = jnp.clip(states.pickup_node, 0, num_nodes - 1)
+            t_idx = jnp.clip(jnp.int32(discretized_times / dt), 0, max_time_slices - 1)
+            
+            # Get Q-values and select greedy action
+            q_values = q_table[curr, pickup, t_idx, :]  # [num_eval, max_deg]
+            valid_mask = states.neighbor_mask
+            q_masked = jnp.where(valid_mask, q_values, -jnp.inf)
+            actions = jnp.argmax(q_masked, axis=-1)
+            
+            # Take step (continuous or discrete)
+            if use_continuous_eval:
+                next_states, rewards, terminals, info = batch_step_continuous(states, actions)
+            else:
+                step_keys, action_keys = jax.random.split(step_keys)
+                action_keys = jax.random.split(action_keys, num_eval)
+                next_states, rewards, terminals, info = batch_step_discrete(states, actions, action_keys)
+            
+            # Accumulate times and rewards
+            travel_times = info['travel'] + info['wait']
+            active = ~completed_mask
+            times_acc = times_acc + travel_times * active
+            rewards_acc = rewards_acc + rewards * active
+            completed_mask = completed_mask | terminals
+            
+            # Track paths, step rewards, and step times
+            path_idx = jnp.clip(path_lens, 0, max_eval_steps)
+            step_idx = jnp.clip(path_lens - 1, 0, max_eval_steps - 1)
+            path_buf = path_buf.at[jnp.arange(num_eval), path_idx].set(next_states.current_node)
+            step_rewards_buf = step_rewards_buf.at[jnp.arange(num_eval), step_idx].set(rewards)
+            step_times_buf = step_times_buf.at[jnp.arange(num_eval), step_idx].set(travel_times)
+            path_lens = path_lens + active.astype(jnp.int32)
+            
+            return (
+                step + jnp.int32(1),
+                next_states,
+                times_acc,
+                rewards_acc,
+                completed_mask,
+                path_buf,
+                step_rewards_buf,
+                step_times_buf,
+                path_lens,
+                step_keys,
+                None
+            )
+        
+        init_keys = jax.random.split(eval_key, num_eval)
+        init_carry = (
+            jnp.int32(0),
+            eval_states,
+            total_times,
+            total_rewards,
+            completed,
+            path_buffer,
+            step_rewards_buffer,
+            step_times_buffer,
+            path_lengths,
+            init_keys[0],  # Dummy key for discrete steps
+            None
+        )
+        _, _, total_times, total_rewards, completed, paths, step_rewards, step_times, path_lengths, _, _ = jax.lax.while_loop(
+            cond_fn, body_fn, init_carry
+        )
+        
+        return total_times, total_rewards, completed, paths, path_lengths, step_rewards, step_times
+    
+    # Wrap with jit, making max_steps and use_continuous_eval static
+    evaluate_q_learning_batched = jax.jit(evaluate_q_learning_batched_impl, static_argnums=(7, 8))
+
+    def evaluate_sp_policy_batched_impl(starts, pickups, eval_key, max_steps, use_discrete):
+        """Batched GPU evaluation of shortest path policy with path tracking."""
+        num_eval = starts.shape[0]
+        eval_keys = jax.random.split(eval_key, num_eval)
+        eval_states, _ = batch_reset(eval_keys, starts, pickups)
+        
+        total_times = jnp.zeros(num_eval, dtype=jnp.float32)
+        total_rewards = jnp.zeros(num_eval, dtype=jnp.float32)
+        completed = jnp.zeros(num_eval, dtype=bool)
+        max_eval_steps = max_steps  # Now static, so can use directly
+        
+        # Track paths, step rewards, and step times
+        path_buffer = jnp.zeros((num_eval, max_eval_steps + 1), dtype=jnp.int32)
+        step_rewards_buffer = jnp.zeros((num_eval, max_eval_steps), dtype=jnp.float32)
+        step_times_buffer = jnp.zeros((num_eval, max_eval_steps), dtype=jnp.float32)
+        path_lengths = jnp.zeros(num_eval, dtype=jnp.int32)
+        path_buffer = path_buffer.at[:, 0].set(eval_states.current_node)
+        path_lengths = path_lengths + 1
+        
+        def cond_fn(carry):
+            step, _, _, _, _, completed_mask, _, _, _, _, _ = carry
+            max_steps_jax = jnp.int32(max_eval_steps)  # Convert static int to JAX int32 for comparison
+            all_done = jnp.logical_or(jnp.all(completed_mask), step >= max_steps_jax)
+            return jnp.logical_not(all_done)
+        
+        def body_fn(carry):
+            step, states, times_acc, rewards_acc, completed_mask, path_buf, step_rewards_buf, step_times_buf, path_lens, step_keys, _ = carry
+            
+            # Use batched shortest path action
+            if use_discrete:
+                actions = offline_shortest_path_action_discrete_batch(
+                    states.current_node,
+                    states.pickup_node,
+                    ctx.env.adj_list,
+                    q_agent.discrete_travel_times,
+                    ctx.env.distances,
+                    ctx.env.neighbor_mask_static[states.current_node],
+                    1e-6  # epsilon
+                )
+            else:
+                actions = offline_shortest_path_action_batch(
+                    states.current_node,
+                    states.pickup_node,
+                    ctx.env.adj_list,
+                    ctx.env.travel_times,
+                    ctx.env.distances,
+                    ctx.env.neighbor_mask_static[states.current_node]
+                )
+            
+            # Take step (continuous or discrete)
+            if use_discrete:
+                step_keys, action_keys = jax.random.split(step_keys)
+                action_keys = jax.random.split(action_keys, num_eval)
+                next_states, rewards, terminals, info = batch_step_discrete(states, actions, action_keys)
+            else:
+                next_states, rewards, terminals, info = batch_step_continuous(states, actions)
+            
+            # Accumulate times and rewards
+            travel_times = info['travel'] + info['wait']
+            active = ~completed_mask
+            times_acc = times_acc + travel_times * active
+            rewards_acc = rewards_acc + rewards * active
+            completed_mask = completed_mask | terminals
+            
+            # Track paths, step rewards, and step times
+            path_idx = jnp.clip(path_lens, 0, max_eval_steps)
+            step_idx = jnp.clip(path_lens - 1, 0, max_eval_steps - 1)
+            path_buf = path_buf.at[jnp.arange(num_eval), path_idx].set(next_states.current_node)
+            step_rewards_buf = step_rewards_buf.at[jnp.arange(num_eval), step_idx].set(rewards)
+            step_times_buf = step_times_buf.at[jnp.arange(num_eval), step_idx].set(travel_times)
+            path_lens = path_lens + active.astype(jnp.int32)
+            
+            return (
+                step + jnp.int32(1),
+                next_states,
+                times_acc,
+                rewards_acc,
+                completed_mask,
+                path_buf,
+                step_rewards_buf,
+                step_times_buf,
+                path_lens,
+                step_keys,
+                None
+            )
+        
+        init_keys = jax.random.split(eval_key, num_eval)
+        init_carry = (
+            jnp.int32(0),
+            eval_states,
+            total_times,
+            total_rewards,
+            completed,
+            path_buffer,
+            step_rewards_buffer,
+            step_times_buffer,
+            path_lengths,
+            init_keys[0],
+            None
+        )
+        _, _, total_times, total_rewards, completed, paths, step_rewards, step_times, path_lengths, _, _ = jax.lax.while_loop(
+            cond_fn, body_fn, init_carry
+        )
+        
+        return total_times, total_rewards, completed, paths, path_lengths, step_rewards, step_times
+    
+    # Wrap with jit, making max_steps and use_discrete static
+    evaluate_sp_policy_batched = jax.jit(evaluate_sp_policy_batched_impl, static_argnums=(3, 4))
+
+    # Evaluation loop with trajectory printing - now optimized with batched GPU evaluation
     eval_iter = 500
     eval_loop_key = jax.random.PRNGKey(args.seed + 1000)
+    max_eval_steps = 2 * ctx.max_length
     
     print("\n" + "="*60)
-    print("Starting trajectory evaluation and visualization...")
+    print("Starting optimized batched GPU trajectory evaluation...")
+    print(f"🚀 Running {eval_iter} iterations with batched GPU evaluation")
     print("="*60)
     
     for i in range(eval_iter):
@@ -771,18 +973,22 @@ def run_q_learning(args, ctx: RunContext) -> None:
         num_pickups = len(eval_pickups)
         
         # Q-learning matching: use Q-table estimation (fast)
+        # Sample a random time index (same for all agents, consistent with training)
+        time_key = jax.random.PRNGKey(base_seed + 999)
+        time_idx = jax.random.randint(time_key, (), 0, q_agent.max_time_slices)
+        
         starts_expanded = jnp.repeat(starts_jax, num_pickups)
         pickups_expanded = jnp.tile(pickups_jax, num_starts)
         returns_flat = _estimate_returns_batch_q_table_direct(
             q_agent.q_table, starts_expanded, pickups_expanded,
-            ctx.env.num_nodes, ctx.env
+            time_idx, ctx.env.num_nodes, q_agent.max_time_slices, ctx.env
         )
         returns_matrix = returns_flat.reshape(num_starts, num_pickups)
         cost_matrix_q = -returns_matrix
         _, assignment_q = optax.assignment.hungarian_algorithm(cost_matrix_q)
         matched_q_pickups = jnp.take(pickups_jax, assignment_q, axis=0)
         
-        # Shortest path matching: use simulation-based (original implementation)
+        # Shortest path matching: use fast offline distance matrix lookup (no simulation needed!)
         matched_sp_pickups_cont, _ = match_pickups(
             eval_starts, eval_pickups, sp_policy, base_seed + 1, use_discrete=False
         )
@@ -790,104 +996,69 @@ def run_q_learning(args, ctx: RunContext) -> None:
             eval_starts, eval_pickups, sp_policy_discrete, base_seed + 2, use_discrete=True
         )
         
-        def discretize_state_time(state: TaxiState, dt: float) -> TaxiState:
-            """Create a copy of state with discretized time for Q-table lookup."""
-            discretized_time = dt * round(state.time / dt)
-            return TaxiState(
-                current_node=state.current_node,
-                pickup_node=state.pickup_node,
-                done=state.done,
-                step_count=state.step_count,
-                neighbor_mask=state.neighbor_mask,
-                time=discretized_time,
-            )
+        # Batched GPU evaluation - much faster!
+        eval_loop_key, q_cont_key = jax.random.split(eval_loop_key)
+        eval_loop_key, q_disc_key = jax.random.split(eval_loop_key)
+        eval_loop_key, sp_cont_key = jax.random.split(eval_loop_key)
+        eval_loop_key, sp_disc_key = jax.random.split(eval_loop_key)
         
-        def evaluate_policy_single(policy_fn, starts, pickups, use_discrete=False, use_continuous_eval=False):
-            """
-            Evaluate policy and return times, paths, rewards, step rewards, and step times.
-            
-            Args:
-                policy_fn: Policy function that takes a state and returns an action
-                starts: List of start nodes
-                pickups: List of pickup nodes
-                use_discrete: If True, discretize state time for Q-table lookup (for Q-learning)
-                use_continuous_eval: If True, use continuous env.step() even when use_discrete=True
-                                     (for Q-learning: train in discrete, eval in continuous)
-            """
-            times, paths, rewards, step_rewards_list, step_times_list = [], [], [], [], []
-            dt = q_agent.dt if hasattr(q_agent, 'dt') else 1.0
-            
-            for start, pickup in zip(np.array(starts).tolist(), np.array(pickups).tolist()):
-                total_time, total_reward = 0.0, 0.0
-                step_count = 0
-                state = init_env(jax.random.PRNGKey(0), start, pickup, ctx.env.neighbor_mask_static)[0]
-                traj = [int(state.current_node)]
-                step_rewards = []
-                step_times = []
-                
-                while (not bool(state.done)) and step_count < 2*ctx.max_length:
-                    # For Q-learning with continuous evaluation:
-                    # Discretize state time for Q-table lookup (action selection)
-                    # but use continuous environment for actual step
-                    if use_discrete and use_continuous_eval:
-                        state_for_policy = discretize_state_time(state, dt)
-                        action = policy_fn(state_for_policy)
-                        # Use continuous environment step
-                        next_state, reward, done, info = ctx.env.step(state, action)
-                    elif use_discrete:
-                        # Original behavior: use discretized step for Q-learning
-                        state_for_policy = discretize_state_time(state, dt)
-                        action = policy_fn(state_for_policy)
-                        next_state, reward, done, info = q_agent.step_with_discretization(
-                            state, action, jax.random.PRNGKey(step_count)
-                        )
-                    else:
-                        # Use normal step for shortest path
-                        action = policy_fn(state)
-                        next_state, reward, done, info = ctx.env.step(state, action)
-                    
-                    step_time = float(info['travel'] + info['wait'])
-                    total_time += step_time
-                    step_reward = float(reward)
-                    total_reward += step_reward
-                    step_rewards.append(step_reward)
-                    step_times.append(step_time)
-                    traj.append(int(next_state.current_node))
-                    step_count += 1
-                    state = next_state
-                    
-                    if done:
-                        break
-                
-                times.append(total_time)
-                rewards.append(total_reward)
-                paths.append(traj)
-                step_rewards_list.append(step_rewards)
-                step_times_list.append(step_times)
-            
-            return np.array(times), paths, np.array(rewards), step_rewards_list, step_times_list
+        print(f"\n✅ Evaluation iteration {i+1}/{eval_iter} (batched GPU)")
         
-        print(f"\nEvaluation iteration {i+1}/{eval_iter}")
-        print(f"Evaluating Q-learning policy (continuous) for starts: {eval_starts} and pickups: {matched_q_pickups}")
-        # Use continuous evaluation: discretize state for Q-table lookup, but use continuous env.step()
-        q_times_continuous, q_paths_continuous, q_rewards_continuous, q_step_rewards_continuous, q_step_times_continuous = evaluate_policy_single(
-            q_learning_policy, eval_starts, matched_q_pickups, use_discrete=True, use_continuous_eval=True
+        # Q-learning continuous evaluation
+        q_times_continuous, q_rewards_continuous, q_completed_continuous, q_paths_continuous, q_path_lens_continuous, q_step_rewards_continuous, q_step_times_continuous = evaluate_q_learning_batched(
+            q_agent.q_table, eval_starts, matched_q_pickups, q_cont_key,
+            q_agent.dt, q_agent.max_time_slices, ctx.env.num_nodes, max_eval_steps, use_continuous_eval=True
         )
         
-        print(f"Evaluating Q-learning policy (discrete) for starts: {eval_starts} and pickups: {matched_q_pickups}")
-        # Use discrete evaluation: same environment as training
-        q_times_discrete, q_paths_discrete, q_rewards_discrete, q_step_rewards_discrete, q_step_times_discrete = evaluate_policy_single(
-            q_learning_policy, eval_starts, matched_q_pickups, use_discrete=True, use_continuous_eval=False
+        # Q-learning discrete evaluation
+        q_times_discrete, q_rewards_discrete, q_completed_discrete, q_paths_discrete, q_path_lens_discrete, q_step_rewards_discrete, q_step_times_discrete = evaluate_q_learning_batched(
+            q_agent.q_table, eval_starts, matched_q_pickups, q_disc_key,
+            q_agent.dt, q_agent.max_time_slices, ctx.env.num_nodes, max_eval_steps, use_continuous_eval=False
         )
         
-        print(f"Evaluating SP policy (continuous) for starts: {eval_starts} and pickups: {matched_sp_pickups_cont}")
-        sp_times_continuous, sp_paths_continuous, sp_rewards_continuous, sp_step_rewards_continuous, sp_step_times_continuous = evaluate_policy_single(
-            sp_policy, eval_starts, matched_sp_pickups_cont, use_discrete=False
+        # SP continuous evaluation
+        sp_times_continuous, sp_rewards_continuous, sp_completed_continuous, sp_paths_continuous, sp_path_lens_continuous, sp_step_rewards_continuous, sp_step_times_continuous = evaluate_sp_policy_batched(
+            eval_starts, matched_sp_pickups_cont, sp_cont_key, max_eval_steps, use_discrete=False
         )
         
-        print(f"Evaluating SP policy (discrete) for starts: {eval_starts} and pickups: {matched_sp_pickups_disc}")
-        sp_times_discrete, sp_paths_discrete, sp_rewards_discrete, sp_step_rewards_discrete, sp_step_times_discrete = evaluate_policy_single(
-            sp_policy_discrete, eval_starts, matched_sp_pickups_disc, use_discrete=True
+        # SP discrete evaluation
+        sp_times_discrete, sp_rewards_discrete, sp_completed_discrete, sp_paths_discrete, sp_path_lens_discrete, sp_step_rewards_discrete, sp_step_times_discrete = evaluate_sp_policy_batched(
+            eval_starts, matched_sp_pickups_disc, sp_disc_key, max_eval_steps, use_discrete=True
+        )
+        
+        # Convert to numpy and extract variable-length paths/step data
+        q_times_continuous = np.array(q_times_continuous)
+        q_times_discrete = np.array(q_times_discrete)
+        sp_times_continuous = np.array(sp_times_continuous)
+        sp_times_discrete = np.array(sp_times_discrete)
+        q_rewards_continuous = np.array(q_rewards_continuous)
+        q_rewards_discrete = np.array(q_rewards_discrete)
+        sp_rewards_continuous = np.array(sp_rewards_continuous)
+        sp_rewards_discrete = np.array(sp_rewards_discrete)
+        
+        # Extract paths and step-level data (convert from padded arrays to lists)
+        def extract_paths_and_steps(paths_array, path_lens_array, step_rewards_array, step_times_array):
+            paths_list = []
+            step_rewards_list = []
+            step_times_list = []
+            for j in range(paths_array.shape[0]):
+                path_len = int(path_lens_array[j])
+                paths_list.append([int(x) for x in paths_array[j, :path_len]])
+                step_rewards_list.append([float(x) for x in step_rewards_array[j, :path_len-1] if path_len > 1])
+                step_times_list.append([float(x) for x in step_times_array[j, :path_len-1] if path_len > 1])
+            return paths_list, step_rewards_list, step_times_list
+        
+        q_paths_continuous, q_step_rewards_continuous, q_step_times_continuous = extract_paths_and_steps(
+            q_paths_continuous, q_path_lens_continuous, q_step_rewards_continuous, q_step_times_continuous
+        )
+        q_paths_discrete, q_step_rewards_discrete, q_step_times_discrete = extract_paths_and_steps(
+            q_paths_discrete, q_path_lens_discrete, q_step_rewards_discrete, q_step_times_discrete
+        )
+        sp_paths_continuous, sp_step_rewards_continuous, sp_step_times_continuous = extract_paths_and_steps(
+            sp_paths_continuous, sp_path_lens_continuous, sp_step_rewards_continuous, sp_step_times_continuous
+        )
+        sp_paths_discrete, sp_step_rewards_discrete, sp_step_times_discrete = extract_paths_and_steps(
+            sp_paths_discrete, sp_path_lens_discrete, sp_step_rewards_discrete, sp_step_times_discrete
         )
         
         # Print trajectories with step rewards and step times
