@@ -48,6 +48,8 @@ class MAPPOConfig:
     batch_episodes: int = 64
     n_batches: int = 500
     obs_mode: str = "relative_targets"
+    minibatch_size_actor: int = 4096
+    minibatch_size_critic: int = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +103,7 @@ def _validate_obs_mode(obs_mode: str) -> str:
 def _gae_batched(
     rewards: np.ndarray,   # (H, E)
     values: np.ndarray,    # (H, E)
+    not_done: np.ndarray,  # (H, E): 1 if transition t->t+1 is non-terminal
     gamma: float,
     lam: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -110,8 +113,9 @@ def _gae_batched(
     gae = np.zeros(E, dtype=np.float32)
     for t in range(H - 1, -1, -1):
         nv = values[t + 1] if t < H - 1 else np.zeros(E, dtype=np.float32)
-        delta = rewards[t] + gamma * nv - values[t]
-        gae = delta + gamma * lam * gae
+        nd = not_done[t]
+        delta = rewards[t] + gamma * nd * nv - values[t]
+        gae = delta + gamma * lam * nd * gae
         adv[t] = gae
     return adv, adv + values
 
@@ -204,6 +208,8 @@ def train_mappo(
         s_obs_g = np.empty((H, E, state_dim), dtype=np.float32)
         s_rew   = np.empty((H, E), dtype=np.float32)
         s_val   = np.empty((H, E), dtype=np.float32)
+        s_not_done = np.empty((H, E), dtype=np.float32)
+        s_state_mask = np.empty((H, E), dtype=np.float32)
 
         # Reuse buffers across timesteps to reduce allocation overhead.
         obs_l = np.empty((E, N, obs_dim), dtype=np.float32)
@@ -235,6 +241,7 @@ def train_mappo(
             obs_g[:, tbase + 2 * M:] = tgt_active.astype(np.float32)
 
             mask = (~reached).astype(np.float32)           # (E, N)
+            s_state_mask[t] = (mask.sum(axis=1) > 0).astype(np.float32)
 
             # ---- ONE forward pass for all E*N agents ----
             ol_flat = obs_l.reshape(E * N, obs_dim)
@@ -319,6 +326,8 @@ def train_mappo(
                     fp = [(int(new_r[e,i]), int(new_c[e,i])) for i in range(N)]
                     tl = [(int(tgt_r[e, j]), int(tgt_c[e, j])) for j in range(M)]
                     rew[e] -= terminal_ot_cost(fp, tl)
+            all_reached = reached.all(axis=1)
+            s_not_done[t] = (((t < (H - 1)) & (~all_reached))).astype(np.float32)
 
             # ---- store ----
             s_obs_l[t] = ol_flat
@@ -332,7 +341,7 @@ def train_mappo(
             pos_r, pos_c = new_r, new_c
 
         # ---- GAE (all E episodes vectorised) ----
-        adv, ret = _gae_batched(s_rew, s_val, cfg.gamma, cfg.gae_lambda)
+        adv, ret = _gae_batched(s_rew, s_val, s_not_done, cfg.gamma, cfg.gae_lambda)
 
         # ---- build PPO tensors ----
         # actor  (H*E*N, ...)
@@ -345,6 +354,7 @@ def train_mappo(
         # critic (H*E, ...)
         c_obs = torch.from_numpy(s_obs_g.reshape(H*E, state_dim))
         c_ret = torch.from_numpy(ret.reshape(H*E))
+        c_mask = torch.from_numpy(s_state_mask.reshape(H*E))
 
         # normalise advantages
         am = b_mask > 0.5
@@ -352,34 +362,58 @@ def train_mappo(
             b_adv = (b_adv - b_adv[am].mean()) / (b_adv[am].std() + 1e-8)
 
         # ---- PPO update ----
-        actor_loss_v = np.nan
-        critic_loss_v = np.nan
-        entropy_v = np.nan
-        clip_frac_v = np.nan
-        ms = b_mask.sum()
+        actor_losses: List[float] = []
+        critic_losses: List[float] = []
+        entropies: List[float] = []
+        clip_fracs: List[float] = []
+        n_actor = H * E * N
+        n_critic = H * E
+        mb_a = max(1, min(cfg.minibatch_size_actor, n_actor))
+        mb_c = max(1, min(cfg.minibatch_size_critic, n_critic))
         for _ in range(cfg.ppo_epochs):
-            nlp, ent = actor.evaluate(b_obs, b_acts)
-            ratio = torch.exp(nlp - b_logp)
-            s1 = ratio * b_adv
-            s2 = torch.clamp(ratio, 1-cfg.clip_eps, 1+cfg.clip_eps) * b_adv
-            # Fraction of active samples where PPO ratio is clipped.
-            clipped = ((ratio < (1 - cfg.clip_eps)) | (ratio > (1 + cfg.clip_eps))).float()
-            clip_frac = (clipped * b_mask).sum() / ms
-            a_loss = (-(torch.min(s1, s2) * b_mask).sum() / ms
-                      - entropy_coef_t * (ent * b_mask).sum() / ms)
-            opt_a.zero_grad(); a_loss.backward()
-            nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
-            opt_a.step()
+            perm_a = rng.permutation(n_actor)
+            for start in range(0, n_actor, mb_a):
+                idx_np = perm_a[start:start + mb_a]
+                idx = torch.from_numpy(idx_np)
+                mb_mask = b_mask[idx]
+                ms = mb_mask.sum()
+                if ms.item() <= 0:
+                    continue
+                nlp, ent = actor.evaluate(b_obs[idx], b_acts[idx])
+                ratio = torch.exp(nlp - b_logp[idx])
+                s1 = ratio * b_adv[idx]
+                s2 = torch.clamp(ratio, 1-cfg.clip_eps, 1+cfg.clip_eps) * b_adv[idx]
+                clipped = ((ratio < (1 - cfg.clip_eps)) | (ratio > (1 + cfg.clip_eps))).float()
+                clip_frac = (clipped * mb_mask).sum() / ms
+                a_loss = (-(torch.min(s1, s2) * mb_mask).sum() / ms
+                          - entropy_coef_t * (ent * mb_mask).sum() / ms)
+                opt_a.zero_grad(); a_loss.backward()
+                nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
+                opt_a.step()
+                actor_losses.append(float(a_loss.item()))
+                entropies.append(float(((ent * mb_mask).sum() / ms).item()))
+                clip_fracs.append(float(clip_frac.item()))
 
-            v = critic(c_obs)
-            c_loss = F.mse_loss(v, c_ret)
-            opt_c.zero_grad(); c_loss.backward()
-            nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
-            opt_c.step()
-            actor_loss_v = float(a_loss.item())
-            critic_loss_v = float(c_loss.item())
-            entropy_v = float(((ent * b_mask).sum() / ms).item())
-            clip_frac_v = float(clip_frac.item())
+            perm_c = rng.permutation(n_critic)
+            for start in range(0, n_critic, mb_c):
+                idx_np = perm_c[start:start + mb_c]
+                idx = torch.from_numpy(idx_np)
+                mb_c_mask = c_mask[idx]
+                ms_c = mb_c_mask.sum()
+                if ms_c.item() <= 0:
+                    continue
+                v = critic(c_obs[idx])
+                diff2 = (v - c_ret[idx]).pow(2)
+                c_loss = (diff2 * mb_c_mask).sum() / ms_c
+                opt_c.zero_grad(); c_loss.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+                opt_c.step()
+                critic_losses.append(float(c_loss.item()))
+
+        actor_loss_v = float(np.mean(actor_losses)) if actor_losses else float("nan")
+        critic_loss_v = float(np.mean(critic_losses)) if critic_losses else float("nan")
+        entropy_v = float(np.mean(entropies)) if entropies else float("nan")
+        clip_frac_v = float(np.mean(clip_fracs)) if clip_fracs else float("nan")
 
         mean_rew = float(s_rew.sum()) / E
         reach_rate = float(reached.mean())

@@ -39,6 +39,11 @@ class QMIXConfig:
     eps_start: float = 0.5
     eps_end: float = 0.05
     eps_decay_episodes: int = 20_000
+    replay_capacity: int = 100_000
+    min_replay_size: int = 2_048
+    batch_size: int = 512
+    updates_per_batch: int = 4
+    double_q: bool = True
 
 
 class QMIXQNet(nn.Module):
@@ -76,6 +81,65 @@ class QMixer(nn.Module):
         b2 = self.hyper_b2(states).view(B, 1, 1)
         y = torch.bmm(hidden, w2) + b2
         return y.view(B)
+
+
+class QMIXReplayBuffer:
+    """Simple ring-buffer replay for transition-level QMIX updates."""
+
+    def __init__(self, capacity: int, n_agents: int, obs_dim: int, state_dim: int):
+        self.capacity = int(max(1, capacity))
+        self.size = 0
+        self.ptr = 0
+        self.obs = np.empty((self.capacity, n_agents, obs_dim), dtype=np.float32)
+        self.state = np.empty((self.capacity, state_dim), dtype=np.float32)
+        self.acts = np.empty((self.capacity, n_agents), dtype=np.int64)
+        self.rew = np.empty((self.capacity,), dtype=np.float32)
+        self.mask = np.empty((self.capacity, n_agents), dtype=np.float32)
+        self.next_obs = np.empty((self.capacity, n_agents, obs_dim), dtype=np.float32)
+        self.next_state = np.empty((self.capacity, state_dim), dtype=np.float32)
+        self.next_mask = np.empty((self.capacity, n_agents), dtype=np.float32)
+        self.not_done = np.empty((self.capacity,), dtype=np.float32)
+
+    def add_batch(
+        self,
+        obs: np.ndarray,
+        state: np.ndarray,
+        acts: np.ndarray,
+        rew: np.ndarray,
+        mask: np.ndarray,
+        next_obs: np.ndarray,
+        next_state: np.ndarray,
+        next_mask: np.ndarray,
+        not_done: np.ndarray,
+    ) -> None:
+        n = int(obs.shape[0])
+        idx = (np.arange(n, dtype=np.int64) + self.ptr) % self.capacity
+        self.obs[idx] = obs
+        self.state[idx] = state
+        self.acts[idx] = acts
+        self.rew[idx] = rew
+        self.mask[idx] = mask
+        self.next_obs[idx] = next_obs
+        self.next_state[idx] = next_state
+        self.next_mask[idx] = next_mask
+        self.not_done[idx] = not_done
+        self.ptr = int((self.ptr + n) % self.capacity)
+        self.size = int(min(self.capacity, self.size + n))
+
+    def sample(self, batch_size: int, rng: np.random.Generator) -> Dict[str, np.ndarray]:
+        bs = int(max(1, batch_size))
+        idx = rng.integers(0, self.size, size=bs, dtype=np.int64)
+        return {
+            "obs": self.obs[idx],
+            "state": self.state[idx],
+            "acts": self.acts[idx],
+            "rew": self.rew[idx],
+            "mask": self.mask[idx],
+            "next_obs": self.next_obs[idx],
+            "next_state": self.next_state[idx],
+            "next_mask": self.next_mask[idx],
+            "not_done": self.not_done[idx],
+        }
 
 
 def _validate_obs_mode(obs_mode: str) -> str:
@@ -129,6 +193,8 @@ def train_qmix(
     target_q_net = copy.deepcopy(q_net)
     target_mixer = copy.deepcopy(mixer)
     opt = torch.optim.Adam(list(q_net.parameters()) + list(mixer.parameters()), lr=cfg.lr)
+    replay = QMIXReplayBuffer(cfg.replay_capacity, N, obs_dim, state_dim)
+    total_updates = 0
 
     aid = np.arange(N, dtype=np.float32) / max(1, N - 1)
     kind = noise_cfg.kind
@@ -296,35 +362,63 @@ def train_qmix(
             pos_r, pos_c = new_r, new_c
 
         B = H * E
-        b_obs = torch.from_numpy(s_obs.reshape(B * N, obs_dim))
-        b_state = torch.from_numpy(s_state.reshape(B, state_dim))
-        b_next_obs = torch.from_numpy(s_next_obs.reshape(B * N, obs_dim))
-        b_next_state = torch.from_numpy(s_next_state.reshape(B, state_dim))
-        b_acts = torch.from_numpy(s_acts.reshape(B, N))
-        b_rew = torch.from_numpy(s_rew.reshape(B))
-        b_mask = torch.from_numpy(s_mask.reshape(B, N))
-        b_next_mask = torch.from_numpy(s_next_mask.reshape(B, N))
-        b_not_done = torch.from_numpy(s_not_done.reshape(B))
+        replay.add_batch(
+            obs=s_obs.reshape(B, N, obs_dim),
+            state=s_state.reshape(B, state_dim),
+            acts=s_acts.reshape(B, N),
+            rew=s_rew.reshape(B),
+            mask=s_mask.reshape(B, N),
+            next_obs=s_next_obs.reshape(B, N, obs_dim),
+            next_state=s_next_state.reshape(B, state_dim),
+            next_mask=s_next_mask.reshape(B, N),
+            not_done=s_not_done.reshape(B),
+        )
 
-        q_all = q_net(b_obs).reshape(B, N, n_act)
-        q_taken = torch.gather(q_all, dim=2, index=b_acts.unsqueeze(-1)).squeeze(-1)
-        q_taken = q_taken * b_mask
-        q_tot = mixer(q_taken, b_state)
+        loss_v = float("nan")
+        if replay.size >= max(1, cfg.min_replay_size, cfg.batch_size):
+            for _ in range(max(1, cfg.updates_per_batch)):
+                batch = replay.sample(cfg.batch_size, rng)
+                bs = int(batch["obs"].shape[0])
+                b_obs = torch.from_numpy(batch["obs"].reshape(bs * N, obs_dim))
+                b_state = torch.from_numpy(batch["state"])
+                b_next_obs = torch.from_numpy(batch["next_obs"].reshape(bs * N, obs_dim))
+                b_next_state = torch.from_numpy(batch["next_state"])
+                b_acts = torch.from_numpy(batch["acts"])
+                b_rew = torch.from_numpy(batch["rew"])
+                b_mask = torch.from_numpy(batch["mask"])
+                b_next_mask = torch.from_numpy(batch["next_mask"])
+                b_not_done = torch.from_numpy(batch["not_done"])
 
-        with torch.no_grad():
-            q_next_all = target_q_net(b_next_obs).reshape(B, N, n_act)
-            q_next_max = q_next_all.max(dim=2).values * b_next_mask
-            q_tot_next = target_mixer(q_next_max, b_next_state)
-            td_target = b_rew + cfg.gamma * b_not_done * q_tot_next
+                q_all = q_net(b_obs).reshape(bs, N, n_act)
+                q_taken = torch.gather(q_all, dim=2, index=b_acts.unsqueeze(-1)).squeeze(-1)
+                q_tot = mixer(q_taken * b_mask, b_state)
 
-        loss = F.mse_loss(q_tot, td_target)
-        opt.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(list(q_net.parameters()) + list(mixer.parameters()), 0.5)
-        opt.step()
-        if (batch_idx + 1) % max(1, cfg.target_update_every) == 0:
-            target_q_net.load_state_dict(q_net.state_dict())
-            target_mixer.load_state_dict(mixer.state_dict())
+                with torch.no_grad():
+                    if cfg.double_q:
+                        q_next_online = q_net(b_next_obs).reshape(bs, N, n_act)
+                        next_argmax = q_next_online.argmax(dim=2, keepdim=True)
+                        q_next_target = target_q_net(b_next_obs).reshape(bs, N, n_act)
+                        q_next_sel = torch.gather(
+                            q_next_target, dim=2, index=next_argmax
+                        ).squeeze(-1)
+                    else:
+                        q_next_target = target_q_net(b_next_obs).reshape(bs, N, n_act)
+                        q_next_sel = q_next_target.max(dim=2).values
+                    q_tot_next = target_mixer(q_next_sel * b_next_mask, b_next_state)
+                    td_target = b_rew + cfg.gamma * b_not_done * q_tot_next
+
+                loss = F.mse_loss(q_tot, td_target)
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(q_net.parameters()) + list(mixer.parameters()), 0.5
+                )
+                opt.step()
+                loss_v = float(loss.item())
+                total_updates += 1
+                if total_updates % max(1, cfg.target_update_every) == 0:
+                    target_q_net.load_state_dict(q_net.state_dict())
+                    target_mixer.load_state_dict(mixer.state_dict())
 
         mean_rew = float(s_rew.sum()) / E
         reach_rate = float(reached.mean())
@@ -349,7 +443,8 @@ def train_qmix(
                 f"{p}/mean_reward": rec,
                 f"{p}/last_batch_reward": float(mean_rew),
                 f"{p}/reach_rate": reach_rate,
-                f"{p}/td_loss": float(loss.item()),
+                f"{p}/td_loss": loss_v,
+                f"{p}/replay_size": int(replay.size),
             })
 
     q_net.obs_mode = obs_mode

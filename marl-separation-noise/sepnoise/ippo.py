@@ -41,6 +41,8 @@ class IPPOConfig:
     batch_episodes: int = 64
     n_batches: int = 500
     obs_mode: str = "relative_targets"
+    minibatch_size_actor: int = 4096
+    minibatch_size_critic: int = 4096
 
 
 class Actor(nn.Module):
@@ -90,6 +92,7 @@ def _validate_obs_mode(obs_mode: str) -> str:
 def _gae_batched(
     rewards: np.ndarray,   # (H, E*N)
     values: np.ndarray,    # (H, E*N)
+    not_done: np.ndarray,  # (H, E*N): 1 if transition t->t+1 is non-terminal
     gamma: float,
     lam: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -98,8 +101,9 @@ def _gae_batched(
     gae = np.zeros(B, dtype=np.float32)
     for t in range(H - 1, -1, -1):
         nv = values[t + 1] if t < H - 1 else np.zeros(B, dtype=np.float32)
-        delta = rewards[t] + gamma * nv - values[t]
-        gae = delta + gamma * lam * gae
+        nd = not_done[t]
+        delta = rewards[t] + gamma * nd * nv - values[t]
+        gae = delta + gamma * lam * nd * gae
         adv[t] = gae
     return adv, adv + values
 
@@ -172,6 +176,7 @@ def train_ippo(
         s_mask = np.empty((H, E, N), dtype=np.float32)
         s_rew = np.empty((H, E, N), dtype=np.float32)
         s_val = np.empty((H, E, N), dtype=np.float32)
+        s_not_done = np.empty((H, E, N), dtype=np.float32)
 
         obs_l = np.empty((E, N, obs_dim), dtype=np.float32)
         for t in range(H):
@@ -259,6 +264,7 @@ def train_ippo(
                     fp = [(int(new_r[e, i]), int(new_c[e, i])) for i in range(N)]
                     tl = [(int(tgt_r[e, j]), int(tgt_c[e, j])) for j in range(M)]
                     rew_agents[e, :] -= float(terminal_ot_cost(fp, tl)) / max(1, N)
+            s_not_done[t] = (((t < (H - 1)) & (~reached))).astype(np.float32)
 
             s_obs[t] = obs_l
             s_acts[t] = actions
@@ -272,6 +278,7 @@ def train_ippo(
         adv, ret = _gae_batched(
             s_rew.reshape(H, E * N),
             s_val.reshape(H, E * N),
+            s_not_done.reshape(H, E * N),
             cfg.gamma,
             cfg.gae_lambda,
         )
@@ -287,37 +294,59 @@ def train_ippo(
         if am.sum() > 1:
             b_adv = (b_adv - b_adv[am].mean()) / (b_adv[am].std() + 1e-8)
 
-        actor_loss_v = np.nan
-        critic_loss_v = np.nan
-        entropy_v = np.nan
-        clip_frac_v = np.nan
-        ms = b_mask.sum()
+        actor_losses: List[float] = []
+        critic_losses: List[float] = []
+        entropies: List[float] = []
+        clip_fracs: List[float] = []
+        n_samples = H * E * N
+        mb_a = max(1, min(cfg.minibatch_size_actor, n_samples))
+        mb_c = max(1, min(cfg.minibatch_size_critic, n_samples))
         for _ in range(cfg.ppo_epochs):
-            nlp, ent = actor.evaluate(b_obs, b_acts)
-            ratio = torch.exp(nlp - b_logp)
-            s1 = ratio * b_adv
-            s2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * b_adv
-            clipped = ((ratio < (1 - cfg.clip_eps)) | (ratio > (1 + cfg.clip_eps))).float()
-            clip_frac = (clipped * b_mask).sum() / ms
-            a_loss = (
-                -(torch.min(s1, s2) * b_mask).sum() / ms
-                - entropy_coef_t * (ent * b_mask).sum() / ms
-            )
-            opt_a.zero_grad()
-            a_loss.backward()
-            nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
-            opt_a.step()
+            perm_a = rng.permutation(n_samples)
+            for start in range(0, n_samples, mb_a):
+                idx_np = perm_a[start:start + mb_a]
+                idx = torch.from_numpy(idx_np)
+                mb_mask = b_mask[idx]
+                ms = mb_mask.sum()
+                if ms.item() <= 0:
+                    continue
+                nlp, ent = actor.evaluate(b_obs[idx], b_acts[idx])
+                ratio = torch.exp(nlp - b_logp[idx])
+                s1 = ratio * b_adv[idx]
+                s2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * b_adv[idx]
+                clipped = ((ratio < (1 - cfg.clip_eps)) | (ratio > (1 + cfg.clip_eps))).float()
+                clip_frac = (clipped * mb_mask).sum() / ms
+                a_loss = (
+                    -(torch.min(s1, s2) * mb_mask).sum() / ms
+                    - entropy_coef_t * (ent * mb_mask).sum() / ms
+                )
+                opt_a.zero_grad()
+                a_loss.backward()
+                nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
+                opt_a.step()
+                actor_losses.append(float(a_loss.item()))
+                entropies.append(float(((ent * mb_mask).sum() / ms).item()))
+                clip_fracs.append(float(clip_frac.item()))
 
-            v = critic(b_obs)
-            c_loss = ((v - b_ret).pow(2) * b_mask).sum() / ms
-            opt_c.zero_grad()
-            c_loss.backward()
-            nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
-            opt_c.step()
-            actor_loss_v = float(a_loss.item())
-            critic_loss_v = float(c_loss.item())
-            entropy_v = float(((ent * b_mask).sum() / ms).item())
-            clip_frac_v = float(clip_frac.item())
+            perm_c = rng.permutation(n_samples)
+            for start in range(0, n_samples, mb_c):
+                idx_np = perm_c[start:start + mb_c]
+                idx = torch.from_numpy(idx_np)
+                mb_mask = b_mask[idx]
+                ms = mb_mask.sum()
+                if ms.item() <= 0:
+                    continue
+                v = critic(b_obs[idx])
+                c_loss = ((v - b_ret[idx]).pow(2) * mb_mask).sum() / ms
+                opt_c.zero_grad()
+                c_loss.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+                opt_c.step()
+                critic_losses.append(float(c_loss.item()))
+        actor_loss_v = float(np.mean(actor_losses)) if actor_losses else float("nan")
+        critic_loss_v = float(np.mean(critic_losses)) if critic_losses else float("nan")
+        entropy_v = float(np.mean(entropies)) if entropies else float("nan")
+        clip_frac_v = float(np.mean(clip_fracs)) if clip_fracs else float("nan")
 
         mean_rew = float(s_rew.sum()) / E
         reach_rate = float(reached.mean())

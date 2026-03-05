@@ -32,7 +32,6 @@ htmlcov/
 *.log
 
 # Project-generated artifacts
-runs/
 wandb/
 benchmarl-vmas-coopnav/
 mappo_navigation_*
