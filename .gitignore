@@ -112,3 +112,4 @@ src/iframe_figures/
 src/analyze_*.py
 src/brute_force.py
 test/
+src/visualize_manhattan_log.py

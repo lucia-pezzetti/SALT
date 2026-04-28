@@ -8,7 +8,7 @@ training environment.
 
 Features:
 - M agents with state tracking (free/on_a_ride)
-- Optimal transport matching using shortest path costs
+- Optimal transport matching using Q-table values (if loaded) or shortest path costs
 - Traffic light waiting times
 - Discrete event simulation where agents decide at node arrivals
 - Support for Q-table greedy policy
@@ -104,7 +104,7 @@ class ManhattanSimulator:
     
     Features:
     - Multi-agent simulation with state tracking
-    - Optimal transport matching for agent-pickup assignment
+    - Optimal transport matching for agent-pickup assignment (Q-table or shortest path costs)
     - Traffic light waiting times at intersections
     - Event-driven simulation with edge-level decisions
     """
@@ -582,16 +582,21 @@ class ManhattanSimulator:
     def optimal_transport_matching(
         self, 
         agent_positions: List[int], 
-        pickup_positions: List[int]
+        pickup_positions: List[int],
+        current_time: float = 0.0
     ) -> List[Tuple[int, int]]:
         """
         Perform optimal transport matching between agents and pickups.
         
-        Uses the Hungarian algorithm to minimize total shortest path cost.
+        Uses the Hungarian algorithm to minimize total cost.
+        - When a Q-table is loaded: cost = -max_a Q(agent, pickup, time, a)
+          (negated because Hungarian minimizes, and higher Q = better assignment)
+        - Otherwise: cost = shortest path distance
         
         Args:
             agent_positions: List of agent current node IDs
             pickup_positions: List of pickup node IDs
+            current_time: Current simulation time (used for Q-table time discretization)
             
         Returns:
             List of (agent_index, pickup_index) assignments
@@ -599,13 +604,38 @@ class ManhattanSimulator:
         num_agents = len(agent_positions)
         num_pickups = len(pickup_positions)
         
-        # Build cost matrix using shortest path distances
         cost_matrix = np.zeros((num_agents, num_pickups))
-        for i, agent_node in enumerate(agent_positions):
-            agent_idx = self.node_to_idx[agent_node]
-            for j, pickup_node in enumerate(pickup_positions):
-                pickup_idx = self.node_to_idx[pickup_node]
-                cost_matrix[i, j] = self.distances[agent_idx, pickup_idx]
+        
+        if self.use_q_policy and self.q_table is not None:
+            # Build cost matrix using Q-table values: cost = -V(s) = -max_a Q(s, a)
+            time_idx = int(current_time / self.q_dt) % self.q_max_time_slices
+            
+            for i, agent_node in enumerate(agent_positions):
+                agent_idx = self.node_to_idx[agent_node]
+                valid_mask = self.neighbor_mask[agent_idx]
+                
+                for j, pickup_node in enumerate(pickup_positions):
+                    pickup_idx = self.node_to_idx[pickup_node]
+                    
+                    if agent_idx == pickup_idx:
+                        # Already at destination — zero cost
+                        cost_matrix[i, j] = 0.0
+                        continue
+                    
+                    # Q-values for all actions at state (agent, pickup, time)
+                    q_values = self.q_table[agent_idx, pickup_idx, time_idx, :]
+                    masked_q = np.where(valid_mask, q_values, -np.inf)
+                    
+                    # Cost = -V(s) = -max_a Q(s, a)
+                    # Higher Q-value → lower cost → preferred assignment
+                    cost_matrix[i, j] = -np.max(masked_q)
+        else:
+            # Build cost matrix using shortest path distances
+            for i, agent_node in enumerate(agent_positions):
+                agent_idx = self.node_to_idx[agent_node]
+                for j, pickup_node in enumerate(pickup_positions):
+                    pickup_idx = self.node_to_idx[pickup_node]
+                    cost_matrix[i, j] = self.distances[agent_idx, pickup_idx]
         
         # Solve assignment problem (Hungarian algorithm)
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
@@ -643,8 +673,8 @@ class ManhattanSimulator:
         # Get agent positions
         agent_positions = [a.current_node for a in free_agents]
         
-        # Perform optimal transport matching
-        assignments = self.optimal_transport_matching(agent_positions, pickups_to_assign)
+        # Perform optimal transport matching (uses Q-table costs if loaded, else shortest path)
+        assignments = self.optimal_transport_matching(agent_positions, pickups_to_assign, current_time)
         
         result = []
         for agent_local_idx, pickup_idx in assignments:
@@ -920,7 +950,8 @@ class ManhattanSimulator:
         q_table_path: Optional[str] = None,
         fixed_start_nodes: Optional[List[int]] = None,
         fixed_pickup_nodes: Optional[List[int]] = None,
-        round_trip: bool = False
+        round_trip: bool = False,
+        reassignment_interval: float = 120.0
     ) -> Tuple[List[Agent], List[Tuple[int, int, int]]]:
         """
         Run a complete multi-agent simulation.
@@ -935,6 +966,8 @@ class ManhattanSimulator:
             fixed_start_nodes: Optional list of node IDs to sample starts from (e.g., 3 fixed nodes)
             fixed_pickup_nodes: Optional list of node IDs to sample pickups from (e.g., 3 fixed nodes)
             round_trip: If True, agents travel back to start after reaching pickup
+            reassignment_interval: Seconds between reassignment batches (default 120s).
+                Free agents accumulate and are reassigned together every this many seconds.
             
         Returns:
             Tuple of (agents list, assignments list)
@@ -981,27 +1014,38 @@ class ManhattanSimulator:
         # Run simulation
         current_time = 0.0
         reassignment_count = 0
+        next_reassignment_time = 0.0  # First reassignment happens immediately (initial is already done)
+        # The initial assignment already happened above, so schedule the first periodic
+        # reassignment after one full interval
+        next_reassignment_time = reassignment_interval
+        
+        print(f"\nReassignment interval: {reassignment_interval:.0f}s (free agents accumulate between batches)")
+        
         while current_time < max_time:
-            # Check for free agents and reassign them
-            free_agents = [a for a in self.agents if a.is_free()]
-            if free_agents:
-                # Sample new pickups for free agents
-                num_free = len(free_agents)
-                new_pickups = np.random.choice(self._pickup_pool, size=num_free, replace=True).tolist()
-                
-                # Perform optimal transport matching and assign
-                new_assignments = self.assign_pickups_to_agents(new_pickups, current_time=current_time)
-                
-                if new_assignments:
-                    reassignment_count += 1
-                    print(f"\n[t={current_time:.1f}s] Reassignment #{reassignment_count} ({len(new_assignments)} agents):")
-                    for agent_id, start, pickup in new_assignments:
-                        path = self.get_shortest_path(start, pickup)
-                        total_time = sum(self.get_path_travel_times(path)) if path else 0
-                        print(f"  Agent {agent_id}: Node {start} → Node {pickup} ({len(path)} nodes, {total_time:.1f}s)")
+            # Check if it's time to reassign accumulated free agents
+            if current_time >= next_reassignment_time:
+                free_agents = [a for a in self.agents if a.is_free()]
+                if free_agents:
+                    # Sample new pickups for free agents
+                    num_free = len(free_agents)
+                    new_pickups = np.random.choice(self._pickup_pool, size=num_free, replace=True).tolist()
                     
-                    # Add to total assignments
-                    assignments.extend(new_assignments)
+                    # Perform optimal transport matching and assign
+                    new_assignments = self.assign_pickups_to_agents(new_pickups, current_time=current_time)
+                    
+                    if new_assignments:
+                        reassignment_count += 1
+                        print(f"\n[t={current_time:.1f}s] Reassignment #{reassignment_count} ({len(new_assignments)} agents, {num_free - len(new_assignments)} still free):")
+                        for agent_id, start, pickup in new_assignments:
+                            path = self.get_shortest_path(start, pickup)
+                            total_time = sum(self.get_path_travel_times(path)) if path else 0
+                            print(f"  Agent {agent_id}: Node {start} → Node {pickup} ({len(path)} nodes, {total_time:.1f}s)")
+                        
+                        # Add to total assignments
+                        assignments.extend(new_assignments)
+                
+                # Schedule next reassignment
+                next_reassignment_time += reassignment_interval
             
             current_time = self.step_simulation(current_time, dt)
         

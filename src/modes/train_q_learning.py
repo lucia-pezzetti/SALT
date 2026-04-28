@@ -50,6 +50,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         def evaluate_sp_continuous(env, starts, pickups, max_steps):
             sp_times, sp_rewards, sp_steps, sp_completed = [], [], [], []
+            noise_key = jax_random.PRNGKey(42)
             for start, pickup in zip(starts, pickups):
                 state = init_env(jax.random.PRNGKey(0), start, pickup, env.neighbor_mask_static)[0]
                 total_time = 0.0
@@ -61,7 +62,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
                         env.adj_list, env.travel_times, env.distances,
                         env.neighbor_mask_static[state.current_node]
                     )
-                    state, reward, done, info = env.step(state, action)
+                    noise_key, nk = jax_random.split(noise_key)
+                    state, reward, done, info = env.step(state, action, noise_key=nk)
                     total_time += float(info["travel"] + info["wait"])
                     total_reward += float(reward)
                     step_count += 1
@@ -103,8 +105,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
                         env.adj_list, q_agent.discrete_travel_times, env.distances,
                         env.neighbor_mask_static[state.current_node]
                     )
-                    key, step_key = jax.random.split(key)
-                    state, reward, done, info = q_agent.step_with_discretization(state, action, step_key)
+                    key, step_key, noise_key = jax.random.split(key, 3)
+                    state, reward, done, info = q_agent.step_with_discretization(state, action, step_key, noise_key=noise_key)
                     total_time += float(info["travel"] + info["wait"])
                     total_reward += float(reward)
                     step_count += 1
@@ -315,6 +317,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
         init_all_time_slices=init_all_time_slices,
         pretrain_learning_rate=pretrain_learning_rate,
         init_q_table_path=getattr(args, 'init_q_table_path', None),
+        no_round_trip=getattr(args, 'no_round_trip', False),
+        q_table_dtype=getattr(args, 'q_table_dtype', 'float32'),
     )
     
     # Final evaluation with matching for multiple agents
@@ -372,13 +376,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         while (not bool(state.done)) and steps < 2 * ctx.max_length:
             action = policy_fn(state)
+            key, step_key, noise_key = jax.random.split(key, 3)
             if use_discrete:
-                key, step_key = jax.random.split(key)
                 next_state, reward, done, info = q_agent.step_with_discretization(
-                    state, action, step_key
+                    state, action, step_key, noise_key=noise_key
                 )
             else:
-                next_state, reward, done, info = ctx.env.step(state, action)
+                next_state, reward, done, info = ctx.env.step(state, action, noise_key=noise_key)
             
             total_time += float(info['travel'] + info['wait'])
             state = next_state
@@ -421,9 +425,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
         starts_expanded = jnp.repeat(starts_jax, num_pickups)
         pickups_expanded = jnp.tile(pickups_jax, num_starts)
         
-        # Sample a random time index (same for all agents, consistent with training)
-        key = jax.random.PRNGKey(base_seed)
-        time_idx = jax.random.randint(key, (), 0, q_agent.max_time_slices)
+        # Always use time_idx=0 (episodes always start at t=0)
+        time_idx = jnp.int32(0)
         
         # Estimate returns directly from Q-table (batched, fast!)
         returns_flat = _estimate_returns_batch_q_table_direct(
@@ -591,6 +594,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     def evaluate_shortest_path_baseline_continuous(starts, pickups):
         """Shortest path in continuous time - real-world comparison."""
         sp_times, sp_rewards, sp_steps, sp_completed = [], [], [], []
+        noise_key = jax.random.PRNGKey(42)
         for start, pickup in zip(starts, pickups):
             total_time = 0.0
             total_reward = 0.0
@@ -602,7 +606,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     ctx.env.adj_list, ctx.env.travel_times, ctx.env.distances,
                     ctx.env.neighbor_mask_static[state.current_node]
                 )
-                state, reward, done, info = ctx.env.step(state, action)
+                noise_key, nk = jax.random.split(noise_key)
+                state, reward, done, info = ctx.env.step(state, action, noise_key=nk)
                 total_time += float(info['travel'] + info['wait'])
                 total_reward += float(reward)
                 step_count += 1
@@ -624,6 +629,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     def evaluate_shortest_path_baseline_discrete(starts, pickups):
         """Shortest path in discrete time - fair comparison with Q-learning."""
         sp_times, sp_rewards, sp_steps, sp_completed = [], [], [], []
+        noise_key = jax.random.PRNGKey(99)
         for start, pickup in zip(starts, pickups):
             total_time = 0.0
             total_reward = 0.0
@@ -636,8 +642,9 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     ctx.env.neighbor_mask_static[state.current_node]
                 )
                 # Use discretized step for fair comparison with Q-learning
+                noise_key, nk = jax.random.split(noise_key)
                 state, reward, done, info = q_agent.step_with_discretization(
-                    state, action, jax.random.PRNGKey(step_count)
+                    state, action, jax.random.PRNGKey(step_count), noise_key=nk
                 )
                 total_time += float(info['travel'] + info['wait'])
                 total_reward += float(reward)
@@ -725,13 +732,15 @@ def run_q_learning(args, ctx: RunContext) -> None:
         matched_pickups = jnp.take(jnp.array(pickups, dtype=jnp.int32), assignment, axis=0)
         return matched_pickups, cost_matrix
     
-    # Batch operations for evaluation
-    batch_step_continuous = jax.jit(jax.vmap(ctx.env.step, in_axes=(0, 0)))
+    # Batch operations for evaluation (with per-step noise when noise_mask > 0)
+    batch_step_continuous = jax.jit(jax.vmap(
+        lambda s, a, nk: ctx.env.step(s, a, noise_key=nk),
+        in_axes=(0, 0, 0),
+    ))
     # Use JIT-compatible function directly (not the wrapper that calls float())
     from training.q_learning import _jitted_step_with_discretization
-    # Note: _jitted_step_with_discretization doesn't use the key, so we ignore it
     batch_step_discrete_fn = jax.vmap(
-        lambda s, a, k: _jitted_step_with_discretization(ctx.env, s, a, q_agent.discrete_travel_times, q_agent.dt),
+        lambda s, a, nk: _jitted_step_with_discretization(ctx.env, s, a, q_agent.discrete_travel_times, q_agent.dt, noise_key=nk),
         in_axes=(0, 0, 0)
     )
     batch_step_discrete = jax.jit(batch_step_discrete_fn)
@@ -777,13 +786,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
             q_masked = jnp.where(valid_mask, q_values, -jnp.inf)
             actions = jnp.argmax(q_masked, axis=-1)
             
-            # Take step (continuous or discrete)
+            # Take step (continuous or discrete), with per-step noise keys
+            step_keys, noise_subkey = jax.random.split(step_keys)
+            noise_keys = jax.random.split(noise_subkey, num_eval)
             if use_continuous_eval:
-                next_states, rewards, terminals, info = batch_step_continuous(states, actions)
+                next_states, rewards, terminals, info = batch_step_continuous(states, actions, noise_keys)
             else:
-                step_keys, action_keys = jax.random.split(step_keys)
-                action_keys = jax.random.split(action_keys, num_eval)
-                next_states, rewards, terminals, info = batch_step_discrete(states, actions, action_keys)
+                next_states, rewards, terminals, info = batch_step_discrete(states, actions, noise_keys)
             
             # Accumulate times and rewards
             travel_times = info['travel'] + info['wait']
@@ -886,13 +895,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     ctx.env.neighbor_mask_static[states.current_node]
                 )
             
-            # Take step (continuous or discrete)
+            # Take step (continuous or discrete), with per-step noise keys
+            step_keys, noise_subkey = jax.random.split(step_keys)
+            noise_keys = jax.random.split(noise_subkey, num_eval)
             if use_discrete:
-                step_keys, action_keys = jax.random.split(step_keys)
-                action_keys = jax.random.split(action_keys, num_eval)
-                next_states, rewards, terminals, info = batch_step_discrete(states, actions, action_keys)
+                next_states, rewards, terminals, info = batch_step_discrete(states, actions, noise_keys)
             else:
-                next_states, rewards, terminals, info = batch_step_continuous(states, actions)
+                next_states, rewards, terminals, info = batch_step_continuous(states, actions, noise_keys)
             
             # Accumulate times and rewards
             travel_times = info['travel'] + info['wait']
@@ -947,7 +956,10 @@ def run_q_learning(args, ctx: RunContext) -> None:
     evaluate_sp_policy_batched = jax.jit(evaluate_sp_policy_batched_impl, static_argnums=(3, 4))
 
     # Evaluation loop with trajectory printing - now optimized with batched GPU evaluation
-    eval_iter = 500
+    eval_iter = 2
+    print_eval_trajectories = (
+        args.epochs == 0 and getattr(args, "init_q_table_path", None)
+    )
     eval_loop_key = jax.random.PRNGKey(args.seed + 1000)
     max_eval_steps = 2 * ctx.max_length
     
@@ -973,9 +985,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
         num_pickups = len(eval_pickups)
         
         # Q-learning matching: use Q-table estimation (fast)
-        # Sample a random time index (same for all agents, consistent with training)
-        time_key = jax.random.PRNGKey(base_seed + 999)
-        time_idx = jax.random.randint(time_key, (), 0, q_agent.max_time_slices)
+        # Always use time_idx=0 (episodes always start at t=0)
+        time_idx = jnp.int32(0)
         
         starts_expanded = jnp.repeat(starts_jax, num_pickups)
         pickups_expanded = jnp.tile(pickups_jax, num_starts)
@@ -1061,46 +1072,46 @@ def run_q_learning(args, ctx: RunContext) -> None:
             sp_paths_discrete, sp_path_lens_discrete, sp_step_rewards_discrete, sp_step_times_discrete
         )
         
-        # Print trajectories with step rewards and step times
-        print(f"\nQ-Learning Trajectories (Continuous - Real World):")
-        for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-            zip(eval_starts, matched_q_pickups, q_paths_continuous, q_times_continuous, q_rewards_continuous, q_step_rewards_continuous, q_step_times_continuous)
-        ):
-            print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-            print(f"    Path: {' -> '.join(map(str, path))}")
-            print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-            print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-            print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
-        
-        print(f"\nQ-Learning Trajectories (Discrete - Training Environment):")
-        for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-            zip(eval_starts, matched_q_pickups, q_paths_discrete, q_times_discrete, q_rewards_discrete, q_step_rewards_discrete, q_step_times_discrete)
-        ):
-            print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-            print(f"    Path: {' -> '.join(map(str, path))}")
-            print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-            print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-            print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
-        
-        print(f"\nShortest Path Trajectories (Continuous - Real World):")
-        for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-            zip(eval_starts, matched_sp_pickups_cont, sp_paths_continuous, sp_times_continuous, sp_rewards_continuous, sp_step_rewards_continuous, sp_step_times_continuous)
-        ):
-            print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-            print(f"    Path: {' -> '.join(map(str, path))}")
-            print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-            print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-            print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
-        
-        print(f"\nShortest Path Trajectories (Discrete - Fair Comparison):")
-        for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-            zip(eval_starts, matched_sp_pickups_disc, sp_paths_discrete, sp_times_discrete, sp_rewards_discrete, sp_step_rewards_discrete, sp_step_times_discrete)
-        ):
-            print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-            print(f"    Path: {' -> '.join(map(str, path))}")
-            print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-            print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-            print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
+        if print_eval_trajectories:
+            print(f"\nQ-Learning Trajectories (Continuous - Real World):")
+            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
+                zip(eval_starts, matched_q_pickups, q_paths_continuous, q_times_continuous, q_rewards_continuous, q_step_rewards_continuous, q_step_times_continuous)
+            ):
+                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
+                print(f"    Path: {' -> '.join(map(str, path))}")
+                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
+                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
+                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
+
+            print(f"\nQ-Learning Trajectories (Discrete - Training Environment):")
+            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
+                zip(eval_starts, matched_q_pickups, q_paths_discrete, q_times_discrete, q_rewards_discrete, q_step_rewards_discrete, q_step_times_discrete)
+            ):
+                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
+                print(f"    Path: {' -> '.join(map(str, path))}")
+                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
+                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
+                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
+
+            print(f"\nShortest Path Trajectories (Continuous - Real World):")
+            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
+                zip(eval_starts, matched_sp_pickups_cont, sp_paths_continuous, sp_times_continuous, sp_rewards_continuous, sp_step_rewards_continuous, sp_step_times_continuous)
+            ):
+                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
+                print(f"    Path: {' -> '.join(map(str, path))}")
+                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
+                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
+                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
+
+            print(f"\nShortest Path Trajectories (Discrete - Fair Comparison):")
+            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
+                zip(eval_starts, matched_sp_pickups_disc, sp_paths_discrete, sp_times_discrete, sp_rewards_discrete, sp_step_rewards_discrete, sp_step_times_discrete)
+            ):
+                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
+                print(f"    Path: {' -> '.join(map(str, path))}")
+                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
+                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
+                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
         
         # Plot comparison: Q-learning vs SP discrete (fair comparison) - DISABLED
         # q_paths_list = [list(map(int, path)) for path in q_paths]
@@ -1117,10 +1128,18 @@ def run_q_learning(args, ctx: RunContext) -> None:
         # matched_pickups_list = np.array(matched_q_pickups).tolist()
         # fig.savefig(f"qlearning_vs_sp_discrete_{np.array(eval_starts).tolist()}_{matched_pickups_list}.png")
         
-        print(f"\nQ-learning avg time (continuous): {np.mean(q_times_continuous):.2f}")
-        print(f"Q-learning avg time (discrete): {np.mean(q_times_discrete):.2f}")
-        print(f"SP (continuous) avg time: {np.mean(sp_times_continuous):.2f}")
-        print(f"SP (discrete) avg time: {np.mean(sp_times_discrete):.2f}")
+        # Log per-agent times (arrays) so downstream analysis can compute dispersion
+        # without collapsing each iteration to a single mean over N agents.
+        print(f"\nQ-learning avg time (continuous): {q_times_continuous.tolist()}")
+        print(f"Q-learning avg time (discrete): {q_times_discrete.tolist()}")
+        print(f"SP (continuous) avg time: {sp_times_continuous.tolist()}")
+        print(f"SP (discrete) avg time: {sp_times_discrete.tolist()}")
+
+        # Keep scalar means as additional context (new labels to avoid ambiguity).
+        print(f"Q-learning mean over agents (continuous): {np.mean(q_times_continuous):.2f}")
+        print(f"Q-learning mean over agents (discrete): {np.mean(q_times_discrete):.2f}")
+        print(f"SP mean over agents (continuous): {np.mean(sp_times_continuous):.2f}")
+        print(f"SP mean over agents (discrete): {np.mean(sp_times_discrete):.2f}")
         
         # Log metrics for both comparisons
     #     final_eval_metrics = {

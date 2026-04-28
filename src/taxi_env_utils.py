@@ -43,6 +43,57 @@ def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = N
     # Align arrays
     return jax.device_put(jnp.array(adj, dtype=jnp.int32)), jax.device_put(jnp.array(times, dtype=jnp.float32)), jax.device_put(jnp.array(neighbor_mask, dtype=bool))
 
+
+def build_noise_mask(G: nx.DiGraph, node_to_idx: dict, noise_level: float = 0.2, max_deg: int = None) -> np.ndarray:
+    """
+    Build a per-edge noise ceiling array of shape [num_nodes, max_deg].
+
+    For each edge, the value is the maximum *extra* multiplicative noise that
+    will be applied at runtime:
+      - Primary roads:   noise_level       (default 0.2 → up to +20%)
+      - Secondary roads: 1.5 * noise_level (default 0.3 → up to +30%)
+      - All others:      0.0              (no noise)
+
+    At each environment step the actual travel time is:
+        travel * (1 + U(0, noise_mask[curr, action]))
+    so a mask value of 0.0 means the edge is deterministic.
+    """
+    node_list = list(G.nodes())
+    num_nodes = len(node_list)
+    if max_deg is None:
+        max_deg = max(dict(G.out_degree()).values())
+
+    mask = np.zeros((num_nodes, max_deg), dtype=np.float32)
+
+    n_primary = 0
+    n_secondary = 0
+
+    for i, node in enumerate(node_list):
+        neighbors = list(G.successors(node))
+        n_neighbors = len(neighbors)
+        for j, nbr in enumerate(neighbors[:max_deg]):
+            best_k = min(G[node][nbr], key=lambda k: G[node][nbr][k]['travel_time_congested'])
+            hw = G[node][nbr][best_k].get('highway', 'unclassified')
+            if isinstance(hw, list):
+                hw = hw[0] if hw else 'unclassified'
+
+            if hw == 'primary':
+                mask[i, j] = noise_level
+                n_primary += 1
+            elif hw == 'secondary':
+                mask[i, j] = 1.5 * noise_level
+                n_secondary += 1
+
+        # Pad with first edge's value (same as adj_list padding)
+        if 0 < n_neighbors < max_deg:
+            mask[i, n_neighbors:] = mask[i, 0]
+
+    print(f"[NOISE] Built noise mask (level={noise_level}): "
+          f"{n_primary} primary edges (up to +{noise_level*100:.0f}%), "
+          f"{n_secondary} secondary edges (up to +{1.5*noise_level*100:.0f}%)")
+
+    return mask
+
 def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhattan_distances.pkl", num_workers=None):
     """
     Load precomputed distance matrix or compute and cache it using parallel processing.

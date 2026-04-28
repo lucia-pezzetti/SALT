@@ -197,6 +197,8 @@ def apply_congestion_model(G_scc: nx.DiGraph,
         data['travel_time_congested'] = t_cong_min
         data['bpr_alpha'] = alpha
 
+
+
 def compute_distributions(filtered_df: pd.DataFrame):
     """
     From filtered taxi DataFrame, compute:

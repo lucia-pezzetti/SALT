@@ -286,7 +286,7 @@ def train(
 
             def step_fn(carry: Tuple[TaxiState, TaxiState], k):
                 state, orig_states = carry
-                k1, k2, k3 = random.split(k, 3)
+                k1, k2, k3, k_noise = random.split(k, 4)
                 # Compute obs
                 sf = obs_fn_batch(state)
                 mask = state.neighbor_mask       # [B, max_deg]
@@ -330,7 +330,13 @@ def train(
                 #                 state.current_node, mask, action, explore, probs, greedy, rand)
                 # jax.debug.print("States: {}, Q-values: {}", state, q_vals)
 
-                next_s, rew, pickup, info = env.step(state, action)
+                # Split noise keys for each agent in the batch
+                batch_noise_keys = random.split(k_noise, state.current_node.shape[0])
+                next_s, rew, pickup, info = jax.vmap(
+                    lambda s, a, nk: env.step(s, a, noise_key=nk),
+                    in_axes=(0, 0, 0),
+                    out_axes=(0, 0, 0, 0)
+                )(state, action, batch_noise_keys)
                 wait = info['wait']               # [B]
                 travel = info['travel']           # [B]
                 done = next_s.done

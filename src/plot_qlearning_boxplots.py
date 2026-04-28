@@ -4,12 +4,35 @@ Parse Q-learning debug logs and produce boxplots comparing average times.
 """
 
 import argparse
+import ast
 import re
 from pathlib import Path
 from typing import List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+def _extract_numeric_values(line: str, pattern: str) -> List[float]:
+    """Extract one scalar or a list of numeric values from a metric line."""
+    match = re.search(pattern, line)
+    if not match:
+        return []
+
+    raw = match.group(1).strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            parsed = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            return []
+        if isinstance(parsed, list):
+            return [float(v) for v in parsed]
+        return []
+
+    try:
+        return [float(raw)]
+    except ValueError:
+        return []
 
 
 def extract_times(filepath: Path) -> Tuple[List[float], List[float], List[float], List[float]]:
@@ -25,31 +48,70 @@ def extract_times(filepath: Path) -> Tuple[List[float], List[float], List[float]
             if not line:
                 continue
 
-            # Try new format first: "Q-learning avg time (continuous):" or "Q-learning avg time (discrete):"
-            q_cont_match = re.search(r"Q-learning avg time \(continuous\):\s*([\d.]+)", line)
-            if q_cont_match:
-                q_cont_times.append(float(q_cont_match.group(1)))
+            # New format can contain scalars or lists: "...: 123.4" or "...: [123.4, ...]"
+            q_cont_vals = _extract_numeric_values(
+                line, r"Q-learning avg time \(continuous\):\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if q_cont_vals:
+                q_cont_times.extend(q_cont_vals)
                 continue
 
-            q_disc_match = re.search(r"Q-learning avg time \(discrete\):\s*([\d.]+)", line)
-            if q_disc_match:
-                q_disc_times.append(float(q_disc_match.group(1)))
+            q_disc_vals = _extract_numeric_values(
+                line, r"Q-learning avg time \(discrete\):\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if q_disc_vals:
+                q_disc_times.extend(q_disc_vals)
                 continue
 
             # Fallback to old format: "Q-learning avg time:" (assume continuous for backward compatibility)
-            q_match = re.search(r"Q-learning avg time:\s*([\d.]+)", line)
-            if q_match:
-                q_cont_times.append(float(q_match.group(1)))
+            q_vals = _extract_numeric_values(
+                line, r"Q-learning avg time:\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if q_vals:
+                q_cont_times.extend(q_vals)
                 continue
 
-            sp_cont_match = re.search(r"SP \(continuous\) avg time:\s*([\d.]+)", line)
-            if sp_cont_match:
-                sp_cont_times.append(float(sp_cont_match.group(1)))
+            sp_cont_vals = _extract_numeric_values(
+                line, r"SP \(continuous\) avg time:\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if sp_cont_vals:
+                sp_cont_times.extend(sp_cont_vals)
                 continue
 
-            sp_disc_match = re.search(r"SP \(discrete\) avg time:\s*([\d.]+)", line)
-            if sp_disc_match:
-                sp_disc_times.append(float(sp_disc_match.group(1)))
+            sp_disc_vals = _extract_numeric_values(
+                line, r"SP \(discrete\) avg time:\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if sp_disc_vals:
+                sp_disc_times.extend(sp_disc_vals)
+                continue
+
+            # Fallback for logs that only print mean-over-agents lines.
+            q_cont_mean_vals = _extract_numeric_values(
+                line, r"Q-learning mean over agents \(continuous\):\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if q_cont_mean_vals:
+                q_cont_times.extend(q_cont_mean_vals)
+                continue
+
+            q_disc_mean_vals = _extract_numeric_values(
+                line, r"Q-learning mean over agents \(discrete\):\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if q_disc_mean_vals:
+                q_disc_times.extend(q_disc_mean_vals)
+                continue
+
+            sp_cont_mean_vals = _extract_numeric_values(
+                line, r"SP mean over agents \(continuous\):\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if sp_cont_mean_vals:
+                sp_cont_times.extend(sp_cont_mean_vals)
+                continue
+
+            sp_disc_mean_vals = _extract_numeric_values(
+                line, r"SP mean over agents \(discrete\):\s*(\[[^\]]*\]|[-+eE.\d]+)"
+            )
+            if sp_disc_mean_vals:
+                sp_disc_times.extend(sp_disc_mean_vals)
                 continue
 
     if not q_cont_times and not q_disc_times:

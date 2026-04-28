@@ -22,14 +22,27 @@ def _jitted_step_with_discretization(
     action: jnp.int32,  # Changed from int to jnp.int32 to avoid type conversion
     discrete_travel_times: jnp.ndarray,
     dt: float,
+    noise_key: jnp.ndarray = None,
 ):
-    """Compiled environment step matching TabularQLearning.step_with_discretization."""
+    """Compiled environment step matching TabularQLearning.step_with_discretization.
+    
+    Args:
+        noise_key: Optional JAX PRNG key for per-step congestion noise.
+                   When provided, travel time is multiplied by
+                   (1 + U(0, env.noise_mask[curr, action])).
+    """
     already_done = state.done
 
     curr = state.current_node
     nxt = env.adj_list[curr, action]
 
     travel = discrete_travel_times[curr, action]
+    
+    # Per-step congestion noise
+    if noise_key is not None:
+        ceil = env.noise_mask[curr, action]
+        noise_factor = 1.0 + ceil * jax_random.uniform(noise_key)
+        travel = travel * noise_factor
 
     reach = (curr == state.pickup_node) | (nxt == state.pickup_node)
     step_n = state.step_count + 1
@@ -347,6 +360,11 @@ def _batched_update_q_values_vectorized(
         next_states_current_node, next_states_pickup_node, next_states_time
     )
     
+    q_dtype = q_table.dtype
+    lr = jnp.asarray(learning_rate, dtype=q_dtype)
+    gamma_t = jnp.asarray(gamma, dtype=q_dtype)
+    rewards_t = jnp.asarray(rewards, dtype=q_dtype)
+
     # Get current Q-values for all agents [num_agents]
     current_q = q_table[curr_indices, pickup_indices, t_indices, actions]
     
@@ -356,22 +374,22 @@ def _batched_update_q_values_vectorized(
     # Mask invalid actions for next states [num_agents, max_deg]
     # next_states_neighbor_mask is already jnp.ndarray with dtype jnp.bool_, so use directly
     valid_masks = next_states_neighbor_mask  # [num_agents, max_deg]
-    q_next_masked = jnp.where(valid_masks, q_next_rows, -1e9)
+    q_next_masked = jnp.where(valid_masks, q_next_rows, jnp.asarray(-1e4, dtype=q_dtype))
     max_next_q = jnp.max(q_next_masked, axis=-1)  # [num_agents]
     
     # Compute targets [num_agents]
     targets = jnp.where(
         dones,
-        rewards,  # Terminal state
-        rewards + gamma * max_next_q
+        rewards_t,  # Terminal state
+        rewards_t + gamma_t * max_next_q
     )
     
     # Q-learning updates [num_agents]
-    new_q_values = current_q + learning_rate * (targets - current_q)
+    new_q_values = current_q + lr * (targets - current_q)
     
     # Mask updates for done agents (keep old values)
     should_update = ~states_done  # [num_agents]
-    final_q_values = jnp.where(should_update, new_q_values, current_q)
+    final_q_values = jnp.where(should_update, new_q_values, current_q).astype(q_dtype)
     
     # Apply all updates at once using vectorized indexing
     return q_table.at[curr_indices, pickup_indices, t_indices, actions].set(final_q_values)
@@ -398,6 +416,7 @@ class TabularQLearning:
         epsilon_decay_steps: int = 10000,
         initial_q_value: float = 0.0,
         max_time_slices: int = 100,
+        q_table_dtype: str = "float32",
     ):
         self.env = env
         self.dt = dt
@@ -408,10 +427,25 @@ class TabularQLearning:
         self.epsilon_decay_steps = epsilon_decay_steps
         self.initial_q_value = initial_q_value
         self.max_time_slices = max_time_slices
+
+        # Configure Q-table dtype to reduce memory footprint when needed.
+        dtype_map = {
+            "float32": jnp.float32,
+            "float16": jnp.float16,
+            "bfloat16": jnp.bfloat16,
+        }
+        q_dtype_key = str(q_table_dtype).lower()
+        if q_dtype_key not in dtype_map:
+            raise ValueError(
+                f"Unsupported q_table_dtype='{q_table_dtype}'. "
+                f"Choose one of: {list(dtype_map.keys())}"
+            )
+        self.q_table_dtype = q_dtype_key
+        q_dtype = dtype_map[q_dtype_key]
         
         # Dense Q-table: [num_nodes, num_nodes, max_time_slices, max_deg]
         q_shape = (env.num_nodes, env.num_nodes, max_time_slices, env.max_deg)
-        self.q_table = jnp.full(q_shape, initial_q_value, dtype=jnp.float32)
+        self.q_table = jnp.full(q_shape, initial_q_value, dtype=q_dtype)
         
         # Track visits for statistics (sparse dict for compatibility)
         # Disabled by default for performance - set track_visits=True to enable
@@ -525,6 +559,9 @@ class TabularQLearning:
             
             # Compute Q-values: immediate reward + discounted future value
             q_values = travel_cost + pickup_bonus_broadcast + future_value
+            # Keep updates in the same dtype as q_table (e.g., bfloat16) to avoid
+            # dtype-promotion temporaries and scatter cast warnings.
+            q_values = q_values.astype(q_table.dtype)
             
             # Mask invalid entries:
             # 1. Skip if curr == pickup
@@ -541,19 +578,13 @@ class TabularQLearning:
             
             # Update Q-table - only update valid entries, leave invalid entries unchanged (they remain at initial_q_value)
             if use_all_time_slices:
-                # Broadcast q_values to all time slices: [num_nodes, num_nodes, max_time_slices, max_deg]
-                q_values_expanded = jnp.broadcast_to(
-                    q_values[:, :, None, :],  # [num_nodes, num_nodes, 1, max_deg]
-                    (num_nodes, num_nodes, max_time_slices, max_deg)
-                )
-                # Update all time slices at once - only update valid entries
-                valid_mask_expanded = jnp.broadcast_to(
-                    valid_mask[:, :, None, :], 
-                    (num_nodes, num_nodes, max_time_slices, max_deg)
-                )
-                q_table = q_table.at[:, :, :, :].set(
-                    jnp.where(valid_mask_expanded, q_values_expanded, q_table)
-                )
+                # Memory-efficient update: write one time slice at a time on device.
+                # This avoids materializing huge [N, N, T, A] temporaries.
+                def update_time_slice(t_idx, q_table_carry):
+                    current_slice = q_table_carry[:, :, t_idx, :]
+                    updated_slice = jnp.where(valid_mask, q_values, current_slice)
+                    return q_table_carry.at[:, :, t_idx, :].set(updated_slice)
+                q_table = jax.lax.fori_loop(0, max_time_slices, update_time_slice, q_table)
             else:
                 # Only update time slice 0 - only update valid entries
                 q_table = q_table.at[:, :, 0, :].set(
@@ -565,7 +596,8 @@ class TabularQLearning:
         # JIT-compile with use_all_time_slices as static argument
         compute_q_values_vectorized_jit = jax.jit(
             compute_q_values_vectorized,
-            static_argnums=(9, 10)  # use_all_time_slices and max_time_slices are static
+            static_argnums=(9, 10),  # use_all_time_slices and max_time_slices are static
+            donate_argnums=(0,),     # donate q_table to reduce peak memory
         )
         
         # Compute Q-values vectorized
@@ -739,7 +771,7 @@ class TabularQLearning:
         returns_matrix = returns_flat.reshape(num_starts, num_pickups)
         return returns_matrix
     
-    def step_with_discretization(self, state: TaxiState, action: int, key: jnp.ndarray) -> Tuple[TaxiState, float, bool, dict]:
+    def step_with_discretization(self, state: TaxiState, action: int, key: jnp.ndarray, noise_key: jnp.ndarray = None) -> Tuple[TaxiState, float, bool, dict]:
         """
         Environment step with discretized travel times.
         This replaces the normal env.step() when using discrete mode.
@@ -750,6 +782,7 @@ class TabularQLearning:
             action,
             self.discrete_travel_times,
             self.dt,
+            noise_key=noise_key,
         )
 
         return (
@@ -761,13 +794,11 @@ class TabularQLearning:
     
     def get_statistics(self) -> Dict:
         """Get statistics about the Q-table."""
-        # Compute statistics on the entire Q-table
-        q_values = self.q_table.flatten()
-        
-        # Compute Q-value statistics (on entire table, including initialized values)
-        avg_q = float(jnp.mean(q_values))
-        min_q = float(jnp.min(q_values))
-        max_q = float(jnp.max(q_values))
+        # Compute statistics directly with reductions to avoid materializing
+        # a huge contiguous flattened buffer (~Q-table size).
+        avg_q = float(jnp.mean(self.q_table))
+        min_q = float(jnp.min(self.q_table))
+        max_q = float(jnp.max(self.q_table))
 
         # TEMPORARY: for signature matching
         num_visited_states = 0
@@ -808,6 +839,7 @@ class TabularQLearning:
             "epsilon_decay_steps": self.epsilon_decay_steps,
             "initial_q_value": self.initial_q_value,
             "max_time_slices": self.max_time_slices,
+            "q_table_dtype": self.q_table_dtype,
             "q_table": np.array(self.q_table),  # Convert JAX array to numpy for serialization
             "visit_counts": dict(self.visit_counts),
         }
@@ -836,6 +868,7 @@ class TabularQLearning:
             epsilon_decay_steps=state.get("epsilon_decay_steps", 10000),
             initial_q_value=state.get("initial_q_value", 0.0),
             max_time_slices=max_time_slices,
+            q_table_dtype=state.get("q_table_dtype", "float32"),
         )
 
         # Load Q-table (convert numpy back to JAX array)
@@ -846,7 +879,7 @@ class TabularQLearning:
                     agent.q_table = agent.q_table.at[curr, pickup, t_idx, action].set(value)
             else:
                 # New format: numpy array
-                agent.q_table = jnp.array(state["q_table"])
+                agent.q_table = jnp.array(state["q_table"], dtype=agent.q_table.dtype)
         
         # Load visit counts
         if "visit_counts" in state:

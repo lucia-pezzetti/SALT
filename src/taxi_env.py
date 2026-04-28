@@ -64,6 +64,9 @@ class TaxiEnv(eqx.Module):
     timeout_penalty: float
     global_state_dim: int
     gamma: float
+    # Per-step congestion noise: noise_mask[i,j] is the max extra fraction for edge (i,j).
+    # 0.0 means deterministic; >0 means travel *= (1 + U(0, noise_mask[i,j])) each step.
+    noise_mask: jnp.ndarray       # [num_nodes, max_deg]
 
     def __init__(
         self,
@@ -82,6 +85,7 @@ class TaxiEnv(eqx.Module):
         pickup_bonus: float = 5.0,
         timeout_penalty: float = -50.0,
         gamma: float = 0.99,
+        noise_mask: Optional[jnp.ndarray] = None,  # [num_nodes, max_deg] - per-edge noise ceiling
     ):
         # static graph data - ensure all arrays are on GPU with proper dtypes
         travel_times_host = np.asarray(travel_times, dtype=np.float32)
@@ -132,6 +136,13 @@ class TaxiEnv(eqx.Module):
         self.green_durations = jnp.asarray(self.green_durations, dtype=jnp.float32)
         self.offsets = jnp.asarray(self.offsets, dtype=jnp.float32)
 
+        # Per-step congestion noise mask
+        if noise_mask is not None:
+            self.noise_mask = jax.device_put(jnp.array(noise_mask, dtype=jnp.float32))
+        else:
+            # All zeros → no noise (fully deterministic travel times)
+            self.noise_mask = jnp.zeros_like(self.travel_times)
+
         # Global traffic params
         self.global_state_dim = 3 * self.num_nodes  # [N,3] -> [3*N]
 
@@ -148,12 +159,17 @@ class TaxiEnv(eqx.Module):
                         self.neighbor_mask_static)[0]
 
     @jax.jit
-    def step(self, state: TaxiState, action: int) -> Tuple[TaxiState, float, bool, dict]:
+    def step(self, state: TaxiState, action: int, noise_key: Optional[jnp.ndarray] = None) -> Tuple[TaxiState, float, bool, dict]:
         """Environment step
         
         If the episode is already done (state.done == True), the agent stays in place
         and receives zero reward. This prevents agents from continuing to move and
         accumulate rewards after reaching the pickup point.
+        
+        Args:
+            noise_key: Optional JAX PRNG key. When provided and noise_mask > 0 for
+                       the traversed edge, travel time is multiplied by
+                       (1 + U(0, noise_mask[curr, action])).
         """
         # Already done
         already_done = state.done
@@ -162,6 +178,12 @@ class TaxiEnv(eqx.Module):
         curr = state.current_node
         nxt = self.adj_list[curr, action]
         travel = self.travel_times[curr, action]
+        
+        # Per-step congestion noise (only when a key is provided)
+        if noise_key is not None:
+            ceil = self.noise_mask[curr, action]  # max extra fraction for this edge
+            noise_factor = 1.0 + ceil * jrandom.uniform(noise_key)  # U(1, 1+ceil)
+            travel = travel * noise_factor
 
         # Check for invalid moves - should not happen if action masking is correct
         # Raise an error if invalid move is attempted

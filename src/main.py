@@ -9,7 +9,7 @@ import threading
 jax.config.update('jax_enable_x64', False)  # Use float32 for better GPU performance
 jax.config.update('jax_compilation_cache_dir', None)  # Will be set by environment
 
-from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn, load_or_compute_distance_matrix_parallel, load_or_build_graph
+from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn, load_or_compute_distance_matrix_parallel, load_or_build_graph, build_noise_mask
 from taxi_env import TaxiEnv, init_env
 from utils import EstimateReturnsState, load_graph
 from modes.context import RunContext
@@ -83,6 +83,8 @@ parser.add_argument("--offset", type=float, default=0.0, help="Offset for the cu
 parser.add_argument("--random_offsets", action="store_true", help="Use random offsets for each traffic light instead of uniform offset")
 parser.add_argument("--cycle_length", type=int, default=90, help="Cycle length for the customised grid environment")
 parser.add_argument("--no_congestion", type=bool, default=False, help="different types of roads have different congestion levels")
+parser.add_argument("--noise", action="store_true", help="Inject random congestion noise on primary/secondary roads (per-edge random multiplier on travel times)")
+parser.add_argument("--noise_level", type=float, default=0.2, help="Noise magnitude: primary roads get U(1, 1+level), secondary get U(1, 1+1.5*level). Default 0.2")
 parser.add_argument("--place_name", type=str, default="Manhattan, New York City, New York, USA", help="Place name for the graph (used for Manhattan)")
 parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zones.shp", help="Path to the shapefile for zones (used for Manhattan)")
 parser.add_argument("--num_agents", type=int, default=1, help="Number of agents in the environment")
@@ -147,6 +149,7 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility (affects starts/pickups selection)")
 parser.add_argument("--discrete", action="store_true", help="Use discrete time discretization and tabular Q-learning instead of PPO")
 parser.add_argument("--dt", type=float, default=1.0, help="Time discretization step in seconds (default: 1.0, used when --discrete is set)")
+parser.add_argument("--q_table_dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Q-table dtype for discrete Q-learning. Use float16/bfloat16 to reduce memory usage.")
 parser.add_argument("--pretrain_enabled", action="store_true", help="Enable shortest path pretraining for Q-learning (discrete mode only)")
 parser.add_argument("--num_pretrain_episodes", type=int, default=10000, help="Number of pretraining episodes using shortest path rollouts (for Q-learning)")
 parser.add_argument("--pretrain_learning_rate", type=float, default=None, help="Learning rate for pretraining (default: None = use agent's LR). Recommended: 0.01-0.05 when using --init_from_shortest_paths")
@@ -156,6 +159,7 @@ parser.add_argument("--eval_only_sp", action="store_true", help="Run shortest-pa
 parser.add_argument("--sample_starts_from_three_fixed", action="store_true", help="Sample starting nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Pickups still sampled from all nodes.")
 parser.add_argument("--sample_pickups_from_three_fixed", action="store_true", help="Sample pickup nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Starts sampled uniformly from all nodes.")
 parser.add_argument("--three_fixed_selection_method", type=str, default="random", choices=["random", "degree", "closeness", "betweenness"], help="Method to select the 3 fixed nodes: 'random' (default), 'degree' (degree centrality), 'closeness' (closeness centrality), 'betweenness' (betweenness centrality)")
+parser.add_argument("--no_round_trip", action="store_true", help="Disable return trips in Q-learning training. Only forward trips (start→pickup) are run; the return leg (pickup→start) is skipped.")
 
 args = parser.parse_args()
 
@@ -230,6 +234,16 @@ start_time = time.time()
 adj_list, travel_times, neighbor_mask_static = build_adj_and_time_matrix(
     G, node_to_idx=node_to_idx
 )
+
+# Build per-edge noise mask for dynamic (per-step) congestion noise
+if getattr(args, 'noise', False):
+    noise_mask = build_noise_mask(
+        G, node_to_idx,
+        noise_level=getattr(args, 'noise_level', 0.2),
+        max_deg=adj_list.shape[1],
+    )
+else:
+    noise_mask = None  # No noise — fully deterministic travel times
 
 # Place graph structures on device (CPU/GPU based on JAX_PLATFORMS) with optimal memory layout
 adj_list = jax.device_put(jnp.array(adj_list, dtype=jnp.int32))
@@ -488,7 +502,8 @@ env = TaxiEnv(
     node_coordinates=node_coordinates,  # Pass normalized coordinates for Euclidean distance
     pickup_bonus=args.pickup_bonus,
     timeout_penalty=args.timeout_penalty,
-    gamma=args.gamma,   
+    gamma=args.gamma,
+    noise_mask=noise_mask,  # Per-step congestion noise (None = deterministic)
 )
 
 # Observation function

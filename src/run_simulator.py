@@ -141,6 +141,12 @@ Examples:
         action="store_true",
         help="Agents travel back to start after reaching pickup"
     )
+    parser.add_argument(
+        "--reassignment_interval",
+        type=float,
+        default=120.0,
+        help="Seconds between reassignment batches. Free agents accumulate and are reassigned together every DT seconds (default: 120)"
+    )
     
     # Trip settings (simple mode)
     parser.add_argument(
@@ -450,6 +456,7 @@ def run_multi_agent_simulation(sim, args):
         print(f"  Policy: Shortest Path")
     if args.round_trip:
         print(f"  Round trip: ENABLED (agents return to start)")
+    print(f"  Reassignment interval: {args.reassignment_interval}s")
     
     # Run simulation
     agents, assignments = sim.run_simulation(
@@ -461,7 +468,8 @@ def run_multi_agent_simulation(sim, args):
         q_table_path=args.q_table,
         fixed_start_nodes=fixed_start_nodes,
         fixed_pickup_nodes=fixed_pickup_nodes,
-        round_trip=args.round_trip
+        round_trip=args.round_trip,
+        reassignment_interval=args.reassignment_interval
     )
     
     # Print statistics
