@@ -165,7 +165,7 @@ def train_ippo(
         pos_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         pos_c = np.zeros((E, N), dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=(E, M)).astype(np.int32)
-        col_lo = max(0, grid.w - 10)
+        col_lo = max(0, grid.w // 2)
         tgt_c = rng.integers(col_lo, grid.w, size=(E, M)).astype(np.int32)
         reached = np.zeros((E, N), dtype=bool)
         tgt_active = np.ones((E, M), dtype=bool)

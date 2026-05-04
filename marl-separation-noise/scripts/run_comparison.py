@@ -4,7 +4,7 @@ Compare  Separation Principle  vs  MAPPO  on the multi-agent gridworld
 under different noise correlation structures (individual / local / global).
 
 Every evaluation episode uses N agents and N targets randomly sampled
-(with repetition) from the last-column cells.  Both algorithms are
+(with repetition) from the last half of columns. Both algorithms are
 evaluated on the **same** target configuration per seed for fairness.
 
 Usage
@@ -37,10 +37,20 @@ import numpy as np
 from sepnoise.env import GridConfig, MultiAgentGrid, Pos
 from sepnoise.noise import NoiseConfig
 from sepnoise.qlearning import (
-    GoalConditionedTabularQ, QConfig, train_goal_q_multiagent,
+    GoalConditionedTabularQ,
+    QConfig,
+    train_goal_q_multiagent,
+)
+from sepnoise.separation_dqn import (
+    GoalConditionedDeepDQNPolicy,
+    SepDeepDQNConfig,
+    train_goal_deep_double_dqn,
 )
 from sepnoise.separation_ppo import (
-    GoalConditionedPPOPolicy, SepPPOConfig, train_goal_ppo,
+    GoalConditionedPPOPolicy,
+    SepPPOConfig,
+    train_goal_ppo,
+    train_goal_a2c,
 )
 from sepnoise.matching import assign_goals, terminal_ot_cost, target_coverage_rate
 from sepnoise.mappo import (
@@ -67,13 +77,23 @@ from sepnoise.viz import plot_terminal_hist
 
 
 # ---- Helpers --------------------------------------------------------------
-
-def _sample_targets(seed: int, n: int, h: int, w: int) -> List[Pos]:
-    """Sample *n* random targets from the last-10-columns pool."""
+def _sample_targets(
+    seed: int,
+    n: int,
+    h: int,
+    w: int,
+    region: str = "last_half",
+) -> List[Pos]:
+    """Sample *n* random targets from the requested grid region."""
     rng = np.random.default_rng(seed + 50_000)
     rows = rng.integers(0, h, size=n)
-    col_lo = max(0, w - 10)
-    cols = rng.integers(col_lo, w, size=n)
+    if region == "last_half":
+        col_lo = max(0, w // 2)
+        cols = rng.integers(col_lo, w, size=n)
+    elif region == "full_grid":
+        cols = rng.integers(0, w, size=n)
+    else:
+        raise ValueError(f"Unknown target sampling region: {region}")
     return [(int(r), int(c)) for r, c in zip(rows, cols)]
 
 
@@ -107,6 +127,95 @@ def _fmt(val: float, std: float, prec: int = 1) -> str:
     return f"{val:.{prec}f}±{std:.{prec}f}"
 
 
+def _parse_reach_thresholds(s: str) -> List[float]:
+    vals = [v.strip() for v in s.split(",") if v.strip()]
+    if not vals:
+        raise ValueError("At least one reach-rate threshold must be provided.")
+    out: List[float] = []
+    for v in vals:
+        thr = float(v)
+        if thr < 0.0 or thr > 1.0:
+            raise ValueError(f"Reach-rate threshold must be in [0,1], got {thr}.")
+        out.append(thr)
+    return out
+
+
+def _stable_reach_milestones(
+    train_curve: List[dict],
+    thresholds: List[float],
+    stability_window: int,
+) -> Dict[str, dict]:
+    if stability_window <= 0:
+        raise ValueError("stability_window must be positive.")
+
+    # Keep fixed threshold keys for easy plotting/comparison downstream.
+    keys = [f"{thr:.2f}" for thr in thresholds]
+    out: Dict[str, dict] = {
+        k: {
+            "env_interactions": float("nan"),
+            "epochs": float("nan"),
+            "episodes": float("nan"),
+        }
+        for k in keys
+    }
+    if not train_curve:
+        return out
+
+    reaches = [float(x.get("reach_rate", float("nan"))) for x in train_curve]
+    interactions = [float(x.get("env_interactions", float("nan"))) for x in train_curve]
+    batches = [float(x.get("batch", float("nan"))) for x in train_curve]
+    episodes = [float(x.get("episodes", float("nan"))) for x in train_curve]
+    n = len(reaches)
+
+    for thr in thresholds:
+        k = f"{thr:.2f}"
+        idx = None
+        max_start = n - stability_window
+        for i in range(max_start + 1):
+            segment = reaches[i : i + stability_window]
+            if all((r == r) and (r >= thr) for r in segment):
+                idx = i
+                break
+        if idx is None:
+            continue
+        out[k] = {
+            "env_interactions": interactions[idx],
+            # "epochs" here corresponds to PPO update epochs/batches.
+            "epochs": batches[idx],
+            "episodes": episodes[idx],
+        }
+    return out
+
+
+def _print_eval_trace(seed: int, label: str, result: dict) -> None:
+    print(f"\n[eval-trace] seed={seed} algorithm={label}")
+    targets = result.get("targets", [])
+    trajectories = result.get("trajectories", [])
+    starts = [traj[0] for traj in trajectories] if trajectories else []
+    print(f"  starts: {starts}")
+    print(f"  targets: {targets}")
+    print("  trajectories:")
+    for i, traj in enumerate(trajectories):
+        print(f"    agent[{i}]: {traj}")
+
+    step_traces = result.get("step_traces", [])
+    if not step_traces:
+        print("  step_traces: <not collected>")
+        return
+
+    print("  step_traces:")
+    for st in step_traces:
+        print(
+            f"    t={st['t']} "
+            f"states_before={st['states_before']} "
+            f"greedy_actions={st['greedy_actions']} "
+            f"executed_actions={st['executed_actions']} "
+            f"action_source={st['action_source']} "
+            f"rewards_no_collision={st['rewards_no_collision']} "
+            f"states_after={st['states_after']}"
+        )
+
+
 _RELATIVE_MODE = "relative_targets"
 
 
@@ -131,7 +240,7 @@ def _parse_sep_methods(s: str) -> List[str]:
     methods = [m.strip() for m in s.split(",") if m.strip()]
     if not methods:
         raise ValueError("At least one separation method must be provided.")
-    valid = {"q", "ppo"}
+    valid = {"q", "ppo", "ddqn", "a2c"}
     unknown = [m for m in methods if m not in valid]
     if unknown:
         raise ValueError(
@@ -211,6 +320,122 @@ def ensure_sep_q(
     return model, {"trained": True, "train_metrics": metrics}
 
 
+def ensure_sep_ddqn(
+    grid: GridConfig,
+    noise_cfg: NoiseConfig,
+    policy_path: str | None,
+    n_agents: int,
+    seed: int,
+    sep_ppo_batches: int = 500,
+    sep_ppo_batch_eps: int = 64,
+    early_stop_patience_batches: int = 0,
+    early_stop_min_rel_policy_update: float = 0.0,
+    early_stop_plateau_window_batches: int = 0,
+    early_stop_max_delta_reach_rate: float = 0.0,
+    early_stop_max_delta_mean_reward: float = 0.0,
+    save_dir: str | None = None,
+    wb_run=None,
+    wb_prefix: str = "train",
+    log_every: int = 10,
+    print_every: int = 10_000,
+) -> tuple[GoalConditionedDeepDQNPolicy, dict]:
+    """Train or load a noise-specific deep Double DQN policy (.pt)."""
+    if policy_path and os.path.exists(policy_path):
+        policy = GoalConditionedDeepDQNPolicy.load(policy_path)
+        if policy.h == grid.h and policy.w == grid.w:
+            print(f"[sep-ddqn] Loaded policy from {policy_path}")
+            return policy, {"loaded_from": policy_path}
+        print("[warn] Sep-DDQN shape mismatch, retraining …")
+
+    total_ix = max(1, sep_ppo_batches * sep_ppo_batch_eps * n_agents * grid.horizon)
+    dqcfg = SepDeepDQNConfig(
+        n_batches=sep_ppo_batches,
+        batch_episodes=sep_ppo_batch_eps,
+        eps_decay_interactions=max(1, total_ix // 2),
+        early_stop_patience_batches=early_stop_patience_batches,
+        early_stop_min_rel_policy_update=early_stop_min_rel_policy_update,
+        early_stop_plateau_window_batches=early_stop_plateau_window_batches,
+        early_stop_max_delta_reach_rate=early_stop_max_delta_reach_rate,
+        early_stop_max_delta_mean_reward=early_stop_max_delta_mean_reward,
+    )
+    model, metrics = train_goal_deep_double_dqn(
+        grid,
+        noise_cfg,
+        n_agents=n_agents,
+        cfg=dqcfg,
+        seed=seed,
+        log_every=log_every,
+        print_every=print_every,
+        wb_run=wb_run,
+        wb_prefix=wb_prefix,
+    )
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        out = os.path.join(save_dir, f"sep_ddqn_policy_{noise_cfg.kind}.pt")
+        model.save(out)
+        print(f"[sep-ddqn] Saved policy to {out}")
+    return model, {"trained": True, "train_metrics": metrics}
+
+
+def ensure_sep_a2c(
+    grid: GridConfig,
+    noise_cfg: NoiseConfig,
+    policy_path: str | None,
+    n_agents: int,
+    seed: int,
+    sep_ppo_batches: int = 500,
+    sep_ppo_batch_eps: int = 64,
+    early_stop_patience_batches: int = 0,
+    early_stop_min_rel_policy_update: float = 0.0,
+    early_stop_plateau_window_batches: int = 0,
+    early_stop_max_delta_reach_rate: float = 0.0,
+    early_stop_max_delta_mean_reward: float = 0.0,
+    save_dir: str | None = None,
+    wb_run=None,
+    wb_prefix: str = "train",
+    log_every: int = 10,
+    print_every: int = 10_000,
+) -> tuple[GoalConditionedPPOPolicy, dict]:
+    """Train or load a noise-specific Separation A2C policy (.pt, same format as Sep-PPO)."""
+    if policy_path and os.path.exists(policy_path):
+        policy = GoalConditionedPPOPolicy.load(policy_path)
+        if policy.h == grid.h and policy.w == grid.w:
+            print(f"[sep-a2c] Loaded policy from {policy_path}")
+            return policy, {"loaded_from": policy_path}
+        print("[warn] Sep A2C shape mismatch, retraining …")
+
+    a2c_cfg = SepPPOConfig(
+        n_batches=sep_ppo_batches,
+        batch_episodes=sep_ppo_batch_eps,
+        eps_decay_episodes=max(1, (sep_ppo_batches * sep_ppo_batch_eps) // 2),
+        eps_decay_interactions=max(
+            1, (sep_ppo_batches * sep_ppo_batch_eps * n_agents * grid.horizon) // 2
+        ),
+        early_stop_patience_batches=early_stop_patience_batches,
+        early_stop_min_rel_policy_update=early_stop_min_rel_policy_update,
+        early_stop_plateau_window_batches=early_stop_plateau_window_batches,
+        early_stop_max_delta_reach_rate=early_stop_max_delta_reach_rate,
+        early_stop_max_delta_mean_reward=early_stop_max_delta_mean_reward,
+    )
+    model, metrics = train_goal_a2c(
+        grid,
+        noise_cfg,
+        n_agents=n_agents,
+        cfg=a2c_cfg,
+        seed=seed,
+        log_every=log_every,
+        print_every=print_every,
+        wb_run=wb_run,
+        wb_prefix=wb_prefix,
+    )
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        out = os.path.join(save_dir, f"sep_a2c_policy_{noise_cfg.kind}.pt")
+        model.save(out)
+        print(f"[sep-a2c] Saved policy to {out}")
+    return model, {"trained": True, "train_metrics": metrics}
+
+
 def rollout_separation(
     Q: GoalConditionedTabularQ,
     grid: GridConfig,
@@ -220,6 +445,7 @@ def rollout_separation(
     rematch_every: int = 0,
     seed: int = 0,
     start_rows: List[int] | None = None,
+    collect_step_traces: bool = False,
 ) -> dict:
     """Greedy rollout with the separation principle (Q + Hungarian)."""
     eval_grid = replace(grid, rng_seed=seed)
@@ -236,25 +462,72 @@ def rollout_separation(
     trajectories: List[List[Pos]] = [
         [tuple(env.pos[i])] for i in range(n_agents)
     ]
+    step_traces: List[dict] = []
     total_cost = 0.0
 
-    for t in range(grid.horizon):
-        if rematch_every > 0 and t > 0 and t % rematch_every == 0:
-            env.goals = assign_goals(env.pos, env.targets)
+    def _rematch_unreached_only() -> None:
+        # Re-match only active agents to still-unreached targets.
+        active_idx = [i for i, r in enumerate(env.reached) if not r]
+        if not active_idx:
+            return
+        reached_targets = {tuple(env.pos[i]) for i, r in enumerate(env.reached) if r}
+        available_targets = [t for t in env.targets if tuple(t) not in reached_targets]
+        if len(available_targets) < len(active_idx):
+            # Fallback for degenerate cases (e.g. duplicated targets): keep matching feasible.
+            available_targets = list(env.targets)
+        active_agents = [env.pos[i] for i in active_idx]
+        matched = assign_goals(active_agents, available_targets)
+        for i, g in zip(active_idx, matched):
+            env.goals[i] = g
 
-        actions = [
+    for t in range(grid.horizon):
+        states_before = [tuple(p) for p in env.pos]
+        if rematch_every > 0 and t > 0 and t % rematch_every == 0:
+            _rematch_unreached_only()
+
+        greedy_actions = [
             4 if env.reached[i]
             else int(np.argmin(Q.Q[s[0], s[1], z[0], z[1], :]))
             for i, (s, z) in enumerate(zip(env.pos, env.goals))
         ]
-        step = env.step(actions)
+        step = env.step(greedy_actions)
         total_cost += float(step["step_cost"])
+        exec_actions = [int(a) for a in step["exec_actions"]]
 
         for i, nr in enumerate(step["newly_reached"]):
             if nr and arrival_time[i] is None:
                 arrival_time[i] = t + 1
         for i in range(n_agents):
             trajectories[i].append(tuple(env.pos[i]))
+        if collect_step_traces:
+            rewards = []
+            action_source = []
+            for i in range(n_agents):
+                if env.reached[i] and arrival_time[i] is not None and arrival_time[i] <= t:
+                    if arrival_time[i] == t + 1:
+                        rewards.append(float(grid.goal_bonus))
+                    else:
+                        rewards.append(0.0)
+                elif arrival_time[i] == t + 1:
+                    rewards.append(float(grid.goal_bonus))
+                else:
+                    rewards.append(float(-grid.step_cost))
+                action_source.append(
+                    "noise_override"
+                    if exec_actions[i] != int(greedy_actions[i])
+                    else "greedy"
+                )
+            step_traces.append(
+                {
+                    "t": int(t),
+                    "states_before": [[int(r), int(c)] for r, c in states_before],
+                    "greedy_actions": [int(a) for a in greedy_actions],
+                    "executed_actions": exec_actions,
+                    "action_source": action_source,
+                    "rewards_no_collision": rewards,
+                    "states_after": [[int(p[0]), int(p[1])] for p in env.pos],
+                }
+            )
 
     fp = [list(p) for p in env.pos]
     term_cost = terminal_ot_cost(env.pos, env.targets)
@@ -265,7 +538,7 @@ def rollout_separation(
         (at if at is not None else grid.horizon) for at in arrival_time
     ]
 
-    return {
+    out = {
         "algorithm": "Separation",
         "noise_kind": noise_cfg.kind, "p": noise_cfg.p,
         "agents": n_agents, "horizon": grid.horizon,
@@ -283,14 +556,23 @@ def rollout_separation(
         "targets": [list(t) for t in targets],
         "trajectories": [[list(p) for p in traj] for traj in trajectories],
     }
+    if collect_step_traces:
+        out["step_traces"] = step_traces
+    return out
 
 
 def ensure_sep_ppo(
     grid: GridConfig, noise_cfg: NoiseConfig, policy_path: str | None,
     n_agents: int, seed: int,
     sep_ppo_batches: int = 500, sep_ppo_batch_eps: int = 64,
+    early_stop_patience_batches: int = 0,
+    early_stop_min_rel_policy_update: float = 0.0,
+    early_stop_plateau_window_batches: int = 0,
+    early_stop_max_delta_reach_rate: float = 0.0,
+    early_stop_max_delta_mean_reward: float = 0.0,
     save_dir: str | None = None, wb_run=None, wb_prefix: str = "train",
     log_every: int = 10,
+    print_every: int = 10_000,
 ) -> tuple[GoalConditionedPPOPolicy, dict]:
     """Train or load a noise-specific goal-conditioned PPO policy."""
     if policy_path and os.path.exists(policy_path):
@@ -304,10 +586,18 @@ def ensure_sep_ppo(
         n_batches=sep_ppo_batches,
         batch_episodes=sep_ppo_batch_eps,
         eps_decay_episodes=max(1, (sep_ppo_batches * sep_ppo_batch_eps) // 2),
+        eps_decay_interactions=max(
+            1, (sep_ppo_batches * sep_ppo_batch_eps * n_agents * grid.horizon) // 2
+        ),
+        early_stop_patience_batches=early_stop_patience_batches,
+        early_stop_min_rel_policy_update=early_stop_min_rel_policy_update,
+        early_stop_plateau_window_batches=early_stop_plateau_window_batches,
+        early_stop_max_delta_reach_rate=early_stop_max_delta_reach_rate,
+        early_stop_max_delta_mean_reward=early_stop_max_delta_mean_reward,
     )
     model, metrics = train_goal_ppo(
         grid, noise_cfg, n_agents=n_agents,
-        cfg=ppo_cfg, seed=seed, log_every=log_every,
+        cfg=ppo_cfg, seed=seed, log_every=log_every, print_every=print_every,
         wb_run=wb_run, wb_prefix=wb_prefix,
     )
     if save_dir:
@@ -319,7 +609,7 @@ def ensure_sep_ppo(
 
 
 def rollout_separation_ppo(
-    policy: GoalConditionedPPOPolicy,
+    policy: GoalConditionedPPOPolicy | GoalConditionedDeepDQNPolicy,
     grid: GridConfig,
     noise_cfg: NoiseConfig,
     n_agents: int,
@@ -327,6 +617,7 @@ def rollout_separation_ppo(
     rematch_every: int = 0,
     seed: int = 0,
     start_rows: List[int] | None = None,
+    collect_step_traces: bool = False,
 ) -> dict:
     """Greedy rollout with separation principle (goal-conditioned PPO + Hungarian)."""
     eval_grid = replace(grid, rng_seed=seed)
@@ -343,25 +634,72 @@ def rollout_separation_ppo(
     trajectories: List[List[Pos]] = [
         [tuple(env.pos[i])] for i in range(n_agents)
     ]
+    step_traces: List[dict] = []
     total_cost = 0.0
 
-    for t in range(grid.horizon):
-        if rematch_every > 0 and t > 0 and t % rematch_every == 0:
-            env.goals = assign_goals(env.pos, env.targets)
+    def _rematch_unreached_only() -> None:
+        # Re-match only active agents to still-unreached targets.
+        active_idx = [i for i, r in enumerate(env.reached) if not r]
+        if not active_idx:
+            return
+        reached_targets = {tuple(env.pos[i]) for i, r in enumerate(env.reached) if r}
+        available_targets = [t for t in env.targets if tuple(t) not in reached_targets]
+        if len(available_targets) < len(active_idx):
+            # Fallback for degenerate cases (e.g. duplicated targets): keep matching feasible.
+            available_targets = list(env.targets)
+        active_agents = [env.pos[i] for i in active_idx]
+        matched = assign_goals(active_agents, available_targets)
+        for i, g in zip(active_idx, matched):
+            env.goals[i] = g
 
-        actions = [
+    for t in range(grid.horizon):
+        states_before = [tuple(p) for p in env.pos]
+        if rematch_every > 0 and t > 0 and t % rematch_every == 0:
+            _rematch_unreached_only()
+
+        greedy_actions = [
             4 if env.reached[i]
             else policy.act_greedy(s, z, t, grid)
             for i, (s, z) in enumerate(zip(env.pos, env.goals))
         ]
-        step = env.step(actions)
+        step = env.step(greedy_actions)
         total_cost += float(step["step_cost"])
+        exec_actions = [int(a) for a in step["exec_actions"]]
 
         for i, nr in enumerate(step["newly_reached"]):
             if nr and arrival_time[i] is None:
                 arrival_time[i] = t + 1
         for i in range(n_agents):
             trajectories[i].append(tuple(env.pos[i]))
+        if collect_step_traces:
+            rewards = []
+            action_source = []
+            for i in range(n_agents):
+                if env.reached[i] and arrival_time[i] is not None and arrival_time[i] <= t:
+                    if arrival_time[i] == t + 1:
+                        rewards.append(float(grid.goal_bonus))
+                    else:
+                        rewards.append(0.0)
+                elif arrival_time[i] == t + 1:
+                    rewards.append(float(grid.goal_bonus))
+                else:
+                    rewards.append(float(-grid.step_cost))
+                action_source.append(
+                    "noise_override"
+                    if exec_actions[i] != int(greedy_actions[i])
+                    else "greedy"
+                )
+            step_traces.append(
+                {
+                    "t": int(t),
+                    "states_before": [[int(r), int(c)] for r, c in states_before],
+                    "greedy_actions": [int(a) for a in greedy_actions],
+                    "executed_actions": exec_actions,
+                    "action_source": action_source,
+                    "rewards_no_collision": rewards,
+                    "states_after": [[int(p[0]), int(p[1])] for p in env.pos],
+                }
+            )
 
     fp = [list(p) for p in env.pos]
     term_cost = terminal_ot_cost(env.pos, env.targets)
@@ -372,7 +710,7 @@ def rollout_separation_ppo(
         (at if at is not None else grid.horizon) for at in arrival_time
     ]
 
-    return {
+    out = {
         "algorithm": "SeparationPPO",
         "noise_kind": noise_cfg.kind, "p": noise_cfg.p,
         "agents": n_agents, "horizon": grid.horizon,
@@ -390,6 +728,9 @@ def rollout_separation_ppo(
         "targets": [list(t) for t in targets],
         "trajectories": [[list(p) for p in traj] for traj in trajectories],
     }
+    if collect_step_traces:
+        out["step_traces"] = step_traces
+    return out
 
 
 # ---- Main ----------------------------------------------------------------
@@ -402,15 +743,49 @@ def main():
     ap.add_argument("--grid_w", type=int, default=30)
     ap.add_argument("--horizon", type=int, default=100)
     ap.add_argument("--agents", type=int, default=7)
+    ap.add_argument("--noise_mode", type=str, default="individual,local,global",
+                    help="Comma-separated noise modes to evaluate")
     ap.add_argument(
         "--p",
         type=str,
-        default="0.15",
+        default="0,0.05,0.1,0.25",
         help="Noise probability p, or comma-separated list (e.g. 0,0.05,0.1,0.25)",
     )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eval_seeds", type=int, default=20,
                     help="Number of evaluation seeds for multi-seed averaging")
+    ap.add_argument(
+        "--reach_thresholds",
+        type=str,
+        default="0.7,0.8,0.9,0.95,0.99",
+        help=(
+            "Comma-separated reach-rate thresholds used to compute "
+            "stable-learning interaction milestones."
+        ),
+    )
+    ap.add_argument(
+        "--stability_window",
+        type=int,
+        default=10,
+        help=(
+            "Number of consecutive training batches required above a threshold "
+            "to declare a stable reach level."
+        ),
+    )
+    ap.add_argument(
+        "--print_eval_traces",
+        action="store_true",
+        help=(
+            "Print starts, targets, trajectories, and per-step "
+            "(state, greedy action, executed action, reward) traces during evaluation."
+        ),
+    )
+    ap.add_argument(
+        "--print_eval_max_seeds",
+        type=int,
+        default=1,
+        help="Maximum number of eval seeds to print when --print_eval_traces is enabled.",
+    )
     ap.add_argument(
         "--fixed_targets",
         type=str,
@@ -420,36 +795,155 @@ def main():
             "If set, the same targets are used for every evaluation seed and algorithm."
         ),
     )
-    ap.add_argument("--rematch_every", type=int, default=0,
-                    help="Re-assign goals every N steps (separation principle)")
+    ap.add_argument(
+        "--eval_target_region",
+        type=str,
+        choices=["last_half", "full_grid"],
+        default="last_half",
+        help=(
+            "Region used to sample evaluation targets when --fixed_targets is not set. "
+            "'last_half' samples from columns [grid_w//2, grid_w), "
+            "'full_grid' samples from all columns."
+        ),
+    )
+    ap.add_argument(
+        "--eval_start_mode",
+        type=str,
+        choices=["random_rows", "bottom_left"],
+        default="random_rows",
+        help=(
+            "Evaluation start placement mode. "
+            "'random_rows' starts each agent at (random_row, 0); "
+            "'bottom_left' starts all agents at (grid_h-1, 0)."
+        ),
+    )
+    ap.add_argument(
+        "--rematch_every",
+        type=int,
+        default=1,
+        help=(
+            "Evaluation-only goal rematching cadence for separation rollouts. "
+            "1 means rematch every timestep; 0 disables rematching."
+        ),
+    )
+    ap.add_argument(
+        "--also_eval_rematch_zero",
+        action="store_true",
+        help=(
+            "Run an additional separation-only evaluation with rematch_every=0 "
+            "(same eval seeds/targets) for direct comparison."
+        ),
+    )
     ap.add_argument("--collision_penalty", type=float, default=0.0)
     ap.add_argument("--goal_bonus", type=float, default=40.0)
     # Separation principle
-    ap.add_argument("--sep_method", type=str, default="q",
-                    help="Comma-separated separation backends. Choices: q,ppo")
+    ap.add_argument(
+        "--sep_method",
+        type=str,
+        default="q",
+        help="Comma-separated separation backends. Choices: q, ddqn, ppo, a2c",
+    )
     ap.add_argument("--q_path_individual", type=str, default=None,
                     help="Pre-trained Q for individual noise (.npy)")
     ap.add_argument("--q_path_local", type=str, default=None,
                     help="Pre-trained Q for local noise (.npy)")
     ap.add_argument("--q_path_global", type=str, default=None,
                     help="Pre-trained Q for global noise (.npy)")
+    ap.add_argument("--q_ddqn_path_individual", type=str, default=None,
+                    help="Pre-trained Sep deep Double DQN policy for individual noise (.pt)")
+    ap.add_argument("--q_ddqn_path_local", type=str, default=None,
+                    help="Pre-trained Sep deep Double DQN policy for local noise (.pt)")
+    ap.add_argument("--q_ddqn_path_global", type=str, default=None,
+                    help="Pre-trained Sep deep Double DQN policy for global noise (.pt)")
     ap.add_argument("--sep_policy_path_individual", type=str, default=None,
                     help="Pre-trained Separation PPO policy for individual noise (.pt)")
     ap.add_argument("--sep_policy_path_local", type=str, default=None,
                     help="Pre-trained Separation PPO policy for local noise (.pt)")
     ap.add_argument("--sep_policy_path_global", type=str, default=None,
                     help="Pre-trained Separation PPO policy for global noise (.pt)")
+    ap.add_argument("--sep_a2c_policy_path_individual", type=str, default=None,
+                    help="Pre-trained Separation A2C policy for individual noise (.pt)")
+    ap.add_argument("--sep_a2c_policy_path_local", type=str, default=None,
+                    help="Pre-trained Separation A2C policy for local noise (.pt)")
+    ap.add_argument("--sep_a2c_policy_path_global", type=str, default=None,
+                    help="Pre-trained Separation A2C policy for global noise (.pt)")
     ap.add_argument("--sep_episodes", type=int, default=320_000,
                     help="Training episodes for separation Q-learning")
     ap.add_argument("--sep_ppo_batches", type=int, default=5000,
                     help="PPO batches for Separation-PPO training")
     ap.add_argument("--sep_ppo_batch_eps", type=int, default=64,
                     help="Episodes per PPO batch for Separation-PPO training")
+    ap.add_argument(
+        "--sep_ppo_early_stop_patience",
+        type=int,
+        default=0,
+        help=(
+            "Early-stop Sep-PPO when relative policy update stays below threshold "
+            "for this many consecutive batches (0 disables)."
+        ),
+    )
+    ap.add_argument(
+        "--sep_ppo_early_stop_min_rel_update",
+        type=float,
+        default=0.0,
+        help="Minimum relative Sep-PPO policy update for early-stop check (0 disables).",
+    )
+    ap.add_argument(
+        "--sep_ppo_early_stop_plateau_window",
+        type=int,
+        default=0,
+        help="Sep-PPO plateau window (batches) for hybrid early stop (0 disables plateau check).",
+    )
+    ap.add_argument(
+        "--sep_ppo_early_stop_max_delta_reach",
+        type=float,
+        default=0.0,
+        help="Max abs delta of Sep-PPO reach-rate moving averages between consecutive windows.",
+    )
+    ap.add_argument(
+        "--sep_ppo_early_stop_max_delta_reward",
+        type=float,
+        default=0.0,
+        help="Max abs delta of Sep-PPO mean-reward moving averages between consecutive windows.",
+    )
     # MAPPO
     ap.add_argument("--mappo_batches", type=int, default=5000,
                     help="Number of PPO update batches")
     ap.add_argument("--mappo_batch_eps", type=int, default=64,
                     help="Episodes per PPO batch")
+    ap.add_argument(
+        "--mappo_early_stop_patience",
+        type=int,
+        default=0,
+        help=(
+            "Early-stop MAPPO when relative policy update stays below threshold "
+            "for this many consecutive batches (0 disables)."
+        ),
+    )
+    ap.add_argument(
+        "--mappo_early_stop_min_rel_update",
+        type=float,
+        default=0.0,
+        help="Minimum relative MAPPO policy update for early-stop check (0 disables).",
+    )
+    ap.add_argument(
+        "--mappo_early_stop_plateau_window",
+        type=int,
+        default=0,
+        help="MAPPO plateau window (batches) for hybrid early stop (0 disables plateau check).",
+    )
+    ap.add_argument(
+        "--mappo_early_stop_max_delta_reach",
+        type=float,
+        default=0.0,
+        help="Max abs delta of MAPPO reach-rate moving averages between consecutive windows.",
+    )
+    ap.add_argument(
+        "--mappo_early_stop_max_delta_reward",
+        type=float,
+        default=0.0,
+        help="Max abs delta of MAPPO mean-reward moving averages between consecutive windows.",
+    )
     ap.add_argument(
         "--mappo_obs_modes",
         type=str,
@@ -459,8 +953,14 @@ def main():
             "Choices: relative_targets"
         ),
     )
-    ap.add_argument("--wandb_log_points", type=int, default=100,
+    ap.add_argument("--wandb_log_points", type=int, default=1000,
                     help="Approximate number of points per training curve in wandb")
+    ap.add_argument(
+        "--train_print_every_batches",
+        type=int,
+        default=500,
+        help="Console progress print cadence in training batches (larger = less frequent).",
+    )
     # IPPO
     ap.add_argument("--run_ippo", action="store_true", help="Also train/evaluate IPPO baseline")
     ap.add_argument("--ippo_batches", type=int, default=5000,
@@ -493,7 +993,7 @@ def main():
     )
     # VDN
     ap.add_argument("--run_vdn", action="store_true", help="Also train/evaluate VDN baseline")
-    ap.add_argument("--vdn_batches", type=int, default=500,
+    ap.add_argument("--vdn_batches", type=int, default=5000,
                     help="Number of VDN update batches")
     ap.add_argument("--vdn_batch_eps", type=int, default=64,
                     help="Episodes per VDN batch")
@@ -536,6 +1036,19 @@ def main():
             subprocess.run(cmd, check=True)
         return
     args.p = float(p_values[0])
+    reach_thresholds = _parse_reach_thresholds(args.reach_thresholds)
+    if args.stability_window <= 0:
+        raise ValueError("--stability_window must be >= 1.")
+    if args.sep_ppo_early_stop_patience < 0 or args.mappo_early_stop_patience < 0:
+        raise ValueError("Early-stop patience values must be >= 0.")
+    if args.sep_ppo_early_stop_min_rel_update < 0.0 or args.mappo_early_stop_min_rel_update < 0.0:
+        raise ValueError("Early-stop relative-update thresholds must be >= 0.")
+    if args.sep_ppo_early_stop_plateau_window < 0 or args.mappo_early_stop_plateau_window < 0:
+        raise ValueError("Early-stop plateau windows must be >= 0.")
+    if args.sep_ppo_early_stop_max_delta_reach < 0.0 or args.mappo_early_stop_max_delta_reach < 0.0:
+        raise ValueError("Early-stop reach-rate deltas must be >= 0.")
+    if args.sep_ppo_early_stop_max_delta_reward < 0.0 or args.mappo_early_stop_max_delta_reward < 0.0:
+        raise ValueError("Early-stop reward deltas must be >= 0.")
 
     # ---- Optional wandb init ----
     wb_run = None
@@ -582,11 +1095,26 @@ def main():
         "local": args.sep_policy_path_local,
         "global": args.sep_policy_path_global,
     }
+    q_ddqn_paths = {
+        "individual": args.q_ddqn_path_individual,
+        "local": args.q_ddqn_path_local,
+        "global": args.q_ddqn_path_global,
+    }
+    sep_a2c_policy_paths = {
+        "individual": args.sep_a2c_policy_path_individual,
+        "local": args.sep_a2c_policy_path_local,
+        "global": args.sep_a2c_policy_path_global,
+    }
 
     mappo_modes = _parse_relative_only_modes(args.mappo_obs_modes, "MAPPO")
     mappo_cfg = MAPPOConfig(
         n_batches=args.mappo_batches,
         batch_episodes=args.mappo_batch_eps,
+        early_stop_patience_batches=args.mappo_early_stop_patience,
+        early_stop_min_rel_policy_update=args.mappo_early_stop_min_rel_update,
+        early_stop_plateau_window_batches=args.mappo_early_stop_plateau_window,
+        early_stop_max_delta_reach_rate=args.mappo_early_stop_max_delta_reach,
+        early_stop_max_delta_mean_reward=args.mappo_early_stop_max_delta_reward,
     )
     ippo_modes = (
         _parse_relative_only_modes(args.ippo_obs_modes, "IPPO")
@@ -603,6 +1131,7 @@ def main():
     qmix_cfg = QMIXConfig(
         n_batches=args.qmix_batches,
         batch_episodes=args.qmix_batch_eps,
+        eps_decay_episodes=max(1, (args.qmix_batches * args.qmix_batch_eps) // 2),
     )
     vdn_modes = (
         _parse_relative_only_modes(args.vdn_obs_modes, "VDN")
@@ -611,24 +1140,29 @@ def main():
     vdn_cfg = VDNConfig(
         n_batches=args.vdn_batches,
         batch_episodes=args.vdn_batch_eps,
+        eps_decay_episodes=max(1, (args.vdn_batches * args.vdn_batch_eps) // 2),
     )
     # Logging cadence for wandb/console comparability with bounded point count.
     # We use --wandb_log_points as an approximate number of points per curve.
     # Separation cadence unit depends on sep_method:
-    # - q   -> episodes
-    # - ppo -> PPO batches
+    # - q -> episodes
+    # - ddqn / ppo / a2c -> batches (--sep_ppo_batches)
     sep_log_every_q = max(1, args.sep_episodes // max(1, args.wandb_log_points))
+    sep_log_every_ddqn = max(1, args.sep_ppo_batches // max(1, args.wandb_log_points))
     sep_log_every_ppo = max(1, args.sep_ppo_batches // max(1, args.wandb_log_points))
+    sep_log_every_a2c = sep_log_every_ppo
     mappo_log_every = max(1, mappo_cfg.n_batches // max(1, args.wandb_log_points))
     ippo_log_every = max(1, ippo_cfg.n_batches // max(1, args.wandb_log_points))
     qmix_log_every = max(1, qmix_cfg.n_batches // max(1, args.wandb_log_points))
     vdn_log_every = max(1, vdn_cfg.n_batches // max(1, args.wandb_log_points))
+    sep_ppo_print_every = max(1, args.train_print_every_batches * args.sep_ppo_batch_eps)
+    mappo_print_every = max(1, args.train_print_every_batches * args.mappo_batch_eps)
     all_results: List[dict] = []
 
     print(
         f"[wandb] log cadence: "
         f"sep_methods={sep_methods} "
-        f"(q:{sep_log_every_q} episodes, ppo:{sep_log_every_ppo} batches) | "
+        f"(q:{sep_log_every_q} episodes, ddqn/ppo/a2c:{sep_log_every_ppo} batches) | "
         f"mappo every {mappo_log_every} batches "
         f"({mappo_log_every * mappo_cfg.batch_episodes} episodes); "
         f"mappo_modes={mappo_modes}; "
@@ -640,7 +1174,16 @@ def main():
         f"{f' vdn_modes={vdn_modes} every {vdn_log_every} batches' if args.run_vdn else ''}"
     )
 
-    for kind in ["individual", "local", "global"]:
+    selected_noise_kinds = [k.strip() for k in args.noise_mode.split(",") if k.strip()]
+    valid_noise_kinds = {"individual", "local", "global"}
+    invalid_noise_kinds = [k for k in selected_noise_kinds if k not in valid_noise_kinds]
+    if invalid_noise_kinds:
+        raise ValueError(
+            f"Unknown noise_mode values: {invalid_noise_kinds}. "
+            f"Valid options are: {sorted(valid_noise_kinds)}."
+        )
+
+    for kind in selected_noise_kinds:
         noise_cfg = NoiseConfig(kind=kind, p=args.p, rng_seed=args.seed)
         kind_dir = os.path.join(base_outdir, kind)
         os.makedirs(kind_dir, exist_ok=True)
@@ -663,16 +1206,46 @@ def main():
                     log_every=sep_log_every_q,
                 )
                 sep_env_interactions = args.sep_episodes * N * grid.horizon
-            else:
+            elif sep_method == "ddqn":
+                sep_model, sep_train_info = ensure_sep_ddqn(
+                    grid, noise_cfg, q_ddqn_paths[kind], n_agents=N,
+                    seed=args.seed,
+                    sep_ppo_batches=args.sep_ppo_batches,
+                    sep_ppo_batch_eps=args.sep_ppo_batch_eps,
+                    early_stop_patience_batches=args.sep_ppo_early_stop_patience,
+                    early_stop_min_rel_policy_update=args.sep_ppo_early_stop_min_rel_update,
+                    early_stop_plateau_window_batches=args.sep_ppo_early_stop_plateau_window,
+                    early_stop_max_delta_reach_rate=args.sep_ppo_early_stop_max_delta_reach,
+                    early_stop_max_delta_mean_reward=args.sep_ppo_early_stop_max_delta_reward,
+                    save_dir=kind_dir, wb_run=wb_run,
+                    wb_prefix=f"train_sep_ddqn/{kind}",
+                    log_every=sep_log_every_ddqn,
+                    print_every=sep_ppo_print_every,
+                )
+                sep_env_interactions = (
+                    sep_train_info.get("train_metrics", {}).get("env_interactions")
+                    if isinstance(sep_train_info, dict) else None
+                )
+                if sep_env_interactions is None:
+                    sep_env_interactions = (
+                        args.sep_ppo_batches * args.sep_ppo_batch_eps * N * grid.horizon
+                    )
+            elif sep_method == "ppo":
                 sep_model, sep_train_info = ensure_sep_ppo(
                     grid, noise_cfg, sep_policy_paths[kind],
                     n_agents=N,
                     seed=args.seed,
                     sep_ppo_batches=args.sep_ppo_batches,
                     sep_ppo_batch_eps=args.sep_ppo_batch_eps,
+                    early_stop_patience_batches=args.sep_ppo_early_stop_patience,
+                    early_stop_min_rel_policy_update=args.sep_ppo_early_stop_min_rel_update,
+                    early_stop_plateau_window_batches=args.sep_ppo_early_stop_plateau_window,
+                    early_stop_max_delta_reach_rate=args.sep_ppo_early_stop_max_delta_reach,
+                    early_stop_max_delta_mean_reward=args.sep_ppo_early_stop_max_delta_reward,
                     save_dir=kind_dir, wb_run=wb_run,
                     wb_prefix=f"train_sep_ppo/{kind}",
                     log_every=sep_log_every_ppo,
+                    print_every=sep_ppo_print_every,
                 )
                 sep_env_interactions = (
                     sep_train_info.get("train_metrics", {}).get("env_interactions")
@@ -682,6 +1255,33 @@ def main():
                     sep_env_interactions = (
                         args.sep_ppo_batches * args.sep_ppo_batch_eps * grid.horizon
                     )
+            elif sep_method == "a2c":
+                sep_model, sep_train_info = ensure_sep_a2c(
+                    grid, noise_cfg, sep_a2c_policy_paths[kind],
+                    n_agents=N,
+                    seed=args.seed,
+                    sep_ppo_batches=args.sep_ppo_batches,
+                    sep_ppo_batch_eps=args.sep_ppo_batch_eps,
+                    early_stop_patience_batches=args.sep_ppo_early_stop_patience,
+                    early_stop_min_rel_policy_update=args.sep_ppo_early_stop_min_rel_update,
+                    early_stop_plateau_window_batches=args.sep_ppo_early_stop_plateau_window,
+                    early_stop_max_delta_reach_rate=args.sep_ppo_early_stop_max_delta_reach,
+                    early_stop_max_delta_mean_reward=args.sep_ppo_early_stop_max_delta_reward,
+                    save_dir=kind_dir, wb_run=wb_run,
+                    wb_prefix=f"train_sep_a2c/{kind}",
+                    log_every=sep_log_every_a2c,
+                    print_every=sep_ppo_print_every,
+                )
+                sep_env_interactions = (
+                    sep_train_info.get("train_metrics", {}).get("env_interactions")
+                    if isinstance(sep_train_info, dict) else None
+                )
+                if sep_env_interactions is None:
+                    sep_env_interactions = (
+                        args.sep_ppo_batches * args.sep_ppo_batch_eps * grid.horizon
+                    )
+            else:
+                raise ValueError(f"Unhandled sep_method: {sep_method}")
             sep_train_time = time.time() - t0
             sep_by_method[sep_method] = {
                 "model": sep_model,
@@ -710,7 +1310,10 @@ def main():
             t0 = time.time()
             actor, mappo_train = train_mappo(
                 grid, noise_cfg, N,
-                cfg=cfg_mode, seed=args.seed, log_every=mappo_log_every,
+                cfg=cfg_mode,
+                seed=args.seed,
+                log_every=mappo_log_every,
+                print_every=mappo_print_every,
                 wb_run=wb_run, wb_prefix=f"train_mappo/{kind}/{mode}",
             )
             mappo_train_time = time.time() - t0
@@ -852,19 +1455,53 @@ def main():
                     })
 
         # ----------------------------------------------------------
+        # 2e. Reach-rate stabilization milestones from training curves
+        # ----------------------------------------------------------
+        sep_reach_stabilization_by_method: dict[str, dict] = {}
+        for sep_method in sep_methods:
+            train_curve = (
+                sep_by_method[sep_method]
+                .get("train_info", {})
+                .get("train_metrics", {})
+                .get("train_curve", [])
+            )
+            sep_reach_stabilization_by_method[sep_method] = _stable_reach_milestones(
+                train_curve=train_curve,
+                thresholds=reach_thresholds,
+                stability_window=args.stability_window,
+            )
+        mappo_reach_stabilization_by_mode = {
+            mode: _stable_reach_milestones(
+                train_curve=mappo_by_mode[mode]["train"].get("train_curve", []),
+                thresholds=reach_thresholds,
+                stability_window=args.stability_window,
+            )
+            for mode in mappo_modes
+        }
+
+        # ----------------------------------------------------------
         # 3. Paired multi-seed evaluation (same targets for all)
         # ----------------------------------------------------------
         print(f"\n  Evaluating on {n_eval} seeds "
               f"(N={N} random targets each) …")
         sep_all_by_method: dict[str, List[dict]] = {m: [] for m in sep_methods}
+        sep_all_by_method_rematch0: dict[str, List[dict]] = (
+            {m: [] for m in sep_methods} if args.also_eval_rematch_zero else {}
+        )
         mappo_all_by_mode: dict[str, List[dict]] = {m: [] for m in mappo_modes}
         ippo_all_by_mode: dict[str, List[dict]] = {m: [] for m in ippo_modes} if args.run_ippo else {}
         qmix_all_by_mode: dict[str, List[dict]] = {m: [] for m in qmix_modes} if args.run_qmix else {}
         vdn_all_by_mode: dict[str, List[dict]] = {m: [] for m in vdn_modes} if args.run_vdn else {}
 
         for s in range(n_eval):
-            # Benchmark evaluation always uses random starts/targets per seed.
-            targets = _sample_targets(s, N, grid.h, grid.w)
+            # Benchmark evaluation uses shared starts/targets per seed.
+            targets = _sample_targets(
+                s, N, grid.h, grid.w, region=args.eval_target_region
+            )
+            start_rows = (
+                [grid.h - 1] * N if args.eval_start_mode == "bottom_left" else None
+            )
+            collect_step_traces = args.print_eval_traces and (s < args.print_eval_max_seeds)
 
             for sep_method in sep_methods:
                 sep_model = sep_by_method[sep_method]["model"]
@@ -872,13 +1509,33 @@ def main():
                     sep_res = rollout_separation(
                         sep_model, grid, noise_cfg, N, targets=targets,
                         rematch_every=args.rematch_every, seed=s,
+                        start_rows=start_rows,
+                        collect_step_traces=collect_step_traces,
                     )
                 else:
                     sep_res = rollout_separation_ppo(
                         sep_model, grid, noise_cfg, N, targets=targets,
                         rematch_every=args.rematch_every, seed=s,
+                        start_rows=start_rows,
+                        collect_step_traces=collect_step_traces,
                     )
                 sep_all_by_method[sep_method].append(sep_res)
+                if args.also_eval_rematch_zero:
+                    if sep_method == "q":
+                        sep_res_r0 = rollout_separation(
+                            sep_model, grid, noise_cfg, N, targets=targets,
+                            rematch_every=0, seed=s,
+                            start_rows=start_rows,
+                            collect_step_traces=False,
+                        )
+                    else:
+                        sep_res_r0 = rollout_separation_ppo(
+                            sep_model, grid, noise_cfg, N, targets=targets,
+                            rematch_every=0, seed=s,
+                            start_rows=start_rows,
+                            collect_step_traces=False,
+                        )
+                    sep_all_by_method_rematch0[sep_method].append(sep_res_r0)
             for mode in mappo_modes:
                 mappo_res = rollout_mappo(
                     mappo_by_mode[mode]["actor"],
@@ -888,6 +1545,8 @@ def main():
                     targets=targets,
                     seed=s,
                     obs_mode=mode,
+                    start_rows=start_rows,
+                    collect_step_traces=collect_step_traces,
                 )
                 mappo_all_by_mode[mode].append(mappo_res)
             if args.run_ippo:
@@ -900,6 +1559,7 @@ def main():
                         targets=targets,
                         seed=s,
                         obs_mode=mode,
+                        start_rows=start_rows,
                     )
                     ippo_all_by_mode[mode].append(ippo_res)
             if args.run_qmix:
@@ -912,6 +1572,7 @@ def main():
                         targets=targets,
                         seed=s,
                         obs_mode=mode,
+                        start_rows=start_rows,
                     )
                     qmix_all_by_mode[mode].append(qmix_res)
             if args.run_vdn:
@@ -924,12 +1585,58 @@ def main():
                         targets=targets,
                         seed=s,
                         obs_mode=mode,
+                        start_rows=start_rows,
                     )
                     vdn_all_by_mode[mode].append(vdn_res)
+
+            if collect_step_traces:
+                for sep_method in sep_methods:
+                    _print_eval_trace(
+                        s,
+                        f"Separation[{sep_method}]",
+                        sep_all_by_method[sep_method][-1],
+                    )
+                for mode in mappo_modes:
+                    _print_eval_trace(
+                        s,
+                        f"MAPPO[{mode}]",
+                        mappo_all_by_mode[mode][-1],
+                    )
+                if args.run_ippo:
+                    for mode in ippo_modes:
+                        _print_eval_trace(
+                            s,
+                            f"IPPO[{mode}]",
+                            ippo_all_by_mode[mode][-1],
+                        )
+                if args.run_qmix:
+                    for mode in qmix_modes:
+                        _print_eval_trace(
+                            s,
+                            f"QMIX[{mode}]",
+                            qmix_all_by_mode[mode][-1],
+                        )
+                if args.run_vdn:
+                    for mode in vdn_modes:
+                        _print_eval_trace(
+                            s,
+                            f"VDN[{mode}]",
+                            vdn_all_by_mode[mode][-1],
+                        )
+                # Keep result files compact: traces are printed, not persisted.
+                for sep_method in sep_methods:
+                    sep_all_by_method[sep_method][-1].pop("step_traces", None)
+                for mode in mappo_modes:
+                    mappo_all_by_mode[mode][-1].pop("step_traces", None)
 
         sep_agg_by_method = {
             m: _aggregate(sep_all_by_method[m]) for m in sep_methods
         }
+        sep_agg_by_method_rematch0 = (
+            {m: _aggregate(sep_all_by_method_rematch0[m]) for m in sep_methods}
+            if args.also_eval_rematch_zero
+            else {}
+        )
         mappo_agg_by_mode = {
             mode: _aggregate(mappo_all_by_mode[mode]) for mode in mappo_modes
         }
@@ -979,7 +1686,19 @@ def main():
                   f"±{sagg['terminal_ot_cost_std']:.1f}"
                   f"  reach={sagg['reach_rate_mean']:.1%}"
                   f"  cover={sagg['target_coverage_mean']:.1%}"
+                  f"  t_incl={sagg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                  f"±{sagg['mean_time_to_reach_including_unreached_std']:.1f}"
                   f"  ({stime:.1f}s train)")
+            if args.also_eval_rematch_zero:
+                sagg0 = sep_agg_by_method_rematch0[sep_method]
+                print(
+                    f"      [rematch=0] OT={sagg0['terminal_ot_cost_mean']:.1f}"
+                    f"±{sagg0['terminal_ot_cost_std']:.1f}"
+                    f"  reach={sagg0['reach_rate_mean']:.1%}"
+                    f"  cover={sagg0['target_coverage_mean']:.1%}"
+                    f"  t_incl={sagg0['mean_time_to_reach_including_unreached_mean']:.1f}"
+                    f"±{sagg0['mean_time_to_reach_including_unreached_std']:.1f}"
+                )
         for mode in mappo_modes:
             agg = mappo_agg_by_mode[mode]
             tmode = mappo_by_mode[mode]["train_time"]
@@ -987,6 +1706,8 @@ def main():
                   f"±{agg['terminal_ot_cost_std']:.1f}"
                   f"  reach={agg['reach_rate_mean']:.1%}"
                   f"  cover={agg['target_coverage_mean']:.1%}"
+                  f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                  f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
                   f"  ({tmode:.1f}s train)")
         if args.run_ippo:
             for mode in ippo_modes:
@@ -996,6 +1717,8 @@ def main():
                       f"±{agg['terminal_ot_cost_std']:.1f}"
                       f"  reach={agg['reach_rate_mean']:.1%}"
                       f"  cover={agg['target_coverage_mean']:.1%}"
+                      f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                      f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
                       f"  ({tmode:.1f}s train)")
         if args.run_qmix:
             for mode in qmix_modes:
@@ -1005,6 +1728,8 @@ def main():
                       f"±{agg['terminal_ot_cost_std']:.1f}"
                       f"  reach={agg['reach_rate_mean']:.1%}"
                       f"  cover={agg['target_coverage_mean']:.1%}"
+                      f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                      f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
                       f"  ({tmode:.1f}s train)")
         if args.run_vdn:
             for mode in vdn_modes:
@@ -1014,6 +1739,8 @@ def main():
                       f"±{agg['terminal_ot_cost_std']:.1f}"
                       f"  reach={agg['reach_rate_mean']:.1%}"
                       f"  cover={agg['target_coverage_mean']:.1%}"
+                      f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                      f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
                       f"  ({tmode:.1f}s train)")
 
         # ---- wandb: log per-noise-kind evaluation metrics ----
@@ -1145,11 +1872,17 @@ def main():
         # same starts for all algorithms, fixed targets if provided (else random).
         viz_seed = args.seed + 900_000
         viz_rng = np.random.default_rng(viz_seed)
-        viz_start_rows = viz_rng.integers(0, grid.h, size=N).astype(int).tolist()
+        viz_start_rows = (
+            [grid.h - 1] * N
+            if args.eval_start_mode == "bottom_left"
+            else viz_rng.integers(0, grid.h, size=N).astype(int).tolist()
+        )
         viz_targets = (
             list(fixed_targets)
             if fixed_targets is not None
-            else _sample_targets(viz_seed, N, grid.h, grid.w)
+            else _sample_targets(
+                viz_seed, N, grid.h, grid.w, region=args.eval_target_region
+            )
         )
 
         viz_sep_by_method: dict[str, dict] = {}
@@ -1399,13 +2132,30 @@ def main():
 
         all_results.append({
             "noise": kind,
+            "reach_thresholds": reach_thresholds,
+            "stability_window_batches": int(args.stability_window),
             "sep_method": primary_sep_method,  # backward compatibility
             "sep_methods": sep_methods,
+            "sep_reach_stabilization": sep_reach_stabilization_by_method.get(
+                primary_sep_method, {}
+            ),
+            "sep_reach_stabilization_by_method": sep_reach_stabilization_by_method,
             "sep_train_info_by_method": {m: v["train_info"] for m, v in sep_by_method.items()},
             "sep_agg": sep_agg,
             "sep_agg_by_method": sep_agg_by_method,
+            "sep_eval_rematch_every_primary": int(args.rematch_every),
+            "sep_agg_by_method_rematch0": sep_agg_by_method_rematch0,
+            "sep_seed0_by_method_rematch0": (
+                {m: sep_all_by_method_rematch0[m][0] for m in sep_methods}
+                if args.also_eval_rematch_zero
+                else {}
+            ),
             "mappo_agg": mappo_agg,  # primary mode for backward compatibility
             "mappo_mode_primary": primary_mode,
+            "mappo_reach_stabilization": mappo_reach_stabilization_by_mode.get(
+                primary_mode, {}
+            ),
+            "mappo_reach_stabilization_by_mode": mappo_reach_stabilization_by_mode,
             "mappo_agg_by_mode": mappo_agg_by_mode,
             "ippo_agg": ippo_agg if args.run_ippo else {},
             "ippo_mode_primary": ippo_primary_mode if args.run_ippo else None,
@@ -1646,8 +2396,10 @@ def main():
         # Save results as artifact
         artifact = wandb.Artifact(f"comparison_p{args.p}_{stamp}", type="results")
         artifact.add_file(os.path.join(base_outdir, "comparison.json"))
-        for kind in ["individual", "local", "global"]:
+        for kind in selected_noise_kinds:
             kind_dir = os.path.join(base_outdir, kind)
+            if not os.path.isdir(kind_dir):
+                continue
             for fname in os.listdir(kind_dir):
                 if fname.endswith((".json", ".png")):
                     artifact.add_file(os.path.join(kind_dir, fname),

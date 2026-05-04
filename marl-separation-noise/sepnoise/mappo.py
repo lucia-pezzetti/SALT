@@ -13,7 +13,6 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from .env import GridConfig, ACTIONS, Pos
@@ -50,6 +49,11 @@ class MAPPOConfig:
     obs_mode: str = "relative_targets"
     minibatch_size_actor: int = 4096
     minibatch_size_critic: int = 1024
+    early_stop_patience_batches: int = 0
+    early_stop_min_rel_policy_update: float = 0.0
+    early_stop_plateau_window_batches: int = 0
+    early_stop_max_delta_reach_rate: float = 0.0
+    early_stop_max_delta_mean_reward: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +186,17 @@ def train_mappo(
     kind = noise_cfg.kind
     p_noise = float(noise_cfg.p)
     batch_rewards_log: List[float] = []
+    train_curve: List[Dict[str, float]] = []
+    consecutive_small_updates = 0
+    early_stopped = False
+    stop_reason = ""
     if wb_run is not None:
         p = wb_prefix
         wb_run.define_metric(f"{p}/iter")
         wb_run.define_metric(f"{p}/*", step_metric=f"{p}/iter")
 
     for batch_idx in range(cfg.n_batches):
+        actor_before = nn.utils.parameters_to_vector(actor.parameters()).detach().clone()
         entropy_coef_t = _linear_decay(
             cfg.entropy_coef, cfg.entropy_coef_end, batch_idx, cfg.n_batches
         )
@@ -195,7 +204,7 @@ def train_mappo(
         pos_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         pos_c = np.zeros((E, N), dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=(E, M)).astype(np.int32)
-        col_lo = max(0, grid.w - 10)
+        col_lo = max(0, grid.w // 2)
         tgt_c = rng.integers(col_lo, grid.w, size=(E, M)).astype(np.int32)
 
         reached = np.zeros((E, N), dtype=bool)
@@ -414,11 +423,26 @@ def train_mappo(
         critic_loss_v = float(np.mean(critic_losses)) if critic_losses else float("nan")
         entropy_v = float(np.mean(entropies)) if entropies else float("nan")
         clip_frac_v = float(np.mean(clip_fracs)) if clip_fracs else float("nan")
+        actor_after = nn.utils.parameters_to_vector(actor.parameters()).detach()
+        delta = actor_after - actor_before
+        delta_norm = float(torch.linalg.vector_norm(delta).item())
+        base_norm = float(torch.linalg.vector_norm(actor_before).item())
+        rel_policy_update = delta_norm / max(base_norm, 1e-12)
 
         mean_rew = float(s_rew.sum()) / E
         reach_rate = float(reached.mean())
         batch_rewards_log.append(mean_rew)
         episodes_done = (batch_idx + 1) * E
+        interactions_done = int((batch_idx + 1) * E * N * H)
+        train_curve.append(
+            {
+                "batch": float(batch_idx + 1),
+                "episodes": float(episodes_done),
+                "env_interactions": float(interactions_done),
+                "reach_rate": float(reach_rate),
+                "rel_policy_update": float(rel_policy_update),
+            }
+        )
         if episodes_done % print_every == 0:
             rec = np.mean(batch_rewards_log[-log_every:])
             print(f"[MAPPO-{noise_cfg.kind}|{obs_mode}] batch {batch_idx+1:4d}/{cfg.n_batches}"
@@ -429,30 +453,76 @@ def train_mappo(
             rec = np.mean(batch_rewards_log[-log_every:])
             p = wb_prefix
             wb_run.log({
-                # Use cumulative processed episodes as x-axis for comparability.
-                f"{p}/iter": episodes_done,
+                # Use cumulative environment interactions as x-axis.
+                f"{p}/iter": interactions_done,
                 f"{p}/batch": batch_idx + 1,
                 f"{p}/episodes": episodes_done,
+                f"{p}/env_interactions": interactions_done,
                 f"{p}/mean_reward": float(rec),
                 f"{p}/last_batch_reward": float(mean_rew),
                 f"{p}/reach_rate": reach_rate,
+                f"{p}/rel_policy_update": float(rel_policy_update),
                 f"{p}/actor_loss": actor_loss_v,
                 f"{p}/critic_loss": critic_loss_v,
                 f"{p}/entropy": entropy_v,
                 f"{p}/clip_fraction": clip_frac_v,
             })
 
+        if cfg.early_stop_patience_batches > 0:
+            small_update_ok = (
+                cfg.early_stop_min_rel_policy_update <= 0.0
+                or rel_policy_update < cfg.early_stop_min_rel_policy_update
+            )
+            plateau_ok = True
+            if cfg.early_stop_plateau_window_batches > 0:
+                w = cfg.early_stop_plateau_window_batches
+                if len(batch_rewards_log) >= 2 * w and len(train_curve) >= 2 * w:
+                    prev_rew = float(np.mean(batch_rewards_log[-2 * w : -w]))
+                    curr_rew = float(np.mean(batch_rewards_log[-w:]))
+                    reach_hist = [float(x["reach_rate"]) for x in train_curve]
+                    prev_reach = float(np.mean(reach_hist[-2 * w : -w]))
+                    curr_reach = float(np.mean(reach_hist[-w:]))
+                    plateau_ok = (
+                        abs(curr_reach - prev_reach) <= cfg.early_stop_max_delta_reach_rate
+                        and abs(curr_rew - prev_rew) <= cfg.early_stop_max_delta_mean_reward
+                    )
+                else:
+                    plateau_ok = False
+
+            if small_update_ok and plateau_ok:
+                consecutive_small_updates += 1
+            else:
+                consecutive_small_updates = 0
+
+            if consecutive_small_updates >= cfg.early_stop_patience_batches:
+                early_stopped = True
+                stop_reason = (
+                    f"stable for {cfg.early_stop_patience_batches} batches "
+                    f"(rel_update<={cfg.early_stop_min_rel_policy_update or 'disabled'}, "
+                    f"plateau_window={cfg.early_stop_plateau_window_batches})"
+                )
+                print(f"[MAPPO-{noise_cfg.kind}|{obs_mode}] early stop at batch {batch_idx + 1}: {stop_reason}")
+                break
+
     actor.obs_mode = obs_mode
     actor.n_targets = M
+    executed_batches = len(train_curve)
+    executed_episodes = int(executed_batches * E)
+    executed_interactions = int(executed_batches * E * N * H)
     return actor, {
-        "algorithm": "MAPPO", "episodes": cfg.n_batches * E,
+        "algorithm": "MAPPO", "episodes": executed_episodes,
         "n_agents": N, "n_targets": M, "noise_kind": noise_cfg.kind,
         "p": noise_cfg.p, "mappo_config": asdict(cfg),
         "obs_mode": obs_mode,
-        "env_interactions": cfg.n_batches * E * N * H,
+        "env_interactions": executed_interactions,
         "mean_reward_last10": float(np.mean(batch_rewards_log[-10:])),
         "entropy_coef_start": float(cfg.entropy_coef),
         "entropy_coef_end": float(cfg.entropy_coef_end),
+        "planned_batches": int(cfg.n_batches),
+        "executed_batches": int(executed_batches),
+        "early_stopped": bool(early_stopped),
+        "early_stop_reason": stop_reason,
+        "train_curve": train_curve,
     }
 
 
@@ -465,6 +535,7 @@ def rollout_mappo(
     n_agents: int, targets: List[Pos] | None = None, seed: int = 0,
     obs_mode: str | None = None,
     start_rows: List[int] | None = None,
+    collect_step_traces: bool = False,
 ) -> Dict[str, Any]:
     rng = np.random.default_rng(seed)
     N, H = n_agents, grid.horizon
@@ -491,6 +562,7 @@ def rollout_mappo(
     trajectories: List[List[Pos]] = [
         [(int(pos_r[i]), int(pos_c[i]))] for i in range(N)
     ]
+    step_traces: List[Dict[str, Any]] = []
     total_cost = 0.0
     aid = np.arange(N, dtype=np.float32) / max(1, N - 1)
     if obs_mode is None:
@@ -505,6 +577,7 @@ def rollout_mappo(
 
     actor.eval()
     for t in range(H):
+        states_before = [(int(pos_r[i]), int(pos_c[i])) for i in range(N)]
         obs_l = np.empty((N, obs_dim), dtype=np.float32)
         obs_l[:, 0] = pos_r / max(1, grid.h - 1)
         obs_l[:, 1] = pos_c / max(1, grid.w - 1)
@@ -524,6 +597,7 @@ def rollout_mappo(
         with torch.no_grad():
             actions_np = actor.net(torch.from_numpy(obs_l)).argmax(-1).numpy()
 
+        greedy_actions = actions_np.copy().astype(np.int32)
         actions_np[reached] = 4
         active = ~reached
         idx_a = np.where(active)[0]
@@ -574,6 +648,34 @@ def rollout_mappo(
         pos_r, pos_c = new_r, new_c
         for i in range(N):
             trajectories[i].append((int(pos_r[i]), int(pos_c[i])))
+        if collect_step_traces:
+            rewards = []
+            action_source = []
+            for i in range(N):
+                if reached[i] and arrival[i] is not None and arrival[i] <= t:
+                    # Already absorbed before this step (or just reached at this step).
+                    if arrival[i] == t + 1:
+                        rewards.append(float(grid.goal_bonus))
+                    else:
+                        rewards.append(0.0)
+                elif arrival[i] == t + 1:
+                    rewards.append(float(grid.goal_bonus))
+                else:
+                    rewards.append(float(-grid.step_cost))
+                action_source.append(
+                    "noise_override" if int(exec_a[i]) != int(greedy_actions[i]) else "greedy"
+                )
+            step_traces.append(
+                {
+                    "t": int(t),
+                    "states_before": [[int(r), int(c)] for r, c in states_before],
+                    "greedy_actions": [int(a) for a in greedy_actions.tolist()],
+                    "executed_actions": [int(a) for a in exec_a.tolist()],
+                    "action_source": action_source,
+                    "rewards_no_collision": rewards,
+                    "states_after": [[int(pos_r[i]), int(pos_c[i])] for i in range(N)],
+                }
+            )
 
     fp = [(int(pos_r[i]), int(pos_c[i])) for i in range(N)]
     tc = terminal_ot_cost(fp, targets)
@@ -581,7 +683,7 @@ def rollout_mappo(
     nr = sum(1 for a in arrival if a is not None)
     rt = [a for a in arrival if a is not None]
     rt_with_horizon = [(a if a is not None else H) for a in arrival]
-    return {
+    out = {
         "algorithm": "MAPPO", "noise_kind": noise_cfg.kind, "p": noise_cfg.p,
         "obs_mode": obs_mode,
         "agents": N, "horizon": H,
@@ -596,3 +698,6 @@ def rollout_mappo(
             [list(p) for p in traj] for traj in trajectories
         ],
     }
+    if collect_step_traces:
+        out["step_traces"] = step_traces
+    return out

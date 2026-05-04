@@ -203,7 +203,7 @@ def train_goal_q_multiagent(
         pos_r = rng.integers(0, grid.h, size=M).astype(np.int32)
         pos_c = np.zeros(M, dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=M).astype(np.int32)
-        col_lo = max(0, grid.w - 10)
+        col_lo = max(0, grid.w // 2)
         tgt_c = rng.integers(col_lo, grid.w, size=M).astype(np.int32)
 
         # --- 2. ε-greedy OT assignment ---

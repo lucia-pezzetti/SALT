@@ -34,6 +34,12 @@ class SepPPOConfig:
     eps_start: float = 0.5
     eps_end: float = 0.05
     eps_decay_episodes: int = 20_000
+    eps_decay_interactions: int | None = None
+    early_stop_patience_batches: int = 0
+    early_stop_min_rel_policy_update: float = 0.0
+    early_stop_plateau_window_batches: int = 0
+    early_stop_max_delta_reach_rate: float = 0.0
+    early_stop_max_delta_mean_reward: float = 0.0
 
 
 class _Actor(nn.Module):
@@ -145,14 +151,14 @@ def _assign_goals_by_value(
     return assigned
 
 
-def _epsilon_by_episode(ep: int, cfg: SepPPOConfig) -> float:
-    """Exponential epsilon schedule (matches separation-q style)."""
-    if ep >= cfg.eps_decay_episodes:
+def _epsilon_by_interactions(interactions_done: int, decay_interactions: int, cfg: SepPPOConfig) -> float:
+    """Exponential epsilon schedule driven by interaction count."""
+    if interactions_done >= decay_interactions:
         return float(cfg.eps_end)
     rate = (cfg.eps_end / max(cfg.eps_start, 1e-8)) ** (
-        1.0 / max(1, cfg.eps_decay_episodes)
+        1.0 / max(1, decay_interactions)
     )
-    return float(max(cfg.eps_start * rate ** ep, cfg.eps_end))
+    return float(max(cfg.eps_start * rate ** interactions_done, cfg.eps_end))
 
 
 class GoalConditionedPPOPolicy:
@@ -206,6 +212,12 @@ def train_goal_ppo(
     H = grid.horizon
     E = cfg.batch_episodes
     N = n_agents
+    total_interactions = int(cfg.n_batches * E * N * H)
+    eps_decay_interactions = int(
+        cfg.eps_decay_interactions
+        if cfg.eps_decay_interactions is not None
+        else max(1, total_interactions // 2)
+    )
     actor = _Actor(obs_dim=obs_dim, hidden=cfg.hidden_size)
     critic = _Critic(obs_dim=obs_dim, hidden=cfg.hidden_size)
     opt_a = torch.optim.Adam(actor.parameters(), lr=cfg.lr_actor)
@@ -213,12 +225,17 @@ def train_goal_ppo(
 
     rewards_log: List[float] = []
     reach_log: List[float] = []
+    train_curve: List[Dict[str, float]] = []
+    consecutive_small_updates = 0
+    early_stopped = False
+    stop_reason = ""
     if wb_run is not None:
         p = wb_prefix
         wb_run.define_metric(f"{p}/iter")
         wb_run.define_metric(f"{p}/*", step_metric=f"{p}/iter")
 
     for batch_idx in range(cfg.n_batches):
+        actor_before = nn.utils.parameters_to_vector(actor.parameters()).detach().clone()
         s_obs = np.empty((H, E, N, obs_dim), dtype=np.float32)
         s_acts = np.empty((H, E, N), dtype=np.int64)
         s_logp = np.empty((H, E, N), dtype=np.float32)
@@ -232,14 +249,15 @@ def train_goal_ppo(
         starts_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         starts_c = np.zeros((E, N), dtype=np.int32)
         targets_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
-        col_lo = max(0, grid.w - 10)
+        col_lo = max(0, grid.w // 2)
         targets_c = rng.integers(col_lo, grid.w, size=(E, N)).astype(np.int32)
         goals_r = np.empty((E, N), dtype=np.int32)
         goals_c = np.empty((E, N), dtype=np.int32)
 
         for e in range(E):
             episode_idx = batch_idx * E + e
-            eps = _epsilon_by_episode(episode_idx, cfg)
+            interactions_done = int(episode_idx * N * H)
+            eps = _epsilon_by_interactions(interactions_done, eps_decay_interactions, cfg)
             starts = [(int(starts_r[e, i]), 0) for i in range(N)]
             targets = [(int(targets_r[e, j]), int(targets_c[e, j])) for j in range(N)]
             if rng.random() < eps:
@@ -361,11 +379,27 @@ def train_goal_ppo(
             critic_loss_v = float(c_loss.item())
             entropy_v = float(((ent * b_mask).sum() / ms).item())
 
+        actor_after = nn.utils.parameters_to_vector(actor.parameters()).detach()
+        delta = actor_after - actor_before
+        delta_norm = float(torch.linalg.vector_norm(delta).item())
+        base_norm = float(torch.linalg.vector_norm(actor_before).item())
+        rel_policy_update = delta_norm / max(base_norm, 1e-12)
+
         mean_rew = float(ep_rewards.sum(axis=1).mean())
         mean_reach = float(ep_reached.mean())
         rewards_log.append(mean_rew)
         reach_log.append(mean_reach)
         episodes_done = (batch_idx + 1) * E
+        interactions_done = int((batch_idx + 1) * E * N * H)
+        train_curve.append(
+            {
+                "batch": float(batch_idx + 1),
+                "episodes": float(episodes_done),
+                "env_interactions": float(interactions_done),
+                "reach_rate": float(mean_reach),
+                "rel_policy_update": float(rel_policy_update),
+            }
+        )
         if episodes_done % print_every == 0:
             rec_rew = float(np.mean(rewards_log[-log_every:]))
             rec_reach = float(np.mean(reach_log[-log_every:]))
@@ -378,28 +412,370 @@ def train_goal_ppo(
         if (batch_idx + 1) % log_every == 0 and wb_run is not None:
             p = wb_prefix
             wb_run.log({
-                f"{p}/iter": episodes_done,
+                f"{p}/iter": interactions_done,
                 f"{p}/batch": batch_idx + 1,
                 f"{p}/episodes": episodes_done,
-                f"{p}/epsilon": float(_epsilon_by_episode(episodes_done - 1, cfg)),
+                f"{p}/env_interactions": interactions_done,
+                f"{p}/epsilon": float(
+                    _epsilon_by_interactions(interactions_done, eps_decay_interactions, cfg)
+                ),
                 f"{p}/mean_reward": float(np.mean(rewards_log[-log_every:])),
                 f"{p}/last_batch_reward": float(mean_rew),
                 f"{p}/reach_rate": float(mean_reach),
+                f"{p}/rel_policy_update": float(rel_policy_update),
                 f"{p}/actor_loss": actor_loss_v,
                 f"{p}/critic_loss": critic_loss_v,
                 f"{p}/entropy": entropy_v,
             })
 
+        if cfg.early_stop_patience_batches > 0:
+            small_update_ok = (
+                cfg.early_stop_min_rel_policy_update <= 0.0
+                or rel_policy_update < cfg.early_stop_min_rel_policy_update
+            )
+            plateau_ok = True
+            if cfg.early_stop_plateau_window_batches > 0:
+                w = cfg.early_stop_plateau_window_batches
+                if len(reach_log) >= 2 * w and len(rewards_log) >= 2 * w:
+                    prev_reach = float(np.mean(reach_log[-2 * w : -w]))
+                    curr_reach = float(np.mean(reach_log[-w:]))
+                    prev_rew = float(np.mean(rewards_log[-2 * w : -w]))
+                    curr_rew = float(np.mean(rewards_log[-w:]))
+                    plateau_ok = (
+                        abs(curr_reach - prev_reach) <= cfg.early_stop_max_delta_reach_rate
+                        and abs(curr_rew - prev_rew) <= cfg.early_stop_max_delta_mean_reward
+                    )
+                else:
+                    plateau_ok = False
+
+            if small_update_ok and plateau_ok:
+                consecutive_small_updates += 1
+            else:
+                consecutive_small_updates = 0
+
+            if consecutive_small_updates >= cfg.early_stop_patience_batches:
+                early_stopped = True
+                stop_reason = (
+                    f"stable for {cfg.early_stop_patience_batches} batches "
+                    f"(rel_update<={cfg.early_stop_min_rel_policy_update or 'disabled'}, "
+                    f"plateau_window={cfg.early_stop_plateau_window_batches})"
+                )
+                print(f"[SepPPO-{noise_cfg.kind}] early stop at batch {batch_idx + 1}: {stop_reason}")
+                break
+
     policy = GoalConditionedPPOPolicy(actor=actor, h=grid.h, w=grid.w)
+    executed_batches = len(train_curve)
+    executed_episodes = int(executed_batches * E)
+    executed_interactions = int(executed_batches * E * N * H)
     metrics = {
         "algorithm": "SeparationPPO",
-        "episodes": int(cfg.n_batches * E),
+        "episodes": executed_episodes,
         "n_agents": int(N),
         "noise_kind": noise_cfg.kind,
         "p": noise_cfg.p,
         "sep_ppo_config": asdict(cfg),
         "mean_reward_last10": float(np.mean(rewards_log[-10:])),
         "mean_reach_last10": float(np.mean(reach_log[-10:])),
-        "env_interactions": int(cfg.n_batches * E * N * H),
+        "env_interactions": executed_interactions,
+        "eps_decay_interactions": eps_decay_interactions,
+        "planned_batches": int(cfg.n_batches),
+        "executed_batches": int(executed_batches),
+        "early_stopped": bool(early_stopped),
+        "early_stop_reason": stop_reason,
+        "train_curve": train_curve,
+    }
+    return policy, metrics
+
+
+def train_goal_a2c(
+    grid: GridConfig,
+    noise_cfg: NoiseConfig,
+    n_agents: int,
+    cfg: SepPPOConfig | None = None,
+    seed: int = 0,
+    log_every: int = 10,
+    print_every: int = 1000,
+    wb_run=None,
+    wb_prefix: str = "train_sep_a2c",
+) -> tuple[GoalConditionedPPOPolicy, Dict[str, Any]]:
+    """
+    Advantage Actor-Critic on the same batched rollout as Sep-PPO, but with a single
+    policy-gradient + value step per batch (no PPO clipping, no multi-epoch replay).
+    """
+    if cfg is None:
+        cfg = SepPPOConfig()
+
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+
+    obs_dim = 6
+    H = grid.horizon
+    E = cfg.batch_episodes
+    N = n_agents
+    total_interactions = int(cfg.n_batches * E * N * H)
+    eps_decay_interactions = int(
+        cfg.eps_decay_interactions
+        if cfg.eps_decay_interactions is not None
+        else max(1, total_interactions // 2)
+    )
+    actor = _Actor(obs_dim=obs_dim, hidden=cfg.hidden_size)
+    critic = _Critic(obs_dim=obs_dim, hidden=cfg.hidden_size)
+    opt_a = torch.optim.Adam(actor.parameters(), lr=cfg.lr_actor)
+    opt_c = torch.optim.Adam(critic.parameters(), lr=cfg.lr_critic)
+
+    rewards_log: List[float] = []
+    reach_log: List[float] = []
+    train_curve: List[Dict[str, float]] = []
+    consecutive_small_updates = 0
+    early_stopped = False
+    stop_reason = ""
+    if wb_run is not None:
+        p = wb_prefix
+        wb_run.define_metric(f"{p}/iter")
+        wb_run.define_metric(f"{p}/*", step_metric=f"{p}/iter")
+
+    for batch_idx in range(cfg.n_batches):
+        actor_before = nn.utils.parameters_to_vector(actor.parameters()).detach().clone()
+        s_obs = np.empty((H, E, N, obs_dim), dtype=np.float32)
+        s_acts = np.empty((H, E, N), dtype=np.int64)
+        s_logp = np.empty((H, E, N), dtype=np.float32)
+        s_rew = np.empty((H, E, N), dtype=np.float32)
+        s_val = np.empty((H, E, N), dtype=np.float32)
+        s_mask = np.empty((H, E, N), dtype=np.float32)
+
+        ep_rewards = np.zeros((E, N), dtype=np.float32)
+        ep_reached = np.zeros((E, N), dtype=np.float32)
+
+        starts_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
+        starts_c = np.zeros((E, N), dtype=np.int32)
+        targets_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
+        col_lo = max(0, grid.w // 2)
+        targets_c = rng.integers(col_lo, grid.w, size=(E, N)).astype(np.int32)
+        goals_r = np.empty((E, N), dtype=np.int32)
+        goals_c = np.empty((E, N), dtype=np.int32)
+
+        for e in range(E):
+            episode_idx = batch_idx * E + e
+            interactions_done = int(episode_idx * N * H)
+            eps = _epsilon_by_interactions(interactions_done, eps_decay_interactions, cfg)
+            starts = [(int(starts_r[e, i]), 0) for i in range(N)]
+            targets = [(int(targets_r[e, j]), int(targets_c[e, j])) for j in range(N)]
+            if rng.random() < eps:
+                perm = rng.permutation(len(targets))
+                goals = [targets[int(j)] for j in perm[:N]]
+            else:
+                goals = _assign_goals_by_value(starts, targets, t=0, grid=grid, critic=critic)
+            goals_r[e] = np.asarray([g[0] for g in goals], dtype=np.int32)
+            goals_c[e] = np.asarray([g[1] for g in goals], dtype=np.int32)
+
+        pos_r = starts_r.copy()
+        pos_c = starts_c.copy()
+        reached = np.zeros((E, N), dtype=bool)
+        p_noise = float(noise_cfg.p)
+        n_act = 5
+
+        for t in range(H):
+            mask = (~reached).astype(np.float32)
+
+            obs = np.empty((E, N, obs_dim), dtype=np.float32)
+            obs[:, :, 0] = pos_r / max(1, grid.h - 1)
+            obs[:, :, 1] = pos_c / max(1, grid.w - 1)
+            obs[:, :, 2] = goals_r / max(1, grid.h - 1)
+            obs[:, :, 3] = goals_c / max(1, grid.w - 1)
+            obs[:, :, 4] = t / max(1, grid.horizon - 1)
+            manh = np.abs(pos_r - goals_r) + np.abs(pos_c - goals_c)
+            obs[:, :, 5] = manh / max(1, (grid.h - 1) + (grid.w - 1))
+
+            obs_flat = obs.reshape(E * N, obs_dim)
+            with torch.no_grad():
+                a_t, lp_t = actor.sample(torch.from_numpy(obs_flat))
+                v_t = critic(torch.from_numpy(obs_flat))
+            actions = a_t.numpy().astype(np.int64).reshape(E, N)
+            logp = lp_t.numpy().astype(np.float32).reshape(E, N)
+            vals = v_t.numpy().astype(np.float32).reshape(E, N)
+            actions[reached] = 4
+
+            exec_a = actions.copy().astype(np.int32)
+            active = ~reached
+            if noise_cfg.kind != "none" and p_noise > 0:
+                idx = np.where(active.ravel())[0]
+                if len(idx):
+                    flat = exec_a.ravel()
+                    slip = rng.random(len(idx)) < p_noise
+                    si = idx[slip]
+                    if len(si):
+                        old = flat[si]
+                        off = rng.integers(0, n_act - 1, size=len(si)).astype(np.int32)
+                        flat[si] = off + (off >= old).astype(np.int32)
+
+            new_r = pos_r.copy()
+            new_c = pos_c.copy()
+            dr = _ACTIONS_ARR[exec_a, 0]
+            dc = _ACTIONS_ARR[exec_a, 1]
+            new_r[active] = np.clip(pos_r[active] + dr[active], 0, grid.h - 1).astype(np.int32)
+            new_c[active] = np.clip(pos_c[active] + dc[active], 0, grid.w - 1).astype(np.int32)
+
+            just_reached = active & (new_r == goals_r) & (new_c == goals_c)
+            still_active = active & (~just_reached)
+            cost = np.zeros((E, N), dtype=np.float32)
+            cost[just_reached] = -float(grid.goal_bonus)
+            cost[still_active] = float(grid.step_cost)
+            if t == H - 1:
+                term_dist = np.abs(new_r - goals_r) + np.abs(new_c - goals_c)
+                cost[still_active] += term_dist[still_active].astype(np.float32)
+            rew = -cost
+
+            s_obs[t] = obs
+            s_acts[t] = actions
+            s_logp[t] = logp
+            s_val[t] = vals
+            s_rew[t] = rew
+            s_mask[t] = mask
+            ep_rewards += rew
+
+            reached = reached | just_reached
+            pos_r, pos_c = new_r, new_c
+
+        ep_reached = reached.astype(np.float32)
+
+        s_rew_f = s_rew.reshape(H, E * N)
+        s_val_f = s_val.reshape(H, E * N)
+        adv, ret = _gae_batched(s_rew_f, s_val_f, cfg.gamma, cfg.gae_lambda)
+        b_obs = torch.from_numpy(s_obs.reshape(H * E * N, obs_dim))
+        b_acts = torch.from_numpy(s_acts.reshape(H * E * N))
+        b_logp = torch.from_numpy(s_logp.reshape(H * E * N))
+        b_adv = torch.from_numpy(adv.reshape(H * E * N))
+        b_ret = torch.from_numpy(ret.reshape(H * E * N))
+        b_mask = torch.from_numpy(s_mask.reshape(H * E * N))
+        am = b_mask > 0.5
+        if am.sum() > 1:
+            b_adv = (b_adv - b_adv[am].mean()) / (b_adv[am].std() + 1e-8)
+
+        ms = b_mask.sum()
+        nlp, ent = actor.evaluate(b_obs, b_acts)
+        a_loss = (
+            -(nlp * b_adv * b_mask).sum() / ms
+            - cfg.entropy_coef * (ent * b_mask).sum() / ms
+        )
+        opt_a.zero_grad()
+        a_loss.backward()
+        nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
+        opt_a.step()
+
+        v = critic(b_obs)
+        c_loss = ((v - b_ret).pow(2) * b_mask).sum() / ms
+        opt_c.zero_grad()
+        c_loss.backward()
+        nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+        opt_c.step()
+
+        actor_loss_v = float(a_loss.item())
+        critic_loss_v = float(c_loss.item())
+        entropy_v = float(((ent * b_mask).sum() / ms).item())
+
+        actor_after = nn.utils.parameters_to_vector(actor.parameters()).detach()
+        delta = actor_after - actor_before
+        delta_norm = float(torch.linalg.vector_norm(delta).item())
+        base_norm = float(torch.linalg.vector_norm(actor_before).item())
+        rel_policy_update = delta_norm / max(base_norm, 1e-12)
+
+        mean_rew = float(ep_rewards.sum(axis=1).mean())
+        mean_reach = float(ep_reached.mean())
+        rewards_log.append(mean_rew)
+        reach_log.append(mean_reach)
+        episodes_done = (batch_idx + 1) * E
+        interactions_done = int((batch_idx + 1) * E * N * H)
+        train_curve.append(
+            {
+                "batch": float(batch_idx + 1),
+                "episodes": float(episodes_done),
+                "env_interactions": float(interactions_done),
+                "reach_rate": float(mean_reach),
+                "rel_policy_update": float(rel_policy_update),
+            }
+        )
+        if episodes_done % print_every == 0:
+            rec_rew = float(np.mean(rewards_log[-log_every:]))
+            rec_reach = float(np.mean(reach_log[-log_every:]))
+            print(
+                f"[SepA2C-{noise_cfg.kind}] batch {batch_idx+1:4d}/{cfg.n_batches}"
+                f"  episodes={episodes_done:6d}"
+                f"  mean_reward={rec_rew:.2f}"
+                f"  reach_rate={rec_reach:.2%}"
+            )
+        if (batch_idx + 1) % log_every == 0 and wb_run is not None:
+            p = wb_prefix
+            wb_run.log({
+                f"{p}/iter": interactions_done,
+                f"{p}/batch": batch_idx + 1,
+                f"{p}/episodes": episodes_done,
+                f"{p}/env_interactions": interactions_done,
+                f"{p}/epsilon": float(
+                    _epsilon_by_interactions(interactions_done, eps_decay_interactions, cfg)
+                ),
+                f"{p}/mean_reward": float(np.mean(rewards_log[-log_every:])),
+                f"{p}/last_batch_reward": float(mean_rew),
+                f"{p}/reach_rate": float(mean_reach),
+                f"{p}/rel_policy_update": float(rel_policy_update),
+                f"{p}/actor_loss": actor_loss_v,
+                f"{p}/critic_loss": critic_loss_v,
+                f"{p}/entropy": entropy_v,
+            })
+
+        if cfg.early_stop_patience_batches > 0:
+            small_update_ok = (
+                cfg.early_stop_min_rel_policy_update <= 0.0
+                or rel_policy_update < cfg.early_stop_min_rel_policy_update
+            )
+            plateau_ok = True
+            if cfg.early_stop_plateau_window_batches > 0:
+                w = cfg.early_stop_plateau_window_batches
+                if len(reach_log) >= 2 * w and len(rewards_log) >= 2 * w:
+                    prev_reach = float(np.mean(reach_log[-2 * w : -w]))
+                    curr_reach = float(np.mean(reach_log[-w:]))
+                    prev_rew = float(np.mean(rewards_log[-2 * w : -w]))
+                    curr_rew = float(np.mean(rewards_log[-w:]))
+                    plateau_ok = (
+                        abs(curr_reach - prev_reach) <= cfg.early_stop_max_delta_reach_rate
+                        and abs(curr_rew - prev_rew) <= cfg.early_stop_max_delta_mean_reward
+                    )
+                else:
+                    plateau_ok = False
+
+            if small_update_ok and plateau_ok:
+                consecutive_small_updates += 1
+            else:
+                consecutive_small_updates = 0
+
+            if consecutive_small_updates >= cfg.early_stop_patience_batches:
+                early_stopped = True
+                stop_reason = (
+                    f"stable for {cfg.early_stop_patience_batches} batches "
+                    f"(rel_update<={cfg.early_stop_min_rel_policy_update or 'disabled'}, "
+                    f"plateau_window={cfg.early_stop_plateau_window_batches})"
+                )
+                print(f"[SepA2C-{noise_cfg.kind}] early stop at batch {batch_idx + 1}: {stop_reason}")
+                break
+
+    policy = GoalConditionedPPOPolicy(actor=actor, h=grid.h, w=grid.w)
+    executed_batches = len(train_curve)
+    executed_episodes = int(executed_batches * E)
+    executed_interactions = int(executed_batches * E * N * H)
+    metrics = {
+        "algorithm": "SeparationA2C",
+        "episodes": executed_episodes,
+        "n_agents": int(N),
+        "noise_kind": noise_cfg.kind,
+        "p": noise_cfg.p,
+        "sep_a2c_config": asdict(cfg),
+        "mean_reward_last10": float(np.mean(rewards_log[-10:])),
+        "mean_reach_last10": float(np.mean(reach_log[-10:])),
+        "env_interactions": executed_interactions,
+        "eps_decay_interactions": eps_decay_interactions,
+        "planned_batches": int(cfg.n_batches),
+        "executed_batches": int(executed_batches),
+        "early_stopped": bool(early_stopped),
+        "early_stop_reason": stop_reason,
+        "train_curve": train_curve,
     }
     return policy, metrics

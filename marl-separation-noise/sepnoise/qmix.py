@@ -34,7 +34,7 @@ class QMIXConfig:
     lr: float = 3e-4
     batch_episodes: int = 64
     n_batches: int = 500
-    target_update_every: int = 10
+    target_update_every: int = 50
     obs_mode: str = "relative_targets"
     eps_start: float = 0.5
     eps_end: float = 0.05
@@ -42,7 +42,7 @@ class QMIXConfig:
     replay_capacity: int = 100_000
     min_replay_size: int = 2_048
     batch_size: int = 512
-    updates_per_batch: int = 4
+    updates_per_batch: int = 8
     double_q: bool = True
 
 
@@ -209,7 +209,7 @@ def train_qmix(
         pos_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         pos_c = np.zeros((E, N), dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=(E, M)).astype(np.int32)
-        col_lo = max(0, grid.w - 10)
+        col_lo = max(0, grid.w // 2)
         tgt_c = rng.integers(col_lo, grid.w, size=(E, M)).astype(np.int32)
         reached = np.zeros((E, N), dtype=bool)
         tgt_active = np.ones((E, M), dtype=bool)
