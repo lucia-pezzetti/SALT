@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from .env import GridConfig, Pos
 from .noise import NoiseConfig
-from .separation_ppo import _obs_sep
+from .salt_ppo import _obs_sep
 
 torch.set_num_threads(min(torch.get_num_threads(), 8))
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)

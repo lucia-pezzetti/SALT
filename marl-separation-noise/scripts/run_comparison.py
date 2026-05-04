@@ -34,46 +34,46 @@ from typing import List, Any, Dict
 
 import numpy as np
 
-from sepnoise.env import GridConfig, MultiAgentGrid, Pos
-from sepnoise.noise import NoiseConfig
-from sepnoise.qlearning import (
+from salt.env import GridConfig, MultiAgentGrid, Pos
+from salt.noise import NoiseConfig
+from salt.q_learning import (
     GoalConditionedTabularQ,
     QConfig,
     train_goal_q_multiagent,
 )
-from sepnoise.separation_dqn import (
+from salt.salt_dqn import (
     GoalConditionedDeepDQNPolicy,
     SepDeepDQNConfig,
     train_goal_deep_double_dqn,
 )
-from sepnoise.separation_ppo import (
+from salt.salt_ppo import (
     GoalConditionedPPOPolicy,
     SepPPOConfig,
     train_goal_ppo,
     train_goal_a2c,
 )
-from sepnoise.matching import assign_goals, terminal_ot_cost, target_coverage_rate
-from sepnoise.mappo import (
+from salt.matching import assign_goals, terminal_ot_cost, target_coverage_rate
+from salt.mappo import (
     MAPPOConfig,
     train_mappo,
     rollout_mappo,
 )
-from sepnoise.ippo import (
+from salt.ippo import (
     IPPOConfig,
     train_ippo,
     rollout_ippo,
 )
-from sepnoise.vdn import (
+from salt.vdn import (
     VDNConfig,
     train_vdn,
     rollout_vdn,
 )
-from sepnoise.qmix import (
+from salt.qmix import (
     QMIXConfig,
     train_qmix,
     rollout_qmix,
 )
-from sepnoise.viz import plot_terminal_hist
+from salt.viz import plot_terminal_hist
 
 
 def _sample_targets(
@@ -999,7 +999,7 @@ def main():
     ap.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     ap.add_argument("--wandb_project", type=str, default="marl-separation-noise",
                     help="W&B project name")
-    ap.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (team/user)")
+    ap.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (team/account)")
     args = ap.parse_args()
 
     p_values = _parse_p_values(args.p)

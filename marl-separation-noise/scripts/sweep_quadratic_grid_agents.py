@@ -22,6 +22,18 @@ from pathlib import Path
 from typing import List, Tuple
 
 
+def _parse_int_values(values: List[str]) -> List[int]:
+    parsed: List[int] = []
+    for value in values:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                parsed.append(int(item))
+    if not parsed:
+        raise ValueError("At least one integer value must be provided.")
+    return parsed
+
+
 def _build_pairs(mode: str, sides: List[int], agents: List[int]) -> List[Tuple[int, int]]:
     if mode == "cartesian":
         return [(s, n) for s in sides for n in agents]
@@ -72,17 +84,17 @@ def main() -> None:
     )
     ap.add_argument(
         "--grid_w_values",
-        type=int,
+        type=str,
         nargs="+",
-        required=True,
+        default=["10"],
         help="Square-grid side lengths to sweep (e.g. 20 30 40).",
     )
     ap.add_argument(
         "--agents_values",
-        type=int,
+        type=str,
         nargs="+",
-        required=True,
-        help="Agent counts to sweep (e.g. 8 12 16).",
+        default=["2", "4", "6", "8"],
+        help="Agent counts to sweep (e.g. 8 12 16, or 8,16,32).",
     )
     ap.add_argument(
         "--mode",
@@ -92,14 +104,14 @@ def main() -> None:
         help="How to combine grid_w_values and agents_values.",
     )
     ap.add_argument("--p", type=str, default="0.1")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--eval_seeds", type=int, default=20)
-    ap.add_argument("--goal_bonus", type=float, default=40.0)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--eval_seeds", type=int, default=50)
+    ap.add_argument("--goal_bonus", type=float, default=0.0)
     ap.add_argument("--collision_penalty", type=float, default=0.0)
     ap.add_argument(
         "--target_interactions",
         type=int,
-        default=128_000_000,
+        default=2_000_000_000,
         help="Target total environment interactions per run (approximate).",
     )
     ap.add_argument("--sep_ppo_batch_eps", type=int, default=64)
@@ -107,7 +119,7 @@ def main() -> None:
     ap.add_argument(
         "--sep_ppo_early_stop_patience",
         type=int,
-        default=0,
+        default=20,
         help="Forwarded early-stop patience for Sep-PPO (0 disables).",
     )
     ap.add_argument(
@@ -119,25 +131,25 @@ def main() -> None:
     ap.add_argument(
         "--sep_ppo_early_stop_plateau_window",
         type=int,
-        default=0,
+        default=20,
         help="Forwarded plateau window (batches) for Sep-PPO hybrid early stop.",
     )
     ap.add_argument(
         "--sep_ppo_early_stop_max_delta_reach",
         type=float,
-        default=0.0,
+        default=0.005,
         help="Forwarded max reach-rate moving-average delta for Sep-PPO plateau.",
     )
     ap.add_argument(
         "--sep_ppo_early_stop_max_delta_reward",
         type=float,
-        default=0.0,
+        default=0.10,
         help="Forwarded max mean-reward moving-average delta for Sep-PPO plateau.",
     )
     ap.add_argument(
         "--mappo_early_stop_patience",
         type=int,
-        default=0,
+        default=20,
         help="Forwarded early-stop patience for MAPPO (0 disables).",
     )
     ap.add_argument(
@@ -149,19 +161,19 @@ def main() -> None:
     ap.add_argument(
         "--mappo_early_stop_plateau_window",
         type=int,
-        default=0,
+        default=20,
         help="Forwarded plateau window (batches) for MAPPO hybrid early stop.",
     )
     ap.add_argument(
         "--mappo_early_stop_max_delta_reach",
         type=float,
-        default=0.0,
+        default=0.005,
         help="Forwarded max reach-rate moving-average delta for MAPPO plateau.",
     )
     ap.add_argument(
         "--mappo_early_stop_max_delta_reward",
         type=float,
-        default=0.0,
+        default=0.10,
         help="Forwarded max mean-reward moving-average delta for MAPPO plateau.",
     )
     ap.add_argument(
@@ -199,16 +211,17 @@ def main() -> None:
     )
     ap.add_argument(
         "--constant_target_density",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "If set, compute square-grid side from each agents value to preserve "
+            "Compute square-grid side from each agents value to preserve "
             "target density over full grid area."
         ),
     )
     ap.add_argument(
         "--density_ref_agents",
         type=int,
-        default=None,
+        default=2,
         help=(
             "Reference agent count for --constant_target_density. "
             "Defaults to the first value in --agents_values."
@@ -217,16 +230,21 @@ def main() -> None:
     ap.add_argument(
         "--density_ref_grid_w",
         type=int,
-        default=None,
+        default=10,
         help=(
             "Reference square-grid side for --constant_target_density. "
             "Defaults to the first value in --grid_w_values."
         ),
     )
+    ap.add_argument("--wandb", action="store_true", help="Enable W&B logging.")
     ap.add_argument("--dry_run", action="store_true", help="Print commands without running.")
     args = ap.parse_args()
+    args.grid_w_values = _parse_int_values(args.grid_w_values)
+    args.agents_values = _parse_int_values(args.agents_values)
 
-    run_comparison = (Path(__file__).resolve().parent / "run_comparison.py").resolve()
+    run_comparison = Path("scripts/run_comparison.py")
+    if not run_comparison.exists():
+        run_comparison = Path(__file__).parent / "run_comparison.py"
     if args.constant_target_density:
         ref_agents = (
             args.density_ref_agents
@@ -332,8 +350,9 @@ def main() -> None:
             str(args.train_print_every_batches),
             "--stability_window",
             str(args.stability_window),
-            "--wandb",
         ]
+        if args.wandb:
+            cmd.append("--wandb")
         if args.print_eval_traces:
             cmd.extend(
                 [
