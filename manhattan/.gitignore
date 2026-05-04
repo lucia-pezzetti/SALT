@@ -1,0 +1,103 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Local environments
+env/
+venv/
+.venv/
+.nyc-taxi/
+conda-meta/
+
+# OS and editor files
+.DS_Store
+*.DS_Store
+Thumbs.db
+.vscode/
+.ipynb_checkpoints/
+
+# Data, geospatial files, and generated artifacts
+data/
+shapefiles/
+*.parquet
+*.csv
+*.zip
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.pkl
+*.png
+*.html
+*.pdf
+
+# Runtime outputs
+cache/
+src/cache/
+q_tables/
+src/q_tables/
+logs/
+src/logs/
+wandb/
+src/wandb/
+tmp/
+old/
+training_logs/
+*.log
+*.tmp
+src/*.out
+src/*.params
+src/*.txt
+src/*.json
+
+# Shell scripts: keep only the canonical discrete Q-learning launcher.
+src/*.sh
+!src/run_main.sh
+
+# Keep the repository focused on the run_main.sh discrete Q-learning pipeline.
+/main.py
+/main_old.py
+src/main_old.py
+src/config.json
+src/evaluate_pretraining.py
+src/pretrain.py
+src/run_experiments.py
+src/run_simulator.py
+src/run_simulator.ipynb
+src/simulator.py
+src/brute_force.py
+src/analyze_*.py
+src/plot_*.py
+plot_*.py
+plot_traveling_times.py
+plot_evaluation_results.py
+
+# Alternative model implementations not used by the discrete Q-learning run.
+src/modes/eval_only.py
+src/modes/train_dqn.py
+src/modes/train_mcts.py
+src/modes/train_ppo.py
+src/training/dqn_trainer.py
+src/training/gnn_networks.py
+src/training/mcts.py
+src/training/ppo.py
+src/training/q_learning_jax.py
+src/training/policy_improvement_sp.py
+src/evaluation/
+
+# Experimental and archived code
+first_version/
+test/
+src/ablation_studies/
+src/todelete/
+src/params/
+src/traffic_experiments/
+src/paths/
+src/iframe_figures/
+src/create_boxplots.py
+src/clear_cache.py
+src/setup_wandb_dashboard.py
+src/visualize_manhattan_log.py
