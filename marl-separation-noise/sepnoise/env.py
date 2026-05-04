@@ -55,13 +55,11 @@ class SingleAgentGoalGrid:
         return self.s, self.z, self.t
 
     def step(self, a: Action) -> Tuple[Pos, float, bool, Dict]:
-        # Absorbing state: agent already at goal — frozen, no cost, no noise
         if self.reached_goal:
             self.t += 1
             done = (self.t >= self.grid.horizon)
             return self.s, 0.0, done, {"a_exec": 4, "reached": True}
 
-        # Active: apply noise and move
         self.noise_model.reset_timestep()
         a_exec = self.noise_model.apply(a, t=self.t, s=self.s, agent_id=0)
 
@@ -73,13 +71,11 @@ class SingleAgentGoalGrid:
 
         done = (self.t >= self.grid.horizon)
 
-        # Just reached the goal → absorb + bonus
         if self.s == self.z:
             self.reached_goal = True
             cost = -float(self.grid.goal_bonus)
             return self.s, cost, done, {"a_exec": int(a_exec), "reached": True}
 
-        # Still moving: normal step cost (+ terminal Manhattan penalty if episode ends)
         cost = float(self.grid.step_cost)
         if done:
             cost += abs(self.s[0] - self.z[0]) + abs(self.s[1] - self.z[1])
@@ -110,7 +106,7 @@ class MultiAgentGrid:
         if start_rows is None:
             start_rows = [int(self.rng.integers(0, self.grid.h)) for _ in range(self.n_agents)]
         self.pos = [(int(r), 0) for r in start_rows]
-        self.goals = [(0, self.grid.w - 1) for _ in range(self.n_agents)]  # placeholder
+        self.goals = [(0, self.grid.w - 1) for _ in range(self.n_agents)]
 
     def step(self, actions: List[Action]) -> Dict:
         assert len(actions) == self.n_agents
@@ -122,14 +118,12 @@ class MultiAgentGrid:
         n_active = 0
 
         for i, (s, a) in enumerate(zip(self.pos, actions)):
-            # Already absorbed: stay, no noise
             if self.reached[i]:
                 next_pos.append(s)
-                exec_actions.append(4)  # stay
+                exec_actions.append(4)
                 newly_reached.append(False)
                 continue
 
-            # Active agent: apply noise and move
             n_active += 1
             a_exec = self.noise_model.apply(int(a), t=self.t, s=s, agent_id=i)
             exec_actions.append(int(a_exec))
@@ -138,14 +132,12 @@ class MultiAgentGrid:
             c = clamp(s[1] + dc, 0, self.grid.w - 1)
             next_pos.append((r, c))
 
-            # Check if agent just reached its goal
             if (r, c) == tuple(self.goals[i]):
                 self.reached[i] = True
                 newly_reached.append(True)
             else:
                 newly_reached.append(False)
 
-        # Collision detection (all agents, including frozen)
         collision_cost = 0.0
         if self.grid.collision_penalty > 0.0:
             counts: Dict[Pos, int] = {}
@@ -161,8 +153,7 @@ class MultiAgentGrid:
 
         n_just_reached = sum(newly_reached)
         n_still_moving = n_active - n_just_reached
-        # Active agents that didn't reach pay step_cost;
-        # agents that just reached get -goal_bonus instead
+        # Reached agents receive the one-time bonus and become cost-free thereafter.
         step_cost = (float(self.grid.step_cost) * n_still_moving
                      - float(self.grid.goal_bonus) * n_just_reached
                      + float(collision_cost))

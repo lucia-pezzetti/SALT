@@ -19,18 +19,12 @@ from .env import GridConfig, ACTIONS, Pos
 from .noise import NoiseConfig
 from .matching import terminal_ot_cost, target_coverage_rate
 
-# Keep a compact action lookup for vectorized transitions.
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)
 MAPPO_OBS_MODES = {"relative_targets"}
 
-# Cap intra-op threads: PyTorch defaults to all cores, which causes
-# massive contention overhead for the small batches used here.
+# The small tensor workloads here are faster with bounded intra-op parallelism.
 torch.set_num_threads(min(torch.get_num_threads(), 8))
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 @dataclass
 class MAPPOConfig:
@@ -55,10 +49,6 @@ class MAPPOConfig:
     early_stop_max_delta_reach_rate: float = 0.0
     early_stop_max_delta_mean_reward: float = 0.0
 
-
-# ---------------------------------------------------------------------------
-# Networks
-# ---------------------------------------------------------------------------
 
 class Actor(nn.Module):
     def __init__(self, obs_dim: int, n_actions: int = 5, hidden: int = 64):
@@ -105,9 +95,9 @@ def _validate_obs_mode(obs_mode: str) -> str:
 
 
 def _gae_batched(
-    rewards: np.ndarray,   # (H, E)
-    values: np.ndarray,    # (H, E)
-    not_done: np.ndarray,  # (H, E): 1 if transition t->t+1 is non-terminal
+    rewards: np.ndarray,
+    values: np.ndarray,
+    not_done: np.ndarray,
     gamma: float,
     lam: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -138,10 +128,6 @@ def _linear_decay(start: float, end: float, step: int, total_steps: int) -> floa
     return float(start + frac * (end - start))
 
 
-# ---------------------------------------------------------------------------
-# Training (episode-batched)
-# ---------------------------------------------------------------------------
-
 def train_mappo(
     grid: GridConfig,
     noise_cfg: NoiseConfig,
@@ -158,9 +144,7 @@ def train_mappo(
     Parameters
     ----------
     n_targets : int, optional
-        Number of targets to sample per episode.  Defaults to *n_agents*
-        (each agent has a target).  Set to e.g. ``grid.h`` to match the
-        evaluation scenario where there are fewer targets than agents.
+        Number of targets sampled per episode. Defaults to one target per agent.
     """
     if cfg is None:
         cfg = MAPPOConfig()
@@ -171,10 +155,8 @@ def train_mappo(
 
     n_act = len(ACTIONS)
     H, N, E = grid.horizon, n_agents, cfg.batch_episodes
-    M = n_targets if n_targets is not None else N   # targets per episode
-    # Relative-targets only: [self(row,col,id,time,active), per-target(dr,dc,available)].
+    M = n_targets if n_targets is not None else N
     obs_dim = 5 + 3 * M
-    # Critic state: [all positions(2N), active_flags(N), time, all_targets(2M), target_available(M)].
     state_dim = 3 * N + 1 + 3 * M
 
     actor  = Actor(obs_dim, n_act, cfg.hidden_size)
@@ -182,7 +164,7 @@ def train_mappo(
     opt_a = torch.optim.Adam(actor.parameters(), lr=cfg.lr_actor)
     opt_c = torch.optim.Adam(critic.parameters(), lr=cfg.lr_critic)
 
-    aid = np.arange(N, dtype=np.float32) / max(1, N - 1)  # normalised agent ids
+    aid = np.arange(N, dtype=np.float32) / max(1, N - 1)
     kind = noise_cfg.kind
     p_noise = float(noise_cfg.p)
     batch_rewards_log: List[float] = []
@@ -200,7 +182,6 @@ def train_mappo(
         entropy_coef_t = _linear_decay(
             cfg.entropy_coef, cfg.entropy_coef_end, batch_idx, cfg.n_batches
         )
-        # ---- initialise E episodes in parallel ----
         pos_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         pos_c = np.zeros((E, N), dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=(E, M)).astype(np.int32)
@@ -209,7 +190,6 @@ def train_mappo(
 
         reached = np.zeros((E, N), dtype=bool)
         tgt_active = np.ones((E, M), dtype=bool)
-        # pre-allocate storage
         s_obs_l = np.empty((H, E * N, obs_dim), dtype=np.float32)
         s_acts  = np.empty((H, E * N), dtype=np.int64)
         s_logp  = np.empty((H, E * N), dtype=np.float32)
@@ -220,14 +200,12 @@ def train_mappo(
         s_not_done = np.empty((H, E), dtype=np.float32)
         s_state_mask = np.empty((H, E), dtype=np.float32)
 
-        # Reuse buffers across timesteps to reduce allocation overhead.
         obs_l = np.empty((E, N, obs_dim), dtype=np.float32)
         obs_g = np.empty((E, state_dim), dtype=np.float32)
         for t in range(H):
-            # ---- encode obs (all E×N at once) ----
             obs_l[:, :, 0] = pos_r / max(1, grid.h - 1)
             obs_l[:, :, 1] = pos_c / max(1, grid.w - 1)
-            obs_l[:, :, 2] = aid                          # broadcast (N,)
+            obs_l[:, :, 2] = aid
             obs_l[:, :, 3] = t / max(1, H - 1)
             active_f = (~reached).astype(np.float32)
             obs_l[:, :, 4] = active_f
@@ -249,24 +227,22 @@ def train_mappo(
             obs_g[:, tbase + 1:tbase + 2 * M:2] = tgt_c / max(1, grid.w - 1)
             obs_g[:, tbase + 2 * M:] = tgt_active.astype(np.float32)
 
-            mask = (~reached).astype(np.float32)           # (E, N)
+            mask = (~reached).astype(np.float32)
             s_state_mask[t] = (mask.sum(axis=1) > 0).astype(np.float32)
 
-            # ---- ONE forward pass for all E*N agents ----
             ol_flat = obs_l.reshape(E * N, obs_dim)
             with torch.no_grad():
                 act_t, lp_t = actor.get_action(torch.from_numpy(ol_flat))
                 val_t = critic(torch.from_numpy(obs_g))
 
-            actions = act_t.numpy().reshape(E, N)          # int64
+            actions = act_t.numpy().reshape(E, N)
             logps   = lp_t.numpy().reshape(E, N)
-            values  = val_t.numpy()                        # (E,)
+            values  = val_t.numpy()
 
-            actions[reached] = 4                           # freeze reached
+            actions[reached] = 4
 
-            # ---- noise (vectorised per noise type) ----
             exec_a = actions.copy().astype(np.int32)
-            active = ~reached                              # (E, N)
+            active = ~reached
 
             if kind != "none" and p_noise > 0:
                 if kind == "individual":
@@ -301,17 +277,15 @@ def train_mappo(
                                     cache[key] = int(actions[e,i])
                             exec_a[e, i] = cache[key]
 
-            # ---- movement (fully vectorised) ----
             new_r = pos_r.copy()
             new_c = pos_c.copy()
-            dr = _ACTIONS_ARR[exec_a, 0]                   # (E, N)
+            dr = _ACTIONS_ARR[exec_a, 0]
             dc = _ACTIONS_ARR[exec_a, 1]
             new_r[active] = np.clip(
                 pos_r[active] + dr[active], 0, grid.h - 1).astype(np.int32)
             new_c[active] = np.clip(
                 pos_c[active] + dc[active], 0, grid.w - 1).astype(np.int32)
 
-            # ---- reaching + rewards ----
             n_just = np.zeros(E, dtype=np.int32)
             n_still = np.zeros(E, dtype=np.int32)
             for e in range(E):
@@ -338,7 +312,6 @@ def train_mappo(
             all_reached = reached.all(axis=1)
             s_not_done[t] = (((t < (H - 1)) & (~all_reached))).astype(np.float32)
 
-            # ---- store ----
             s_obs_l[t] = ol_flat
             s_acts[t]  = actions.reshape(E * N)
             s_logp[t]  = logps.reshape(E * N)
@@ -349,28 +322,22 @@ def train_mappo(
 
             pos_r, pos_c = new_r, new_c
 
-        # ---- GAE (all E episodes vectorised) ----
         adv, ret = _gae_batched(s_rew, s_val, s_not_done, cfg.gamma, cfg.gae_lambda)
 
-        # ---- build PPO tensors ----
-        # actor  (H*E*N, ...)
-        adv_exp = np.repeat(adv[:, :, None], N, axis=2)    # (H, E, N)
+        adv_exp = np.repeat(adv[:, :, None], N, axis=2)
         b_obs  = torch.from_numpy(s_obs_l.reshape(H*E*N, obs_dim))
         b_acts = torch.from_numpy(s_acts.reshape(H*E*N))
         b_logp = torch.from_numpy(s_logp.reshape(H*E*N))
         b_adv  = torch.from_numpy(adv_exp.reshape(H*E*N))
         b_mask = torch.from_numpy(s_mask.reshape(H*E*N))
-        # critic (H*E, ...)
         c_obs = torch.from_numpy(s_obs_g.reshape(H*E, state_dim))
         c_ret = torch.from_numpy(ret.reshape(H*E))
         c_mask = torch.from_numpy(s_state_mask.reshape(H*E))
 
-        # normalise advantages
         am = b_mask > 0.5
         if am.sum() > 1:
             b_adv = (b_adv - b_adv[am].mean()) / (b_adv[am].std() + 1e-8)
 
-        # ---- PPO update ----
         actor_losses: List[float] = []
         critic_losses: List[float] = []
         entropies: List[float] = []
@@ -453,7 +420,6 @@ def train_mappo(
             rec = np.mean(batch_rewards_log[-log_every:])
             p = wb_prefix
             wb_run.log({
-                # Use cumulative environment interactions as x-axis.
                 f"{p}/iter": interactions_done,
                 f"{p}/batch": batch_idx + 1,
                 f"{p}/episodes": episodes_done,
@@ -526,10 +492,6 @@ def train_mappo(
     }
 
 
-# ---------------------------------------------------------------------------
-# Evaluation (deterministic rollout)
-# ---------------------------------------------------------------------------
-
 def rollout_mappo(
     actor: Actor, grid: GridConfig, noise_cfg: NoiseConfig,
     n_agents: int, targets: List[Pos] | None = None, seed: int = 0,
@@ -558,7 +520,7 @@ def rollout_mappo(
         pos_r = np.clip(np.asarray(start_rows, dtype=np.int32), 0, grid.h - 1)
     pos_c = np.zeros(N, dtype=np.int32)
     reached = np.zeros(N, dtype=bool)
-    arrival = [None] * N  # type: List[Optional[int]]
+    arrival: List[Optional[int]] = [None] * N
     trajectories: List[List[Pos]] = [
         [(int(pos_r[i]), int(pos_c[i]))] for i in range(N)
     ]
@@ -653,7 +615,6 @@ def rollout_mappo(
             action_source = []
             for i in range(N):
                 if reached[i] and arrival[i] is not None and arrival[i] <= t:
-                    # Already absorbed before this step (or just reached at this step).
                     if arrival[i] == t + 1:
                         rewards.append(float(grid.goal_bonus))
                     else:

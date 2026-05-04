@@ -76,7 +76,6 @@ from sepnoise.qmix import (
 from sepnoise.viz import plot_terminal_hist
 
 
-# ---- Helpers --------------------------------------------------------------
 def _sample_targets(
     seed: int,
     n: int,
@@ -148,7 +147,7 @@ def _stable_reach_milestones(
     if stability_window <= 0:
         raise ValueError("stability_window must be positive.")
 
-    # Keep fixed threshold keys for easy plotting/comparison downstream.
+    # Fixed string keys keep downstream plots stable across threshold choices.
     keys = [f"{thr:.2f}" for thr in thresholds]
     out: Dict[str, dict] = {
         k: {
@@ -180,7 +179,6 @@ def _stable_reach_milestones(
             continue
         out[k] = {
             "env_interactions": interactions[idx],
-            # "epochs" here corresponds to PPO update epochs/batches.
             "epochs": batches[idx],
             "episodes": episodes[idx],
         }
@@ -289,8 +287,6 @@ def _parse_fixed_targets(s: str, h: int, w: int) -> List[Pos]:
         targets.append((r, c))
     return targets
 
-
-# ---- Separation-principle helpers ----------------------------------------
 
 def ensure_sep_q(
     grid: GridConfig, noise_cfg: NoiseConfig, q_path: str | None,
@@ -466,14 +462,12 @@ def rollout_separation(
     total_cost = 0.0
 
     def _rematch_unreached_only() -> None:
-        # Re-match only active agents to still-unreached targets.
         active_idx = [i for i, r in enumerate(env.reached) if not r]
         if not active_idx:
             return
         reached_targets = {tuple(env.pos[i]) for i, r in enumerate(env.reached) if r}
         available_targets = [t for t in env.targets if tuple(t) not in reached_targets]
         if len(available_targets) < len(active_idx):
-            # Fallback for degenerate cases (e.g. duplicated targets): keep matching feasible.
             available_targets = list(env.targets)
         active_agents = [env.pos[i] for i in active_idx]
         matched = assign_goals(active_agents, available_targets)
@@ -638,14 +632,12 @@ def rollout_separation_ppo(
     total_cost = 0.0
 
     def _rematch_unreached_only() -> None:
-        # Re-match only active agents to still-unreached targets.
         active_idx = [i for i, r in enumerate(env.reached) if not r]
         if not active_idx:
             return
         reached_targets = {tuple(env.pos[i]) for i, r in enumerate(env.reached) if r}
         available_targets = [t for t in env.targets if tuple(t) not in reached_targets]
         if len(available_targets) < len(active_idx):
-            # Fallback for degenerate cases (e.g. duplicated targets): keep matching feasible.
             available_targets = list(env.targets)
         active_agents = [env.pos[i] for i in active_idx]
         matched = assign_goals(active_agents, available_targets)
@@ -732,8 +724,6 @@ def rollout_separation_ppo(
         out["step_traces"] = step_traces
     return out
 
-
-# ---- Main ----------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
@@ -836,7 +826,7 @@ def main():
     )
     ap.add_argument("--collision_penalty", type=float, default=0.0)
     ap.add_argument("--goal_bonus", type=float, default=40.0)
-    # Separation principle
+    # Separation policy settings.
     ap.add_argument(
         "--sep_method",
         type=str,
@@ -906,7 +896,7 @@ def main():
         default=0.0,
         help="Max abs delta of Sep-PPO mean-reward moving averages between consecutive windows.",
     )
-    # MAPPO
+    # MAPPO settings.
     ap.add_argument("--mappo_batches", type=int, default=5000,
                     help="Number of PPO update batches")
     ap.add_argument("--mappo_batch_eps", type=int, default=64,
@@ -961,7 +951,7 @@ def main():
         default=500,
         help="Console progress print cadence in training batches (larger = less frequent).",
     )
-    # IPPO
+    # Optional baseline settings.
     ap.add_argument("--run_ippo", action="store_true", help="Also train/evaluate IPPO baseline")
     ap.add_argument("--ippo_batches", type=int, default=5000,
                     help="Number of IPPO update batches")
@@ -976,7 +966,6 @@ def main():
             "Choices: relative_targets"
         ),
     )
-    # QMIX
     ap.add_argument("--run_qmix", action="store_true", help="Also train/evaluate QMIX baseline")
     ap.add_argument("--qmix_batches", type=int, default=5000,
                     help="Number of QMIX update batches")
@@ -991,7 +980,6 @@ def main():
             "Choices: relative_targets"
         ),
     )
-    # VDN
     ap.add_argument("--run_vdn", action="store_true", help="Also train/evaluate VDN baseline")
     ap.add_argument("--vdn_batches", type=int, default=5000,
                     help="Number of VDN update batches")
@@ -1006,9 +994,8 @@ def main():
             "Choices: relative_targets"
         ),
     )
-    # Output
+    # Output and logging.
     ap.add_argument("--outdir", type=str, default="runs/comparison")
-    # wandb
     ap.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     ap.add_argument("--wandb_project", type=str, default="marl-separation-noise",
                     help="W&B project name")
@@ -1050,7 +1037,6 @@ def main():
     if args.sep_ppo_early_stop_max_delta_reward < 0.0 or args.mappo_early_stop_max_delta_reward < 0.0:
         raise ValueError("Early-stop reward deltas must be >= 0.")
 
-    # ---- Optional wandb init ----
     wb_run = None
     if args.wandb:
         import wandb
@@ -1142,11 +1128,7 @@ def main():
         batch_episodes=args.vdn_batch_eps,
         eps_decay_episodes=max(1, (args.vdn_batches * args.vdn_batch_eps) // 2),
     )
-    # Logging cadence for wandb/console comparability with bounded point count.
-    # We use --wandb_log_points as an approximate number of points per curve.
-    # Separation cadence unit depends on sep_method:
-    # - q -> episodes
-    # - ddqn / ppo / a2c -> batches (--sep_ppo_batches)
+    # Keep logged curves comparable without storing every training batch.
     sep_log_every_q = max(1, args.sep_episodes // max(1, args.wandb_log_points))
     sep_log_every_ddqn = max(1, args.sep_ppo_batches // max(1, args.wandb_log_points))
     sep_log_every_ppo = max(1, args.sep_ppo_batches // max(1, args.wandb_log_points))
@@ -1188,9 +1170,7 @@ def main():
         kind_dir = os.path.join(base_outdir, kind)
         os.makedirs(kind_dir, exist_ok=True)
 
-        # ----------------------------------------------------------
-        # 1. Train Separation backends
-        # ----------------------------------------------------------
+        # Train separation backends.
         sep_by_method: dict[str, dict] = {}
         for sep_method in sep_methods:
             print(f"\n{'=' * 60}")
@@ -1295,9 +1275,7 @@ def main():
                     f"timing/{kind}/sep/{sep_method}/env_interactions": sep_env_interactions,
                 })
 
-        # ----------------------------------------------------------
-        # 2. Train MAPPO variants
-        # ----------------------------------------------------------
+        # Train MAPPO variants.
         print(f"\n{'=' * 60}")
         print(f"  MAPPO variants — {kind} noise  (p={args.p})  "
               f"({mappo_cfg.n_batches}×{mappo_cfg.batch_episodes} eps each)")
@@ -1325,7 +1303,6 @@ def main():
                 "env_interactions": mappo_env_interactions,
             }
 
-            # Save actor weights (per mode + legacy filename for primary mode).
             import torch
             torch.save(actor.state_dict(), os.path.join(kind_dir, f"actor_{mode}.pt"))
             if mode == primary_mode:
@@ -1337,9 +1314,7 @@ def main():
                     f"timing/{kind}/mappo/{mode}/env_interactions": mappo_env_interactions,
                 })
 
-        # ----------------------------------------------------------
-        # 2b. Train IPPO variants (optional)
-        # ----------------------------------------------------------
+        # Train optional IPPO variants.
         ippo_by_mode: dict[str, dict] = {}
         ippo_primary_mode = None
         if args.run_ippo:
@@ -1376,9 +1351,7 @@ def main():
                         f"timing/{kind}/ippo/{mode}/env_interactions": ippo_env_interactions,
                     })
 
-        # ----------------------------------------------------------
-        # 2c. Train QMIX variants (optional)
-        # ----------------------------------------------------------
+        # Train optional QMIX variants.
         qmix_by_mode: dict[str, dict] = {}
         qmix_primary_mode = None
         if args.run_qmix:
@@ -1415,9 +1388,7 @@ def main():
                         f"timing/{kind}/qmix/{mode}/env_interactions": qmix_env_interactions,
                     })
 
-        # ----------------------------------------------------------
-        # 2d. Train VDN variants (optional)
-        # ----------------------------------------------------------
+        # Train optional VDN variants.
         vdn_by_mode: dict[str, dict] = {}
         vdn_primary_mode = None
         if args.run_vdn:
@@ -1454,9 +1425,7 @@ def main():
                         f"timing/{kind}/vdn/{mode}/env_interactions": vdn_env_interactions,
                     })
 
-        # ----------------------------------------------------------
-        # 2e. Reach-rate stabilization milestones from training curves
-        # ----------------------------------------------------------
+        # Estimate when training curves first stay above each reach-rate threshold.
         sep_reach_stabilization_by_method: dict[str, dict] = {}
         for sep_method in sep_methods:
             train_curve = (
@@ -1479,9 +1448,7 @@ def main():
             for mode in mappo_modes
         }
 
-        # ----------------------------------------------------------
-        # 3. Paired multi-seed evaluation (same targets for all)
-        # ----------------------------------------------------------
+        # Paired multi-seed evaluation with shared starts and targets.
         print(f"\n  Evaluating on {n_eval} seeds "
               f"(N={N} random targets each) …")
         sep_all_by_method: dict[str, List[dict]] = {m: [] for m in sep_methods}
@@ -1494,7 +1461,6 @@ def main():
         vdn_all_by_mode: dict[str, List[dict]] = {m: [] for m in vdn_modes} if args.run_vdn else {}
 
         for s in range(n_eval):
-            # Benchmark evaluation uses shared starts/targets per seed.
             targets = _sample_targets(
                 s, N, grid.h, grid.w, region=args.eval_target_region
             )
@@ -1623,7 +1589,7 @@ def main():
                             f"VDN[{mode}]",
                             vdn_all_by_mode[mode][-1],
                         )
-                # Keep result files compact: traces are printed, not persisted.
+                # Traces are for console debugging only; result files stay compact.
                 for sep_method in sep_methods:
                     sep_all_by_method[sep_method][-1].pop("step_traces", None)
                 for mode in mappo_modes:
@@ -1653,9 +1619,9 @@ def main():
             if args.run_vdn else {}
         )
 
-        # Seed-0 for histograms and detailed output
+        # Seed 0 is kept for plots and detailed per-algorithm outputs.
         sep_seed0_by_method = {m: sep_all_by_method[m][0] for m in sep_methods}
-        sep_agg = sep_agg_by_method[primary_sep_method]  # backward compatibility
+        sep_agg = sep_agg_by_method[primary_sep_method]
         sep_m = sep_seed0_by_method[primary_sep_method]
         mappo_seed0_by_mode = {mode: mappo_all_by_mode[mode][0] for mode in mappo_modes}
         mappo_agg = mappo_agg_by_mode[primary_mode]
@@ -1743,7 +1709,6 @@ def main():
                       f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
                       f"  ({tmode:.1f}s train)")
 
-        # ---- wandb: log per-noise-kind evaluation metrics ----
         if wb_run is not None:
             import wandb
             for sep_method in sep_methods:
@@ -1785,16 +1750,13 @@ def main():
                             f"eval/{kind}/vdn/{mode}/{k}_std": agg[f"{k}_std"],
                         })
 
-        # ----------------------------------------------------------
-        # Save per-noise-type outputs
-        # ----------------------------------------------------------
+        # Save per-noise-kind outputs.
         for sep_method in sep_methods:
             sm = sep_seed0_by_method[sep_method]
             sa = sep_agg_by_method[sep_method]
             sall = sep_all_by_method[sep_method]
             with open(os.path.join(kind_dir, f"sep_{sep_method}_metrics.json"), "w") as f:
                 json.dump({"seed0": sm, "aggregate": sa, "all_seeds": sall}, f, indent=2)
-            # Backward compatibility with previous output names.
             if sep_method == primary_sep_method:
                 with open(os.path.join(kind_dir, "sep_metrics.json"), "w") as f:
                     json.dump({"seed0": sm, "aggregate": sa, "all_seeds": sall}, f, indent=2)
@@ -1809,7 +1771,6 @@ def main():
                            "all_seeds": m_all}, f, indent=2)
             with open(os.path.join(kind_dir, f"mappo_{mode}_train.json"), "w") as f:
                 json.dump(m_train, f, indent=2, default=str)
-            # Backward compatibility with previous output names.
             if mode == primary_mode:
                 with open(os.path.join(kind_dir, "mappo_metrics.json"), "w") as f:
                     json.dump({"seed0": m_seed0, "aggregate": m_agg,
@@ -1868,8 +1829,7 @@ def main():
                     with open(os.path.join(kind_dir, "vdn_train.json"), "w") as f:
                         json.dump(v_train, f, indent=2, default=str)
 
-        # Dedicated visualization rollout:
-        # same starts for all algorithms, fixed targets if provided (else random).
+        # Dedicated visualization rollout with shared starts and targets.
         viz_seed = args.seed + 900_000
         viz_rng = np.random.default_rng(viz_seed)
         viz_start_rows = (
@@ -1964,7 +1924,7 @@ def main():
             else None
         )
 
-        # Terminal histograms (seed-0 rollout)
+        # Terminal histograms from seed-0 rollout.
         targets_0 = [tuple(t) for t in sep_m["targets"]]
         trajectories_overlay: Dict[str, List[List[Pos]]] = {}
         for sep_method in sep_methods:
@@ -2038,7 +1998,6 @@ def main():
                 outpath=mappo_hist_path,
                 title=f"MAPPO[{mode}] — {kind} noise (p={args.p})",
             )
-            # Backward compatibility.
             if mode == primary_mode:
                 plot_terminal_hist(
                     grid.h, grid.w,
@@ -2101,7 +2060,6 @@ def main():
                         title=f"VDN — {kind} noise (p={args.p})",
                     )
 
-        # ---- wandb: log terminal histogram images ----
         if wb_run is not None:
             import wandb
             img_payload = {}
@@ -2134,7 +2092,7 @@ def main():
             "noise": kind,
             "reach_thresholds": reach_thresholds,
             "stability_window_batches": int(args.stability_window),
-            "sep_method": primary_sep_method,  # backward compatibility
+            "sep_method": primary_sep_method,
             "sep_methods": sep_methods,
             "sep_reach_stabilization": sep_reach_stabilization_by_method.get(
                 primary_sep_method, {}
@@ -2150,7 +2108,7 @@ def main():
                 if args.also_eval_rematch_zero
                 else {}
             ),
-            "mappo_agg": mappo_agg,  # primary mode for backward compatibility
+            "mappo_agg": mappo_agg,
             "mappo_mode_primary": primary_mode,
             "mappo_reach_stabilization": mappo_reach_stabilization_by_mode.get(
                 primary_mode, {}
@@ -2168,7 +2126,7 @@ def main():
             "vdn_agg_by_mode": vdn_agg_by_mode if args.run_vdn else {},
             "sep_seed0": sep_m,
             "sep_seed0_by_method": sep_seed0_by_method,
-            "mappo_seed0": mappo_m,  # primary mode
+            "mappo_seed0": mappo_m,
             "mappo_seed0_by_mode": mappo_seed0_by_mode,
             "ippo_seed0": ippo_m if args.run_ippo else {},
             "ippo_seed0_by_mode": ippo_seed0_by_mode if args.run_ippo else {},
@@ -2206,7 +2164,6 @@ def main():
             } if args.run_vdn else {},
         })
 
-    # ---- Comparison table ------------------------------------------------
     hdr_w = 104
     print(f"\n{'=' * hdr_w}")
     print(f"  COMPARISON  ({n_eval}-seed eval, N={N} agents, N={N} random targets per episode)")
@@ -2276,7 +2233,6 @@ def main():
                 print(f"{'':12}  {f'VDN[{mode}]':<22} {v_ot:>12} {v_rr:>12} {v_cv:>12} {v_mt:>12}")
         print("─" * hdr_w)
 
-    # ---- Efficiency summary ----
     print(f"\nTraining efficiency:")
     for r in all_results:
         kind = r["noise"]
@@ -2307,11 +2263,9 @@ def main():
                 v_t = r["vdn_train_time_by_mode"][mode]
                 print(f"               VDN[{mode:<15}] {v_int/1e6:.1f}M interactions, {v_t:.1f}s")
 
-    # ---- Save full results ----
     with open(os.path.join(base_outdir, "comparison.json"), "w") as f:
         json.dump(all_results, f, indent=2, default=str)
 
-    # ---- wandb: summary table + artifact ----
     if wb_run is not None:
         import wandb
 
@@ -2393,7 +2347,6 @@ def main():
                     )
         wb_run.log({"comparison_table": table})
 
-        # Save results as artifact
         artifact = wandb.Artifact(f"comparison_p{args.p}_{stamp}", type="results")
         artifact.add_file(os.path.join(base_outdir, "comparison.json"))
         for kind in selected_noise_kinds:

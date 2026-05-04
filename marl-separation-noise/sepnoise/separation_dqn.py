@@ -40,7 +40,6 @@ def _epsilon_ddqn(interactions_done: int, decay_interactions: int, cfg: SepDeepD
 @dataclass
 class SepDeepDQNConfig:
     gamma: float = 0.98
-    # Match Sep-PPO actor LR scale (single network vs actor+critic).
     lr: float = 3e-4
     hidden_size: int = 64
     max_grad_norm: float = 0.5
@@ -50,7 +49,7 @@ class SepDeepDQNConfig:
     replay_warmup: int = 5_000
     train_steps_per_batch: int = 64
     minibatch_size: int = 256
-    target_update_every: int = 500  # learner (optimizer) steps between hard target sync
+    target_update_every: int = 500
     eps_start: float = 0.5
     eps_end: float = 0.05
     eps_decay_interactions: int | None = None
@@ -350,8 +349,7 @@ def train_goal_deep_double_dqn(
 
             done_here = just_reached | (t == H - 1)
 
-            # Store the *executed* action (after slip), not the pre-noise policy action.
-            # r and s' come from the env transition under exec_a; TD targets must use the same a.
+            # The Bellman target must use the action that actually drove the transition.
             for e in range(E):
                 for n in range(N):
                     if mask[e, n] < 0.5:

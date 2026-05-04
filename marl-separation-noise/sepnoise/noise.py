@@ -3,12 +3,12 @@ from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 import numpy as np
 
-Action = int  # 0=up,1=down,2=left,3=right,4=stay
+Action = int
 
 @dataclass
 class NoiseConfig:
-    kind: str  # 'none'|'individual'|'local'|'global'
-    p: float   # slip probability
+    kind: str
+    p: float
     rng_seed: int = 0
 
 class NoiseModel:
@@ -26,7 +26,7 @@ class NoiseModel:
         if cfg.kind not in ("none", "individual", "local", "global"):
             raise ValueError(f"Unknown noise kind: {cfg.kind}")
 
-        self._global_slip: Optional[bool] = None      # shared coin flip
+        self._global_slip: Optional[bool] = None
         self._local_choices: Dict[Tuple[int, int, int, int], int] = {}
 
     def reset_timestep(self):
@@ -62,10 +62,6 @@ class NoiseModel:
             return int(self._local_choices[key])
 
         raise RuntimeError("Unreachable")
-
-    # ------------------------------------------------------------------
-    # Vectorised batch interface (all agents in one timestep at once)
-    # ------------------------------------------------------------------
 
     def _vec_slip(self, intended: np.ndarray) -> np.ndarray:
         """Uniform random action != intended, fully vectorised."""

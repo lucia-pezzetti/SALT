@@ -22,7 +22,7 @@ from .matching import terminal_ot_cost, target_coverage_rate
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)
 QMIX_OBS_MODES = {"relative_targets"}
 
-# Cap intra-op threads for small tensors.
+# The small tensor workloads here are faster with bounded intra-op parallelism.
 torch.set_num_threads(min(torch.get_num_threads(), 8))
 
 
@@ -72,7 +72,6 @@ class QMixer(nn.Module):
         )
 
     def forward(self, agent_qs: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
-        # agent_qs: [B, N], states: [B, state_dim]
         B = agent_qs.size(0)
         w1 = torch.abs(self.hyper_w1(states)).view(B, self.n_agents, self.embed_dim)
         b1 = self.hyper_b1(states).view(B, 1, self.embed_dim)
@@ -604,4 +603,3 @@ def rollout_qmix(
             [list(p) for p in traj] for traj in trajectories
         ],
     }
-

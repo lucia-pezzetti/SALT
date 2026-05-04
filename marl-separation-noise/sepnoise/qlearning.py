@@ -18,7 +18,7 @@ class QConfig:
     gamma: float = 0.98
     eps_start: float = 0.5
     eps_end: float = 0.05
-    eps_decay_episodes: int = 20_000  # episodes over which ε decays (exponential)
+    eps_decay_episodes: int = 20_000
 
 class GoalConditionedTabularQ:
     """
@@ -68,7 +68,7 @@ def epsilon_by_episode(ep: int, cfg: QConfig) -> float:
     """Exponential decay: eps_start * decay_rate^ep, clamped to eps_end."""
     if ep >= cfg.eps_decay_episodes:
         return float(cfg.eps_end)
-    # decay_rate chosen so that eps_start * rate^decay_episodes = eps_end
+    # Choose the rate so eps reaches eps_end at eps_decay_episodes.
     rate = (cfg.eps_end / max(cfg.eps_start, 1e-8)) ** (
         1.0 / max(1, cfg.eps_decay_episodes)
     )
@@ -152,12 +152,6 @@ def train_goal_q(
     return model, metrics
 
 
-# ---------------------------------------------------------------------------
-# Multi-agent Q-learning with ε-greedy optimal transport assignment
-# (vectorised: all M agents processed in parallel per timestep)
-# ---------------------------------------------------------------------------
-
-# Pre-compute actions array once at module level
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)
 
 def train_goal_q_multiagent(
@@ -199,14 +193,12 @@ def train_goal_q_multiagent(
     for ep in range(episodes):
         eps = epsilon_by_episode(ep, qcfg)
 
-        # --- 1. sample M starts (col 0) and M targets (last 10 cols) ---
         pos_r = rng.integers(0, grid.h, size=M).astype(np.int32)
         pos_c = np.zeros(M, dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=M).astype(np.int32)
         col_lo = max(0, grid.w // 2)
         tgt_c = rng.integers(col_lo, grid.w, size=M).astype(np.int32)
 
-        # --- 2. ε-greedy OT assignment ---
         if rng.random() < eps:
             perm = rng.permutation(M)
             goal_r = tgt_r[perm]
@@ -221,7 +213,6 @@ def train_goal_q_multiagent(
             goal_r = tgt_r[col_ind]
             goal_c = tgt_c[col_ind]
 
-        # --- 3. simulate M agents in parallel with inline Q-updates ---
         reached = np.zeros(M, dtype=bool)
         total_cost = np.float32(0.0)
 
@@ -238,13 +229,11 @@ def train_goal_q_multiagent(
             zr = goal_r[idx]
             zc = goal_c[idx]
 
-            # Vectorised ε-greedy action selection
             q_vals = model.Q[sr, sc, zr, zc, :]
             best = np.argmin(q_vals, axis=1).astype(np.int32)
             rand_a = rng.integers(0, n_act, size=na).astype(np.int32)
             actions = np.where(rng.random(na) < eps, rand_a, best)
 
-            # Vectorised noise + movement
             exec_a = noise.apply_batch(actions, t=t, pos_r=sr, pos_c=sc,
                                        agent_ids=idx)
             new_r = np.clip(sr + _ACTIONS_ARR[exec_a, 0],
@@ -252,7 +241,6 @@ def train_goal_q_multiagent(
             new_c = np.clip(sc + _ACTIONS_ARR[exec_a, 1],
                             0, grid.w - 1).astype(np.int32)
 
-            # Vectorised cost computation
             just_reached = (new_r == zr) & (new_c == zc)
             last_step = (t == H - 1)
 
@@ -267,9 +255,7 @@ def train_goal_q_multiagent(
 
             done_flags = just_reached | last_step
 
-            # --- Inline Q-table update (per timestep) ---
-            # Values propagate within the episode: step t+1 sees
-            # the Q-table already updated by steps 0..t.
+            # Online updates let later timesteps see earlier changes from the same episode.
             q_cur = model.Q[sr, sc, zr, zc, actions]
             q_nxt = np.min(
                 model.Q[new_r, new_c, zr, zc, :], axis=-1,
@@ -277,8 +263,7 @@ def train_goal_q_multiagent(
             td_targets = costs + np.where(
                 done_flags, np.float32(0), gamma * q_nxt
             )
-            # With only M agents per batch, duplicate keys are
-            # extremely rare, so np.add.at is safe here.
+            # Duplicate keys are rare at this batch size; np.add.at handles them correctly.
             np.add.at(
                 model.Q,
                 (sr, sc, zr, zc, actions),

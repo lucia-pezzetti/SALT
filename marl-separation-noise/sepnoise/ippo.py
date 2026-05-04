@@ -22,7 +22,7 @@ from .matching import terminal_ot_cost, target_coverage_rate
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)
 IPPO_OBS_MODES = {"relative_targets"}
 
-# Cap intra-op threads for small tensor workloads.
+# The small tensor workloads here are faster with bounded intra-op parallelism.
 torch.set_num_threads(min(torch.get_num_threads(), 8))
 
 
@@ -90,9 +90,9 @@ def _validate_obs_mode(obs_mode: str) -> str:
 
 
 def _gae_batched(
-    rewards: np.ndarray,   # (H, E*N)
-    values: np.ndarray,    # (H, E*N)
-    not_done: np.ndarray,  # (H, E*N): 1 if transition t->t+1 is non-terminal
+    rewards: np.ndarray,
+    values: np.ndarray,
+    not_done: np.ndarray,
     gamma: float,
     lam: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -536,4 +536,3 @@ def rollout_ippo(
             [list(p) for p in traj] for traj in trajectories
         ],
     }
-

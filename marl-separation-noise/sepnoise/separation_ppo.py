@@ -13,7 +13,7 @@ from torch.distributions import Categorical
 from .env import GridConfig, SingleAgentGoalGrid, Pos
 from .noise import NoiseConfig
 
-# Cap intra-op threads for small tensor workloads.
+# The small tensor workloads here are faster with bounded intra-op parallelism.
 torch.set_num_threads(min(torch.get_num_threads(), 8))
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)
 
@@ -94,8 +94,8 @@ def _obs_sep(s: Pos, z: Pos, t: int, grid: GridConfig) -> np.ndarray:
 
 
 def _gae_batched(
-    rewards: np.ndarray,  # (H, E)
-    values: np.ndarray,   # (H, E)
+    rewards: np.ndarray,
+    values: np.ndarray,
     gamma: float,
     lam: float,
 ) -> Tuple[np.ndarray, np.ndarray]:

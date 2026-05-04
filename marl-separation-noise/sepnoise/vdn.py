@@ -19,11 +19,10 @@ from .env import GridConfig, ACTIONS, Pos
 from .noise import NoiseConfig
 from .matching import terminal_ot_cost, target_coverage_rate
 
-# Keep a compact action lookup for vectorized transitions.
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)
 VDN_OBS_MODES = {"relative_targets"}
 
-# Cap intra-op threads for small tensors.
+# The small tensor workloads here are faster with bounded intra-op parallelism.
 torch.set_num_threads(min(torch.get_num_threads(), 8))
 
 
@@ -533,4 +532,3 @@ def rollout_vdn(
             [list(p) for p in traj] for traj in trajectories
         ],
     }
-
