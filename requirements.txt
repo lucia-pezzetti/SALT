@@ -13,3 +13,4 @@ plotly==6.0.1
 pyarrow==19.0.1
 scipy==1.15.2
 shapely==2.1.0
+wandb>=0.16.0
