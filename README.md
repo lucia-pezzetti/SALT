@@ -28,15 +28,15 @@ conda activate ride-sharing
 ## Dataset
 The full TLC dataset is publicly available at [NYC TLC Trip Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
 
-## Discrete Q-Learning Pipeline
+## Code Pipeline
 
-The current repository is polished around the Manhattan discrete tabular Q-learning pipeline used for the experiments. The canonical launcher is:
+The current repository implement the Manhattan discrete tabular Q-learning pipeline used for the experiments in the paper. The canonical launcher is:
 
 ```bash
 bash src/run_main.sh
 ```
 
-The launcher moves into `src/`, activates the Conda environment configured by `CONDA_ENV` (default: `ride-sharing`), prints the active JAX backend, and runs `main.py` with the discrete Q-learning flags used for the experiment.
+The launcher activates the Conda environment configured by `CONDA_ENV` (default: `ride-sharing`), and runs `main.py` with the discrete Q-learning flags used for the experiment.
 
 Useful overrides:
 
