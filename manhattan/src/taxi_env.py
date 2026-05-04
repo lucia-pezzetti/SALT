@@ -8,12 +8,12 @@ import numpy as np
 
 # State
 class TaxiState(NamedTuple):
-    current_node: jnp.ndarray  # shape () - scalar int32
-    pickup_node: jnp.ndarray   # shape () - scalar int32  
-    done: jnp.ndarray          # shape () - scalar bool
-    step_count: jnp.ndarray    # shape () - scalar int32
-    neighbor_mask: jnp.ndarray # shape [max_deg]
-    time: jnp.ndarray          # shape () - scalar float32
+    current_node: jnp.ndarray  
+    pickup_node: jnp.ndarray    
+    done: jnp.ndarray          
+    step_count: jnp.ndarray    
+    neighbor_mask: jnp.ndarray 
+    time: jnp.ndarray          
 
 
 @jax.jit
@@ -59,7 +59,6 @@ class TaxiEnv(eqx.Module):
     green_durations: jnp.ndarray  # [num_nodes, max_deg]
     offsets: jnp.ndarray          # [num_nodes, max_deg]
     # Congestion weight & timeout
-    # alpha: float                  # per-vehicle delay
     pickup_bonus: float = 50.0  # bonus for reaching the pickup
     timeout_penalty: float
     global_state_dim: int
@@ -81,16 +80,13 @@ class TaxiEnv(eqx.Module):
         traffic_params: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],  # (periods, green_durations, offsets) each [num_nodes, max_deg]
         paths_dict: Optional[dict] = None,
         node_coordinates: Optional[jnp.ndarray] = None,  # [num_nodes, 2] - normalized lat/lon coordinates
-        # alpha: float = 1.0,
         pickup_bonus: float = 5.0,
         timeout_penalty: float = -50.0,
         gamma: float = 0.99,
         noise_mask: Optional[jnp.ndarray] = None,  # [num_nodes, max_deg] - per-edge noise ceiling
     ):
-        # static graph data - ensure all arrays are on GPU with proper dtypes
         travel_times_host = np.asarray(travel_times, dtype=np.float32)
         valid_times = travel_times_host[travel_times_host > 0.0]
-        # Equinox modules are frozen dataclasses; use object.__setattr__ for new fields
         object.__setattr__(
             self,
             "avg_travel_time_per_hop",
@@ -104,13 +100,11 @@ class TaxiEnv(eqx.Module):
         self.distances = jax.device_put(jnp.array(distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
         self.hop_distances = jax.device_put(jnp.array(hop_distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
         self.paths_dict = paths_dict
-        # Store normalized node coordinates for Euclidean distance computation
         if node_coordinates is not None:
             self.node_coordinates = jax.device_put(jnp.array(node_coordinates, dtype=jnp.float32))  # [num_nodes, 2]
         else:
             self.node_coordinates = None
 
-        # sizes
         self.num_nodes, self.max_deg = adj_list.shape
         self.max_steps = max_steps
 
@@ -121,7 +115,6 @@ class TaxiEnv(eqx.Module):
         # congestion params
         self.pickup_bonus = pickup_bonus
         self.timeout_penalty = timeout_penalty
-        # self.alpha = alpha
         self.gamma = gamma
 
         # Traffic params
@@ -185,7 +178,6 @@ class TaxiEnv(eqx.Module):
             noise_factor = 1.0 + ceil * jrandom.uniform(noise_key)  # U(1, 1+ceil)
             travel = travel * noise_factor
 
-        # Check for invalid moves - should not happen if action masking is correct
         # Raise an error if invalid move is attempted
         invalid = (nxt == -1)
         reach = (curr == state.pickup_node) | (nxt == state.pickup_node)
@@ -195,76 +187,27 @@ class TaxiEnv(eqx.Module):
         # Time calculations
         t1 = state.time + travel
         
-        # Signal phase & wait - use edge-based traffic params (at the end of the edge)
+        # Signal phase & wait - use edge-based traffic params
         period_edge = self.periods[curr, action]
         offset_edge = self.offsets[curr, action]
         green_edge = self.green_durations[curr, action]
         
         cycle = (t1 + offset_edge) % period_edge
         wait = jnp.where(cycle < green_edge, 0.0, period_edge - cycle)  # Original traffic light logic
-        # wait = 0.0
         t2 = t1 + wait
         norm_time = t2 % period_edge
 
         # Reward calculation - optimized
         total_delay = travel + wait
         
-        # EUCLIDEAN DISTANCE
-        # Use Euclidean distance from normalized coordinates if available, otherwise fall back to travel time distance
-        # Note: In JIT-compiled code, we can't check None with Python if, so we always compute both and select
-        # Since node_coordinates is either None (not provided) or a valid array, we use jnp.where with a check
-        # if self.node_coordinates is not None:
-        #     # Compute Euclidean distance from normalized coordinates
-        #     coord_nxt = self.node_coordinates[nxt]  # [2]
-        #     coord_pickup = self.node_coordinates[state.pickup_node]  # [2]
-        #     diff = coord_nxt - coord_pickup
-        #     dist_n = jnp.sqrt(jnp.sum(diff * diff) + 1e-8)  # Euclidean distance in normalized coordinate space (add small epsilon for numerical stability)
-        # else:
-        #     # Fallback to shortest path travel time distance
-        # dist_n = self.distances[nxt, state.pickup_node]
-        # 
-        # # Add pickup bonus when reaching the pickup location
-        # pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
-        # # Scale down delay penalty and increase pickup bonus to ensure positive rewards for completion
-        # # Using Euclidean distance penalty instead of travel time distance
-        # reward = - total_delay/60.0 - 0.5*dist_n/60.0
-        
-        # HOP DISTANCES
-        # Compute hop distances from current and next nodes to pickup
-        # hop_dist_curr = self.hop_distances[curr, state.pickup_node]
-        # hop_dist_next = self.hop_distances[nxt, state.pickup_node]
-        # hop_dist_diff = hop_dist_curr - hop_dist_next
-        # Average travel time per hop
-        # valid_travel_times = jnp.where(self.travel_times > 0.0, self.travel_times, 0.0)
-        # sum_valid = jnp.sum(valid_travel_times)
-        # count_valid = jnp.sum(self.travel_times > 0.0, dtype=jnp.float32)
-        # avg_travel_time_per_hop = jnp.where(
-        #     count_valid > 0.0, sum_valid / count_valid, 0.0
-        # )
-        # Scale the hop-based shaping term by the average travel time per hop
-        # hop_shaping = (avg_travel_time_per_hop / 60.0) * hop_dist_diff
-        # Distance shaping commented out
-        # dist_curr = self.distances[curr, state.pickup_node]
-        # dist_next = self.distances[nxt, state.pickup_node]
-        # dist_diff = dist_curr - dist_next
-        # dist_shaping = dist_diff / 60.0
-        
         # Pickup bonus
         pickup_bonus = jnp.where(reach, self.pickup_bonus, 0.0)
 
-        # Reward scaling (we want to make the reward between -1 and 1)
-        reward_scaling = 1.0 #5e-3
-
-        # Distance shaping commented out - no longer guiding agent toward pickup
         # Positive reward for moving closer (dist_diff > 0), negative for moving away
-        reward = - reward_scaling * total_delay/60.0 + pickup_bonus # + dist_shaping
+        reward = - total_delay/60.0 + pickup_bonus # + dist_shaping
         
         # Already done
         reward = jnp.where(already_done, 0.0, reward)
-
-        # Debug
-        # jax.debug.print("Reward: delay={delay:.2f}, shaping={shaping:.2f}, pickup_bonus={bonus:.2f}, reward={reward:.2f}, reach={reach}", 
-        #                 delay=total_delay, shaping=shaping, bonus=pickup_bonus, reward=reward, reach=reach)
 
         # Neighbor mask
         nm = self.neighbor_mask_static[nxt]

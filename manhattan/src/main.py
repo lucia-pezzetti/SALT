@@ -8,9 +8,8 @@ import sys
 import time
 import threading
 
-# Enable JAX optimizations for GPU
-jax.config.update('jax_enable_x64', False)  # Use float32 for better GPU performance
-jax.config.update('jax_compilation_cache_dir', None)  # Will be set by environment
+jax.config.update('jax_enable_x64', False)
+jax.config.update('jax_compilation_cache_dir', None)
 
 from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn, load_or_compute_distance_matrix_parallel, load_or_build_graph, build_noise_mask
 from taxi_env import TaxiEnv, init_env
@@ -87,34 +86,22 @@ def optimize_jax_config():
     os.makedirs(cache_dir, exist_ok=True)
     jax.config.update('jax_compilation_cache_dir', cache_dir)
     
-    # Enable XLA optimizations
     jax.config.update('jax_enable_x64', False)
     jax.config.update('jax_enable_compilation_cache', True)
-    
-    # Reduce compilation memory usage
-    # This helps prevent LLVM from trying to allocate large contiguous memory blocks
-    # Note: Platform is set via JAX_PLATFORMS environment variable (CPU/GPU)
-    # try:
-    #     jax.config.update('jax_platform_name', 'cpu')  # Ensure we're using CPU backend
-    # except:
-    #     pass  # Ignore if already set
     
     # Set memory preallocation (respect environment variables if set)
     if 'XLA_PYTHON_CLIENT_PREALLOCATE' not in os.environ:
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     if 'XLA_PYTHON_CLIENT_MEM_FRACTION' not in os.environ:
-        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '1.0'  # Memory fraction (platform-dependent)
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '1.0'
     if 'XLA_PYTHON_CLIENT_ALLOCATOR' not in os.environ:
-        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # Use platform allocator
+        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
     
     # Configure XLA flags to avoid contiguous memory allocation issues
-    # This prevents LLVM from trying to allocate large contiguous memory sections
     xla_flags = os.environ.get('XLA_FLAGS', '')
     xla_flags_parts = xla_flags.split() if xla_flags else []
     
     # Add flags to reduce memory pressure during compilation
-    # Only use valid XLA flags to avoid crashes
-    # Note: Platform-specific flags can be added here if needed
     flags_to_add = [
         # '--xla_cpu_enable_fast_math=false',  # CPU-specific, disabled for GPU
     ]
@@ -125,10 +112,6 @@ def optimize_jax_config():
     
     os.environ['XLA_FLAGS'] = ' '.join(xla_flags_parts)
     
-    # Get platform info
-    platforms = os.environ.get('JAX_PLATFORMS', 'auto')
-    
-    # print(f"JAX optimized: cache_dir={cache_dir}, float32=True, compilation_cache=True, platforms={platforms}")
 
 parser = argparse.ArgumentParser(description="Discrete tabular Q-learning ride-sharing simulator")
 parser.add_argument("--env_type", type=str, choices=["manhattan", "simple"], default="manhattan", help="Type of environment to use")
@@ -235,20 +218,13 @@ if args.fixed_eval:
     if len(args.fixed_starts) != len(args.fixed_pickups):
         raise ValueError("--fixed_starts and --fixed_pickups must have the same length")
 
-# Validate zone-based filtering parameters
-# Default: both None (all nodes)
-# If only one is provided, the other defaults to None (all nodes)
-# If both are provided, use both as specified
-
 # Convert string numbers to integers if they look like numbers
 def convert_zone(zone):
     """Convert zone to appropriate type (int if numeric, str otherwise)."""
     if isinstance(zone, str):
-        # Try to convert to int if it's a numeric string
         try:
             return int(zone)
         except ValueError:
-            # It's a zone name, keep as string
             return zone
     return zone
 
@@ -285,8 +261,6 @@ if args.params_dir is None:
 
 # --- Load or build the environment with caching ---
 if args.env_type == "manhattan":
-    # if specified, load the graph from the cache file
-    # graph_cache_file = os.path.join(args.cache_dir, "manhattan_graph_4zones_1pair.pkl")
     graph_cache_file = None
 else:
     graph_cache_file = os.path.join(args.cache_dir, f"simple_graph_{args.num_layers}layers_{args.offset}offset.pkl")
@@ -311,14 +285,13 @@ if getattr(args, 'noise', False):
 else:
     noise_mask = None  # No noise — fully deterministic travel times
 
-# Place graph structures on device (CPU/GPU based on JAX_PLATFORMS) with optimal memory layout
+# Place graph structures on device
 adj_list = jax.device_put(jnp.array(adj_list, dtype=jnp.int32))
 travel_times = jax.device_put(jnp.array(travel_times, dtype=jnp.float32))
 neighbor_mask_static = jax.device_put(jnp.array(neighbor_mask_static, dtype=bool))
 
 # Precompute shortest-path distance matrix
 if args.env_type == "manhattan":
-    # distance_cache_file = os.path.join(args.cache_dir, "manhattan_distances_4zones_1pair.pkl")
     distance_cache_file = None
 else:
     distance_cache_file = os.path.join(args.cache_dir, f"simple_distances_{args.num_layers}layers_{args.offset}offset.pkl")
@@ -326,7 +299,7 @@ dist_mat, hop_dist_mat, max_length, paths_dict = load_or_compute_distance_matrix
     G, node_to_idx, distance_cache_file, args.num_workers
 )
 
-# Place distance matrices on device (CPU/GPU based on JAX_PLATFORMS)
+# Place distance matrices on device
 distances = jax.device_put(jnp.array(dist_mat, dtype=jnp.float32))
 hop_distances = jax.device_put(jnp.array(hop_dist_mat, dtype=jnp.float32))
 

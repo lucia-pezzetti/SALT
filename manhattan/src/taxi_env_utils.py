@@ -56,7 +56,6 @@ def build_noise_mask(G: nx.DiGraph, node_to_idx: dict, noise_level: float = 0.2,
 
     At each environment step the actual travel time is:
         travel * (1 + U(0, noise_mask[curr, action]))
-    so a mask value of 0.0 means the edge is deterministic.
     """
     node_list = list(G.nodes())
     num_nodes = len(node_list)
@@ -99,10 +98,8 @@ def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhatt
     Load precomputed distance matrix or compute and cache it using parallel processing.
     """
     if cache_file is not None and os.path.exists(cache_file):
-        # print(f"Loading precomputed distance matrix from {cache_file}")
         with open(cache_file, 'rb') as f:
             data = pickle.load(f)
-            # Return None for paths_dict to use smart greedy approach
             return data['dist_mat'], data['hop_dist_mat'], data['max_length'], None
     
     # Compute distance matrix with parallel processing
@@ -157,7 +154,6 @@ def load_or_compute_distance_matrix_parallel(G, node_to_idx, cache_file="manhatt
     
     # Cache the results - only if cache_file is provided
     if cache_file is not None:
-        # print(f"Caching distance matrix to {cache_file} (hybrid approach)")
         with open(cache_file, 'wb') as f:
             pickle.dump({
                 'dist_mat': dist_mat,
@@ -259,15 +255,12 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
 
     # If specified, cache the graph
     if cache_file is not None:
-        # Get zone metadata for caching (if Manhattan env)
-        # We need to get this from build_env, but since build_env is called separately,
-        # we'll reload it here for caching purposes
+        # Get zone metadata for caching
         nodes_gdf = None
         node_to_zone = None
         zone_to_nodes = None
         zone_name_to_locationID = None
         if args.env_type == 'manhattan':
-            # Reload to get zone metadata for caching
             _, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(
                 place_name=args.place_name,
                 zone_shp=args.zone_shp,
@@ -285,7 +278,6 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
                 'fixed_pickups_idx': fixed_pickups_idx,
                 'traffic_params': traffic_params
             }
-            # Add zone metadata if available
             if nodes_gdf is not None:
                 cache_data['nodes_gdf'] = nodes_gdf
             if node_to_zone is not None:
@@ -438,31 +430,16 @@ def make_obs_fn(
         """
         Observation function
         """
-        # Use pre-computed normalized lat/lon coordinates
-        xy_c = latlon[s.current_node]   # [2] - direct GPU memory access
-        xy_p = latlon[s.pickup_node]    # [2] - direct GPU memory access
+        # Normalized lat/lon coordinates
+        xy_c = latlon[s.current_node]   # [2] 
+        xy_p = latlon[s.pickup_node]    # [2]
         
-        # Compute relative position (direction vector from current to pickup)
-        # relative_pos = xy_p - xy_c  # [2] - single operation
-        
-        # Compute distance and angle efficiently (avoid expensive operations)
-        # distance_sq = jnp.sum(relative_pos * relative_pos)  # [1] - faster than linalg.norm
-        # distance = jnp.sqrt(distance_sq + 1e-8)  # [1] - add small epsilon for numerical stability
-        
-        # # Compute angle efficiently
-        # angle = jnp.arctan2(relative_pos[1], relative_pos[0])  # [1] - direct computation
-        
-        # Pre-allocate result array for better memory layout
         obs = jnp.zeros(5, dtype=jnp.float32)
         
         # Fill in values with optimized assignments
         obs = obs.at[0:2].set(xy_c)           # [2] - current position
         obs = obs.at[2:4].set(xy_p)           # [2] - pickup position  
-        # obs = obs.at[4:6].set(relative_pos)   # [2] - direction vector
-        # obs = obs.at[6].set(distance)         # [1] - distance
-        # obs = obs.at[7].set(angle)            # [1] - angle
         obs = obs.at[4].set(s.time)           # [1] - time
-        # obs = obs.at[4].set(0.0)                # [1] - time
         
         return obs
 
@@ -562,7 +539,6 @@ def build_traffic_params(G: nx.DiGraph,
     green_durations = np.zeros((num_nodes, max_deg), dtype=np.float32)
     offsets_arr = np.zeros((num_nodes, max_deg), dtype=np.float32)
     
-    # Initialize random number generator for random offsets if needed
     if random_offsets:
         rng = np.random.RandomState(seed)
     
@@ -570,7 +546,7 @@ def build_traffic_params(G: nx.DiGraph,
         neighbors = list(G.successors(node))
         n_neighbors = len(neighbors)
         for j, nbr in enumerate(neighbors[:max_deg]):
-            # Get the best edge (same logic as build_adj_and_time_matrix)
+            # Get the best edge
             best_k = min(G[node][nbr], key=lambda k: G[node][nbr][k]['travel_time_congested'])
             edge_data = G[node][nbr][best_k]
             
@@ -581,7 +557,7 @@ def build_traffic_params(G: nx.DiGraph,
             
             # decide cycle & green based on edge's highway type
             if hw in ("motorway", "trunk"):
-                cycle, green = cycle_length, cycle_length    # effectively always green
+                cycle, green = cycle_length, cycle_length    # always green
             elif hw == "primary":
                 cycle, green = cycle_length, cycle_length * 0.5
             elif hw == "secondary":
@@ -596,7 +572,6 @@ def build_traffic_params(G: nx.DiGraph,
             periods[i, j] = cycle
             green_durations[i, j] = green
             if random_offsets:
-                # Generate random integer offset between 0 and cycle_length (exclusive)
                 offsets_arr[i, j] = float(rng.randint(0, int(cycle_length)))
             else:
                 offsets_arr[i, j] = offset

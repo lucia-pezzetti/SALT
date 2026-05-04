@@ -321,8 +321,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     log_dict_clean[key] = value
             wandb.log(log_dict_clean, step=int(step), commit=True)
     
-    # Use optimistic initialization with positive large value to favor exploration
-    initial_q_value = 0.0  # No optimistic initialization - use explicit init methods
+    initial_q_value = 0.0
     
     q_agent = train_q_learning(
         env=ctx.env,
@@ -384,7 +383,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     print(f"Sampled {num_start_sets} sets of {B} starts and {num_pickup_sets} sets of {B} pickups")
     print(f"Evaluating {num_start_sets} × {num_pickup_sets} = {num_start_sets * num_pickup_sets} combinations with Hungarian matching (using Q-table estimation, same as training)")
     
-    # Create Q-learning greedy policy (needed for matching)
+    # Create Q-learning greedy policy
     def q_learning_policy(state: TaxiState) -> int:
         """Greedy Q-learning policy (epsilon=0)."""
         valid_actions = []
@@ -400,7 +399,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         best_idx = np.argmax(q_values)
         return valid_actions[best_idx]
     
-    # Helper functions for matching (define before use)
+    # Helper functions for matching
     def simulate_policy_time(policy_fn, start, pickup, base_seed, use_discrete):
         """Simulate a single start/pickup pair and return total travel time (seconds)."""
         key = jax.random.PRNGKey(base_seed)
@@ -447,7 +446,6 @@ def run_q_learning(args, ctx: RunContext) -> None:
         if len(starts) == 0:
             return pickups, jnp.zeros((0, 0), dtype=jnp.float32)
         
-        # Use the same fast Q-table-based estimation as during training (not slow simulations)
         from training.q_learning import _estimate_returns_batch_q_table_direct
         
         starts_jax = jnp.array(starts, dtype=jnp.int32)
@@ -455,11 +453,10 @@ def run_q_learning(args, ctx: RunContext) -> None:
         num_starts = len(starts)
         num_pickups = len(pickups)
         
-        # Create all combinations (same as training)
+        # Create all combinations
         starts_expanded = jnp.repeat(starts_jax, num_pickups)
         pickups_expanded = jnp.tile(pickups_jax, num_starts)
         
-        # Always use time_idx=0 (episodes always start at t=0)
         time_idx = jnp.int32(0)
         
         # Estimate returns directly from Q-table (batched, fast!)
@@ -477,7 +474,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         returns_matrix = returns_flat.reshape(num_starts, num_pickups)
         cost_matrix = -returns_matrix  # Negative because Hungarian minimizes cost
         
-        # Hungarian algorithm (same as training)
+        # Hungarian algorithm
         _, assignment = optax.assignment.hungarian_algorithm(cost_matrix)
         matched_pickups = jnp.take(pickups_jax, assignment, axis=0)
         return matched_pickups, cost_matrix
@@ -502,7 +499,6 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 all_eval_pickups.append(int(pickup))
                 all_eval_seeds.append(base_seed)
     
-    # Convert to JAX arrays for batched evaluation
     eval_starts_arr = jnp.array(all_eval_starts, dtype=jnp.int32)
     eval_pickups_arr = jnp.array(all_eval_pickups, dtype=jnp.int32)
     eval_seeds_arr = jnp.array(all_eval_seeds, dtype=jnp.uint32)
@@ -617,7 +613,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     print(f"  Completion Rate: {final_eval['completion_rate']:.2%}")
     print(f"  Total evaluations: {len(all_rewards)} (25 set combinations × {B} agents)")
     
-    # # Log final metrics
+    # Log final metrics
     wandb.log({
         "final/avg_reward": final_eval['avg_reward'],
         "final/avg_steps": final_eval['avg_steps'],
@@ -659,7 +655,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
             'steps': sp_steps,
         }
     
-    # Shortest path baseline - DISCRETE (fair comparison with Q-learning)
+    # Shortest path baseline - DISCRETE
     def evaluate_shortest_path_baseline_discrete(starts, pickups):
         """Shortest path in discrete time - fair comparison with Q-learning."""
         sp_times, sp_rewards, sp_steps, sp_completed = [], [], [], []
@@ -675,7 +671,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     ctx.env.adj_list, q_agent.discrete_travel_times, ctx.env.distances,
                     ctx.env.neighbor_mask_static[state.current_node]
                 )
-                # Use discretized step for fair comparison with Q-learning
+                # Use discretized step
                 noise_key, nk = jax.random.split(noise_key)
                 state, reward, done, info = q_agent.step_with_discretization(
                     state, action, jax.random.PRNGKey(step_count), noise_key=nk
@@ -696,19 +692,6 @@ def run_q_learning(args, ctx: RunContext) -> None:
             'rewards': sp_rewards,
             'steps': sp_steps,
         }
-    
-    # Shortest path baselines removed - final evaluation now uses matching approach
-    # Baselines are still computed in periodic evaluations during training
-    
-    # Baseline logging commented out - variables no longer exist (replaced with matching approach)
-    # wandb.log({
-    #     "baseline/sp_continuous_avg_reward": sp_baseline_continuous['avg_reward'],
-    #     "baseline/sp_continuous_avg_steps": sp_baseline_continuous['avg_steps'],
-    #     "baseline/sp_continuous_completion_rate": sp_baseline_continuous['completion_rate'],
-    #     "baseline/sp_discrete_avg_reward": sp_baseline_discrete['avg_reward'],
-    #     "baseline/sp_discrete_avg_steps": sp_baseline_discrete['avg_steps'],
-    #     "baseline/sp_discrete_completion_rate": sp_baseline_discrete['completion_rate'],
-    # })
     
     # Create Q-learning greedy policy
     def q_learning_policy(state: TaxiState) -> int:
@@ -877,7 +860,6 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         return total_times, total_rewards, completed, paths, path_lengths, step_rewards, step_times
     
-    # Wrap with jit, making max_steps and use_continuous_eval static
     evaluate_q_learning_batched = jax.jit(evaluate_q_learning_batched_impl, static_argnums=(7, 8))
 
     def evaluate_sp_policy_batched_impl(starts, pickups, eval_key, max_steps, use_discrete):
@@ -889,9 +871,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
         total_times = jnp.zeros(num_eval, dtype=jnp.float32)
         total_rewards = jnp.zeros(num_eval, dtype=jnp.float32)
         completed = jnp.zeros(num_eval, dtype=bool)
-        max_eval_steps = max_steps  # Now static, so can use directly
+        max_eval_steps = max_steps
         
-        # Track paths, step rewards, and step times
         path_buffer = jnp.zeros((num_eval, max_eval_steps + 1), dtype=jnp.int32)
         step_rewards_buffer = jnp.zeros((num_eval, max_eval_steps), dtype=jnp.float32)
         step_times_buffer = jnp.zeros((num_eval, max_eval_steps), dtype=jnp.float32)
@@ -901,14 +882,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         def cond_fn(carry):
             step, _, _, _, _, completed_mask, _, _, _, _, _ = carry
-            max_steps_jax = jnp.int32(max_eval_steps)  # Convert static int to JAX int32 for comparison
+            max_steps_jax = jnp.int32(max_eval_steps)
             all_done = jnp.logical_or(jnp.all(completed_mask), step >= max_steps_jax)
             return jnp.logical_not(all_done)
         
         def body_fn(carry):
             step, states, times_acc, rewards_acc, completed_mask, path_buf, step_rewards_buf, step_times_buf, path_lens, step_keys, _ = carry
             
-            # Use batched shortest path action
             if use_discrete:
                 actions = offline_shortest_path_action_discrete_batch(
                     states.current_node,
@@ -989,7 +969,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     # Wrap with jit, making max_steps and use_discrete static
     evaluate_sp_policy_batched = jax.jit(evaluate_sp_policy_batched_impl, static_argnums=(3, 4))
 
-    # Evaluation loop with trajectory printing - now optimized with batched GPU evaluation
+    # Evaluation loop with trajectory printing
     eval_iter = 2
     print_eval_trajectories = (
         args.epochs == 0 and getattr(args, "init_q_table_path", None)
@@ -1033,7 +1013,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         _, assignment_q = optax.assignment.hungarian_algorithm(cost_matrix_q)
         matched_q_pickups = jnp.take(pickups_jax, assignment_q, axis=0)
         
-        # Shortest path matching: use fast offline distance matrix lookup (no simulation needed!)
+        # Shortest path matching
         matched_sp_pickups_cont, _ = match_pickups(
             eval_starts, eval_pickups, sp_policy, base_seed + 1, use_discrete=False
         )
@@ -1041,13 +1021,12 @@ def run_q_learning(args, ctx: RunContext) -> None:
             eval_starts, eval_pickups, sp_policy_discrete, base_seed + 2, use_discrete=True
         )
         
-        # Batched GPU evaluation - much faster!
         eval_loop_key, q_cont_key = jax.random.split(eval_loop_key)
         eval_loop_key, q_disc_key = jax.random.split(eval_loop_key)
         eval_loop_key, sp_cont_key = jax.random.split(eval_loop_key)
         eval_loop_key, sp_disc_key = jax.random.split(eval_loop_key)
         
-        print(f"\n✅ Evaluation iteration {i+1}/{eval_iter} (batched GPU)")
+        print(f"\n Evaluation iteration {i+1}/{eval_iter} (batched GPU)")
         
         # Q-learning continuous evaluation
         q_times_continuous, q_rewards_continuous, q_completed_continuous, q_paths_continuous, q_path_lens_continuous, q_step_rewards_continuous, q_step_times_continuous = evaluate_q_learning_batched(
@@ -1147,23 +1126,6 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
                 print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
         
-        # Plot comparison: Q-learning vs SP discrete (fair comparison) - DISABLED
-        # q_paths_list = [list(map(int, path)) for path in q_paths]
-        # sp_paths_discrete_list = [list(map(int, path)) for path in sp_paths_discrete]
-        # fig = plot_rl_vs_shortest_path(
-        #     q_paths_list,
-        #     sp_paths_discrete_list,
-        #     ctx.G,
-        #     ctx.node_to_idx,
-        #     ctx.idx_to_node,
-        #     eval_starts,
-        #     matched_q_pickups,
-        # )
-        # matched_pickups_list = np.array(matched_q_pickups).tolist()
-        # fig.savefig(f"qlearning_vs_sp_discrete_{np.array(eval_starts).tolist()}_{matched_pickups_list}.png")
-        
-        # Log per-agent times (arrays) so downstream analysis can compute dispersion
-        # without collapsing each iteration to a single mean over N agents.
         print(f"\nQ-learning avg time (continuous): {q_times_continuous.tolist()}")
         print(f"Q-learning avg time (discrete): {q_times_discrete.tolist()}")
         print(f"SP (continuous) avg time: {sp_times_continuous.tolist()}")
@@ -1175,50 +1137,6 @@ def run_q_learning(args, ctx: RunContext) -> None:
         print(f"SP mean over agents (continuous): {np.mean(sp_times_continuous):.2f}")
         print(f"SP mean over agents (discrete): {np.mean(sp_times_discrete):.2f}")
         
-        # Log metrics for both comparisons
-    #     final_eval_metrics = {
-    #         # Q-learning metrics
-    #         "final_eval/qlearning_avg_time": float(np.mean(q_times)),
-    #         "final_eval/qlearning_times": q_times.tolist(),
-            
-    #         # Continuous SP (real-world comparison)
-    #         "final_eval/sp_continuous_avg_time": float(np.mean(sp_times_continuous)),
-    #         "final_eval/qlearning_vs_sp_continuous_ratio": float(np.mean(q_times) / np.mean(sp_times_continuous)),
-    #         "final_eval/qlearning_vs_sp_continuous_improvement": float((np.mean(sp_times_continuous) - np.mean(q_times)) / np.mean(sp_times_continuous) * 100),
-    #         "final_eval/sp_continuous_times": sp_times_continuous.tolist(),
-            
-    #         # Discrete SP (fair comparison)
-    #         "final_eval/sp_discrete_avg_time": float(np.mean(sp_times_discrete)),
-    #         "final_eval/qlearning_vs_sp_discrete_ratio": float(np.mean(q_times) / np.mean(sp_times_discrete)),
-    #         "final_eval/qlearning_vs_sp_discrete_improvement": float((np.mean(sp_times_discrete) - np.mean(q_times)) / np.mean(sp_times_discrete) * 100),
-    #         "final_eval/sp_discrete_times": sp_times_discrete.tolist(),
-    #     }
-    #     wandb.log(final_eval_metrics)
-        
-    #     # Comparison table: Q-learning vs SP discrete (fair comparison)
-    #     eval_comparison_table_discrete = wandb.Table(
-    #         columns=["Metric", "Q-Learning", "SP (Discrete)", "Improvement"], 
-    #         data=[
-    #             ["Average Time", float(np.mean(q_times)), float(np.mean(sp_times_discrete)), float((np.mean(sp_times_discrete) - np.mean(q_times)) / np.mean(sp_times_discrete) * 100)],
-    #             ["Min Time", float(np.min(q_times)), float(np.min(sp_times_discrete)), float((np.min(sp_times_discrete) - np.min(q_times)) / np.min(sp_times_discrete) * 100)],
-    #             ["Max Time", float(np.max(q_times)), float(np.max(sp_times_discrete)), float((np.max(sp_times_discrete) - np.max(q_times)) / np.max(sp_times_discrete) * 100)],
-    #             ["Std Time", float(np.std(q_times)), float(np.std(sp_times_discrete)), 0.0],
-    #         ]
-    #     )
-    #     wandb.log({"final_evaluation_comparison_discrete": eval_comparison_table_discrete})
-        
-    #     # Comparison table: Q-learning vs SP continuous (real-world comparison)
-    #     eval_comparison_table_continuous = wandb.Table(
-    #         columns=["Metric", "Q-Learning", "SP (Continuous)", "Improvement"], 
-    #         data=[
-    #             ["Average Time", float(np.mean(q_times)), float(np.mean(sp_times_continuous)), float((np.mean(sp_times_continuous) - np.mean(q_times)) / np.mean(sp_times_continuous) * 100)],
-    #             ["Min Time", float(np.min(q_times)), float(np.min(sp_times_continuous)), float((np.min(sp_times_continuous) - np.min(q_times)) / np.min(sp_times_continuous) * 100)],
-    #             ["Max Time", float(np.max(q_times)), float(np.max(sp_times_continuous)), float((np.max(sp_times_continuous) - np.max(q_times)) / np.max(sp_times_continuous) * 100)],
-    #             ["Std Time", float(np.std(q_times)), float(np.std(sp_times_continuous)), 0.0],
-    #         ]
-    #     )
-    #     wandb.log({"final_evaluation_comparison_continuous": eval_comparison_table_continuous})
-    
     wandb.finish()
     print("\n" + "="*60)
     print("Q-learning training completed!")

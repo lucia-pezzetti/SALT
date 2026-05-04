@@ -19,7 +19,7 @@ from taxi_env import TaxiState, TaxiEnv, init_env
 def _jitted_step_with_discretization(
     env: TaxiEnv,
     state: TaxiState,
-    action: jnp.int32,  # Changed from int to jnp.int32 to avoid type conversion
+    action: jnp.int32,
     discrete_travel_times: jnp.ndarray,
     dt: float,
     noise_key: jnp.ndarray = None,
@@ -62,14 +62,9 @@ def _jitted_step_with_discretization(
     norm_time = jnp.mod(discrete_t2, period_edge)
 
     total_delay = travel + wait
-    # Distance shaping commented out
-    # dist_curr = env.distances[curr, state.pickup_node]
-    # dist_next = env.distances[nxt, state.pickup_node]
-    # dist_diff = dist_curr - dist_next
-    # dist_shaping = dist_diff / 60.0
 
     pickup_bonus = jnp.where(reach, env.pickup_bonus, 0.0)
-    reward = -total_delay / 60.0 + pickup_bonus # + dist_shaping
+    reward = -total_delay / 60.0 + pickup_bonus
     reward = jnp.where(already_done, 0.0, reward)
 
     nm = env.neighbor_mask_static[nxt]
@@ -187,7 +182,6 @@ def _select_action_jit(
     q_row = q_table[curr, pickup, t_idx, :]  # [max_deg]
     
     # Mask invalid actions
-    # state.neighbor_mask is already jnp.ndarray with dtype jnp.bool_, so use directly
     valid_mask = state.neighbor_mask
     q_masked = jnp.where(valid_mask, q_row, -1e9)
     
@@ -202,13 +196,11 @@ def _select_action_jit(
     best_action = jnp.argmax(q_masked)
     
     # For random action: sample uniformly from all actions, then mask
-    # This is simpler than finding valid actions, and we'll fallback to greedy if invalid
     key, subkey = jax_random.split(key)
     max_deg = q_table.shape[-1]
     random_action = jax_random.randint(subkey, (), 0, max_deg, dtype=jnp.int32)
     
     # Choose between greedy and random based on epsilon
-    # If random action is invalid, fallback to greedy
     action = jnp.where(
         rand_val < epsilon,
         jnp.where(valid_mask[random_action], random_action, best_action),
@@ -244,7 +236,6 @@ def _update_q_value_jit(
     q_next_row = q_table[n_curr, n_pickup, n_t_idx, :]  # [max_deg]
     
     # Mask invalid actions for next state
-    # next_state.neighbor_mask is already jnp.ndarray with dtype jnp.bool_, so use directly
     valid_mask = next_state.neighbor_mask
     q_next_masked = jnp.where(valid_mask, q_next_row, -1e9)
     max_next_q = jnp.max(q_next_masked)
@@ -304,7 +295,6 @@ def _estimate_return_q_table_direct(
 
 
 # Batched version for multiple start-pickup pairs
-# time_idx is shared across all pairs (same time for all agents), so in_axes=None for it
 _estimate_returns_batch_q_table_direct = jax.vmap(
     _estimate_return_q_table_direct,
     in_axes=(None, 0, 0, None, None, None, None),  # q_table, start, pickup, time_idx, num_nodes, max_time_slices, env
@@ -372,7 +362,6 @@ def _batched_update_q_values_vectorized(
     q_next_rows = q_table[next_curr_indices, next_pickup_indices, next_t_indices, :]
     
     # Mask invalid actions for next states [num_agents, max_deg]
-    # next_states_neighbor_mask is already jnp.ndarray with dtype jnp.bool_, so use directly
     valid_masks = next_states_neighbor_mask  # [num_agents, max_deg]
     q_next_masked = jnp.where(valid_masks, q_next_rows, jnp.asarray(-1e4, dtype=q_dtype))
     max_next_q = jnp.max(q_next_masked, axis=-1)  # [num_agents]
@@ -559,8 +548,6 @@ class TabularQLearning:
             
             # Compute Q-values: immediate reward + discounted future value
             q_values = travel_cost + pickup_bonus_broadcast + future_value
-            # Keep updates in the same dtype as q_table (e.g., bfloat16) to avoid
-            # dtype-promotion temporaries and scatter cast warnings.
             q_values = q_values.astype(q_table.dtype)
             
             # Mask invalid entries:
@@ -578,8 +565,6 @@ class TabularQLearning:
             
             # Update Q-table - only update valid entries, leave invalid entries unchanged (they remain at initial_q_value)
             if use_all_time_slices:
-                # Memory-efficient update: write one time slice at a time on device.
-                # This avoids materializing huge [N, N, T, A] temporaries.
                 def update_time_slice(t_idx, q_table_carry):
                     current_slice = q_table_carry[:, :, t_idx, :]
                     updated_slice = jnp.where(valid_mask, q_values, current_slice)
@@ -593,7 +578,6 @@ class TabularQLearning:
             
             return q_table
         
-        # JIT-compile with use_all_time_slices as static argument
         compute_q_values_vectorized_jit = jax.jit(
             compute_q_values_vectorized,
             static_argnums=(9, 10),  # use_all_time_slices and max_time_slices are static
@@ -614,7 +598,6 @@ class TabularQLearning:
             max_time_slices,
         )
         
-        # Count initialized values (only valid actions) - vectorized
         # Count valid (curr, pickup, action) triplets where curr != pickup and action is valid
         same_node_mask = jnp.arange(num_nodes)[:, None] != jnp.arange(num_nodes)[None, :]  # [num_nodes, num_nodes]
         num_valid_curr_pickup_pairs = int(same_node_mask.sum())
@@ -622,9 +605,6 @@ class TabularQLearning:
         # Count valid actions per node
         valid_actions_per_node = self.env.neighbor_mask_static.sum(axis=1)  # [num_nodes]
         # For each (curr, pickup) pair, count valid actions for curr
-        # We need to sum over all curr nodes, but only for valid (curr, pickup) pairs
-        # This is approximately: num_valid_pairs * avg_valid_actions_per_node
-        # More accurately: sum over curr of (num_valid_pickups_for_curr * num_valid_actions_for_curr)
         num_valid_pickups_per_curr = same_node_mask.sum(axis=1)  # [num_nodes] - number of valid pickups for each curr
         num_valid_actions = int((num_valid_pickups_per_curr * valid_actions_per_node).sum())
         
@@ -657,12 +637,8 @@ class TabularQLearning:
     def set_q_value(self, state: TaxiState, action: int, value: float):
         """Set Q-value for a state-action pair."""
         curr, pickup, t_idx = self._get_state_indices(state)
-        # Use in-place update with .at[].set() - creates new array but JAX optimizes this
         self.q_table = self.q_table.at[curr, pickup, t_idx, action].set(float(value))
-        # if self.track_visits:
-        #     q_key = (curr, pickup, t_idx, action)
-        #     self.visit_counts[q_key] = self.visit_counts.get(q_key, 0) + 1
-    
+            
     def get_action(self, state: TaxiState, step: int, key: jnp.ndarray) -> int:
         """
         Epsilon-greedy action selection (uses JIT-compiled version).
@@ -687,8 +663,6 @@ class TabularQLearning:
             self.env.num_nodes,
             key,
         )
-        # Note: new_key is returned but we don't use it here since key is passed by value
-        # For proper key management, the caller should handle this
         return int(action)
     
     def update_q_value(
@@ -704,7 +678,6 @@ class TabularQLearning:
         
         Q(s, a) = Q(s, a) + alpha * [r + gamma * max_a' Q(s', a') - Q(s, a)]
         """
-        # Use JIT-compiled update function
         self.q_table = _update_q_value_jit(
             self.q_table,
             state,
@@ -719,20 +692,13 @@ class TabularQLearning:
             self.env.num_nodes,
         )
         
-        # Update visit counts (not JIT-compiled, but fast)
-        # Skip if tracking disabled for performance
-        # if self.track_visits:
-        #     curr, pickup, t_idx = self._get_state_indices(state)
-        #     q_key = (curr, pickup, t_idx, action)
-        #     self.visit_counts[q_key] = self.visit_counts.get(q_key, 0) + 1
-    
     def estimate_returns_for_matching(
         self,
         starts: jnp.ndarray,
         pickups: jnp.ndarray,
         time_idx: jnp.int32 = 0,
-        rollout_steps: int = 10,  # Ignored - kept for API compatibility
-        key: jnp.ndarray = None,  # Ignored - kept for API compatibility
+        rollout_steps: int = 10,  
+        key: jnp.ndarray = None, 
     ) -> jnp.ndarray:
         """
         Estimate returns for start-pickup pairs using Q-table directly (no rollouts needed!).
@@ -793,30 +759,13 @@ class TabularQLearning:
     
     def get_statistics(self) -> Dict:
         """Get statistics about the Q-table."""
-        # Compute statistics directly with reductions to avoid materializing
-        # a huge contiguous flattened buffer (~Q-table size).
         avg_q = float(jnp.mean(self.q_table))
         min_q = float(jnp.min(self.q_table))
         max_q = float(jnp.max(self.q_table))
 
-        # TEMPORARY: for signature matching
         num_visited_states = 0
         avg_visits = 0.0
         max_visits = 0
-        
-        # # Only compute visit statistics if tracking is enabled (expensive for large dicts)
-        # if self.track_visits and self.visit_counts:
-        #     visit_counts_list = list(self.visit_counts.values())
-        #     num_visited_states = len(self.visit_counts)
-        #     avg_visits = float(np.mean(visit_counts_list)) if visit_counts_list else 0.0
-        #     max_visits = int(np.max(visit_counts_list)) if visit_counts_list else 0
-        # else:
-        #     # Estimate visited states by counting non-initial values (much faster)
-        #     # This is approximate but avoids expensive dict operations
-        #     non_initial_mask = (q_values != self.initial_q_value)
-        #     num_visited_states = int(jnp.sum(non_initial_mask))
-        #     avg_visits = 0.0
-        #     max_visits = 0
         
         return {
             'num_states': num_visited_states,
@@ -839,7 +788,7 @@ class TabularQLearning:
             "initial_q_value": self.initial_q_value,
             "max_time_slices": self.max_time_slices,
             "q_table_dtype": self.q_table_dtype,
-            "q_table": np.array(self.q_table),  # Convert JAX array to numpy for serialization
+            "q_table": np.array(self.q_table),
             "visit_counts": dict(self.visit_counts),
         }
 
@@ -870,17 +819,14 @@ class TabularQLearning:
             q_table_dtype=state.get("q_table_dtype", "float32"),
         )
 
-        # Load Q-table (convert numpy back to JAX array)
+        # Load Q-table
         if "q_table" in state:
             if isinstance(state["q_table"], dict):
-                # Legacy format: convert dict to dense array
                 for (curr, pickup, t_idx, action), value in state["q_table"].items():
                     agent.q_table = agent.q_table.at[curr, pickup, t_idx, action].set(value)
             else:
-                # New format: numpy array
                 agent.q_table = jnp.array(state["q_table"], dtype=agent.q_table.dtype)
         
-        # Load visit counts
         if "visit_counts" in state:
             agent.visit_counts.update(state["visit_counts"])
         
@@ -898,41 +844,26 @@ class TabularQLearning:
         with Path(path).open("rb") as f:
             state = pickle.load(f)
         
-        # Load Q-table (convert numpy back to JAX array)
+        # Load Q-table
         if "q_table" in state:
             loaded_q_table = state["q_table"]
             
-            # Handle different formats
             if isinstance(loaded_q_table, dict):
-                # Legacy format: convert dict to dense array efficiently using vectorized operations
-                print(f"Converting dictionary format to dense array (this may take a moment for large Q-tables)...")
-                print(f"  Dictionary has {len(loaded_q_table)} entries")
                 
-                # Get the shape of the current Q-table
                 q_shape = self.q_table.shape
-                
-                # Convert current JAX array to numpy for efficient indexing
                 q_table_np = np.array(self.q_table)
                 
-                # Extract keys and values from dictionary
-                # Use vectorized numpy operations for much faster updates
-                # Unpack keys and values in one pass for efficiency
                 items = list(loaded_q_table.items())
                 
                 if len(items) > 0:
-                    # Unpack keys and values directly
-                    # Keys are tuples of (curr, pickup, t_idx, action)
                     keys_list, values_list = zip(*items)
-                    
-                    # Convert to numpy arrays for vectorized indexing
-                    # Unpack keys into separate arrays for each dimension
+                
                     curr_indices = np.array([k[0] for k in keys_list], dtype=np.int32)
                     pickup_indices = np.array([k[1] for k in keys_list], dtype=np.int32)
                     t_idx_indices = np.array([k[2] for k in keys_list], dtype=np.int32)
                     action_indices = np.array([k[3] for k in keys_list], dtype=np.int32)
                     q_values = np.array(values_list, dtype=np.float32)
                     
-                    # Filter out indices that are out of bounds
                     valid_mask = (
                         (curr_indices >= 0) & (curr_indices < q_shape[0]) &
                         (pickup_indices >= 0) & (pickup_indices < q_shape[1]) &
@@ -942,37 +873,22 @@ class TabularQLearning:
                     
                     if np.any(~valid_mask):
                         num_invalid = np.sum(~valid_mask)
-                        print(f"  Warning: {num_invalid:,} entries out of bounds, skipping them...")
                     
-                    # Use advanced indexing to update all valid entries at once
-                    # This is much faster than updating one by one
                     valid_curr = curr_indices[valid_mask]
                     valid_pickup = pickup_indices[valid_mask]
                     valid_t_idx = t_idx_indices[valid_mask]
                     valid_action = action_indices[valid_mask]
                     valid_values = q_values[valid_mask]
                     
-                    # Vectorized update: update all entries in one operation
                     q_table_np[valid_curr, valid_pickup, valid_t_idx, valid_action] = valid_values
-                    
-                    print(f"  Updated {np.sum(valid_mask):,} / {len(items):,} entries using vectorized operations")
-                
-                # Convert back to JAX array in one operation
+                                    
                 self.q_table = jnp.array(q_table_np)
-                print(f"  Conversion complete!")
             else:
-                # New format: numpy array
-                # Convert to numpy first if needed (more efficient for operations)
                 if not isinstance(loaded_q_table, np.ndarray):
                     loaded_q_table = np.array(loaded_q_table)
                 
-                # Check if shapes match
                 if loaded_q_table.shape != self.q_table.shape:
-                    print(f"Warning: Q-table shape mismatch!")
-                    print(f"  Loaded Q-table shape: {loaded_q_table.shape}")
-                    print(f"  Current Q-table shape: {self.q_table.shape}")
                     
-                    # Critical: max_deg (last dimension) must match environment's max_deg
                     loaded_max_deg = loaded_q_table.shape[3]
                     env_max_deg = self.q_table.shape[3]
                     
@@ -984,27 +900,17 @@ class TabularQLearning:
                             f"Please use a Q-table created with the same graph structure."
                         )
                     
-                    print(f"  Attempting to copy compatible entries...")
                     
-                    # Convert current Q-table to numpy for efficient slice operations
                     q_table_np = np.array(self.q_table)
                     
-                    # Copy compatible entries (up to minimum dimensions) using numpy
                     min_shape = tuple(min(s1, s2) for s1, s2 in zip(loaded_q_table.shape, self.q_table.shape))
                     q_table_np[:min_shape[0], :min_shape[1], :min_shape[2], :min_shape[3]] = \
                         loaded_q_table[:min_shape[0], :min_shape[1], :min_shape[2], :min_shape[3]]
                     
-                    # Convert back to JAX array in one operation
                     self.q_table = jnp.array(q_table_np)
                 else:
-                    # Shapes match, convert to JAX array directly
                     self.q_table = jnp.array(loaded_q_table)
             
-            print(f"Successfully loaded Q-table from {path}")
-            print(f"  Q-table shape: {self.q_table.shape}")
             stats = self.get_statistics()
-            print(f"  Avg Q-value: {stats['avg_q_value']:.4f}")
-            print(f"  Min Q-value: {stats['min_q_value']:.4f}")
-            print(f"  Max Q-value: {stats['max_q_value']:.4f}")
         else:
             raise ValueError(f"No Q-table found in saved file: {path}")
