@@ -22,7 +22,7 @@ pip install -r requirements.txt
 After the setup is complete, activate the environment manually:
 
 ```bash
-conda activate nyc-taxi
+conda activate ride-sharing
 ```
 
 ## Dataset
