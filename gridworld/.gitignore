@@ -1,38 +1,32 @@
-# Python bytecode and caches
+# Generated experiment outputs and paper figures
+runs/
+wandb/
+*.png
+*.pdf
+*.svg
+*.eps
+*.pt
+*.npy
+
+# Local Python/runtime artifacts
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Build and packaging
-build/
-dist/
-*.egg-info/
-.eggs/
-pip-wheel-metadata/
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Tooling and test caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-
-# Notebooks and editor/system files
-.ipynb_checkpoints/
 .DS_Store
 
-# Logs
-*.log
+# Keep the paper-facing experiment pipeline visible.
+scripts/*
+!scripts/
+!scripts/run_comparison.py
+!scripts/sweep_quadratic_grid_agents.py
+scripts/plot_comparison_bars.py
 
-# Project-generated artifacts
-wandb/
-benchmarl-vmas-coopnav/
-mappo_navigation_*
-pyproject.toml
+# Keep the package used by the pipeline, but hide experimental side implementations.
+!sepnoise/
+sepnoise/qplex.py
+
+# Local/editor material
+.vscode/
+appendix_d_filled.tex
