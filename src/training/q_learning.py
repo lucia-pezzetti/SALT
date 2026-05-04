@@ -597,7 +597,6 @@ class TabularQLearning:
         compute_q_values_vectorized_jit = jax.jit(
             compute_q_values_vectorized,
             static_argnums=(9, 10),  # use_all_time_slices and max_time_slices are static
-            donate_argnums=(0,),     # donate q_table to reduce peak memory
         )
         
         # Compute Q-values vectorized
@@ -1009,4 +1008,3 @@ class TabularQLearning:
             print(f"  Max Q-value: {stats['max_q_value']:.4f}")
         else:
             raise ValueError(f"No Q-table found in saved file: {path}")
-

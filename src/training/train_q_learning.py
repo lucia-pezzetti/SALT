@@ -731,12 +731,9 @@ def train_q_learning(
         
         return final_states, final_rewards, final_lengths, final_dones, final_q_table, final_key
     
-    # Donate q_table buffer (arg index 1) so XLA can reuse memory instead of allocating
-    # an additional full Q-table buffer each call. This significantly reduces GPU peak memory.
     run_episode_batch = jax.jit(
         run_episode_batch,
         static_argnums=(13,),      # max_steps must be static for jnp.arange
-        donate_argnums=(1,),       # donate q_table
     )
     
     # JIT-compiled function to sample starts and pickups
@@ -1497,4 +1494,3 @@ def evaluate_q_agent(
         'steps': total_steps,
         'completions': completions,
     }
-

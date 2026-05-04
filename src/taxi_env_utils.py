@@ -204,7 +204,8 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
                     G, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(
                         place_name=args.place_name, 
                         zone_shp=args.zone_shp, 
-                        no_congestion=args.no_congestion
+                        no_congestion=args.no_congestion,
+                        manhattan_area=getattr(args, 'manhattan_area', 'south_manhattan'),
                     )
                 else:
                     # Get zone_name_to_locationID from cache or reload if needed
@@ -214,7 +215,8 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
                         _, _, _, _, zone_name_to_locationID = load_graph(
                             place_name=args.place_name, 
                             zone_shp=args.zone_shp, 
-                            no_congestion=args.no_congestion
+                            no_congestion=args.no_congestion,
+                            manhattan_area=getattr(args, 'manhattan_area', 'south_manhattan'),
                         )
                 
                 start_zones = getattr(args, 'start_zones', None)
@@ -269,7 +271,8 @@ def load_or_build_graph(args, cache_file="manhattan_graph.pkl"):
             _, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(
                 place_name=args.place_name,
                 zone_shp=args.zone_shp,
-                no_congestion=args.no_congestion
+                no_congestion=args.no_congestion,
+                manhattan_area=getattr(args, 'manhattan_area', 'south_manhattan'),
             )
         
         # Cache graph
@@ -303,7 +306,12 @@ def build_env(args):
     """
     if args.env_type == 'manhattan':
         # --- Load and preprocess Manhattan graph ---
-        G, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(place_name = args.place_name, zone_shp = args.zone_shp, no_congestion= args.no_congestion)
+        G, nodes_gdf, node_to_zone, zone_to_nodes, zone_name_to_locationID = load_graph(
+            place_name=args.place_name,
+            zone_shp=args.zone_shp,
+            no_congestion=args.no_congestion,
+            manhattan_area=getattr(args, 'manhattan_area', 'south_manhattan'),
+        )
 
         seed = getattr(args, 'seed', None)
         start_zones = getattr(args, 'start_zones', None)

@@ -1,7 +1,10 @@
 import jax
 import jax.numpy as jnp
 from jax import random as jax_random, vmap
+import json
 import os
+import subprocess
+import sys
 import time
 import threading
 
@@ -13,16 +16,68 @@ from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn, load_or_compu
 from taxi_env import TaxiEnv, init_env
 from utils import EstimateReturnsState, load_graph
 from modes.context import RunContext
-from modes.eval_only import run_eval_only
-from modes.train_dqn import run_dqn
-from modes.train_mcts import run_mcts
-from modes.train_ppo import run_ppo
-from modes.train_q_learning import run_q_learning
 
 import argparse
 
 # Thread-safe caching
 _cache_lock = threading.Lock()
+
+
+def _json_safe(value):
+    """Convert small runtime metadata values into JSON-serializable objects."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return str(value)
+
+
+def _git_value(*args):
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=os.getcwd(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return None
+
+
+def print_run_trace(args):
+    """Print the effective runtime configuration into the redirected training log."""
+    git_status = _git_value("status", "--short")
+    metadata = {
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "git_commit": _git_value("rev-parse", "HEAD"),
+        "git_dirty": bool(git_status),
+        "git_status_short": git_status,
+        "python_executable": sys.executable,
+        "jax_version": jax.__version__,
+        "jax_backend": jax.default_backend(),
+        "jax_devices": [str(device) for device in jax.devices()],
+        "environment": {
+            key: os.environ.get(key)
+            for key in [
+                "CONDA_DEFAULT_ENV",
+                "JAX_PLATFORMS",
+                "JAX_ENABLE_X64",
+                "JAX_COMPILATION_CACHE_DIR",
+                "JAX_COMPILATION_CACHE_BASE",
+                "WANDB_MODE",
+                "WANDB_PROJECT",
+            ]
+        },
+        "args": vars(args),
+    }
+    print("=== Run Trace ===")
+    print(json.dumps(_json_safe(metadata), indent=2, sort_keys=True))
+    print("=== End Run Trace ===")
 
 
 def optimize_jax_config():
@@ -75,7 +130,7 @@ def optimize_jax_config():
     
     # print(f"JAX optimized: cache_dir={cache_dir}, float32=True, compilation_cache=True, platforms={platforms}")
 
-parser = argparse.ArgumentParser(description="Highly Optimized Ride-sharing Simulator")
+parser = argparse.ArgumentParser(description="Discrete tabular Q-learning ride-sharing simulator")
 parser.add_argument("--env_type", type=str, choices=["manhattan", "simple"], default="manhattan", help="Type of environment to use")
 parser.add_argument("--num_layers", type=int, default=4, help="Number of layers in the customised grid environment")
 parser.add_argument("--layer_width", type=int, default=3, help="Width of each layer in the customised grid environment")
@@ -87,6 +142,16 @@ parser.add_argument("--noise", action="store_true", help="Inject random congesti
 parser.add_argument("--noise_level", type=float, default=0.2, help="Noise magnitude: primary roads get U(1, 1+level), secondary get U(1, 1+1.5*level). Default 0.2")
 parser.add_argument("--place_name", type=str, default="Manhattan, New York City, New York, USA", help="Place name for the graph (used for Manhattan)")
 parser.add_argument("--zone_shp", type=str, default="../data/processed/taxi_zones.shp", help="Path to the shapefile for zones (used for Manhattan)")
+parser.add_argument(
+    "--manhattan_area",
+    nargs="+",
+    default=["south_manhattan"],
+    help=(
+        "Manhattan area preset or explicit zone names. Presets: south_manhattan, "
+        "small_manhattan_area, upper_east_side_small. For explicit zones, pass "
+        "quoted names, e.g. --manhattan_area 'Upper East Side North' 'Yorkville West'."
+    ),
+)
 parser.add_argument("--num_agents", type=int, default=1, help="Number of agents in the environment")
 parser.add_argument("--base_time", type=float, default=1.0, help="Base travel time for grid environment")
 parser.add_argument("--max_steps", type=int, default=300, help="Maximum number of steps per episode")
@@ -116,10 +181,9 @@ parser.add_argument(
     default=None,
     help="Path to a saved Q-table file to use for initialization (discrete mode only). The Q-table will be loaded to initialize the agent, but hyperparameters will be taken from current arguments.",
 )
-parser.add_argument("--pretrain_ckpt", type=str, default="pretrained_params.pkl", help="Checkpoint file for pretrained parameters")
-parser.add_argument("--model", type=str, default="ppo", choices=["dqn", "mcts", "ppo"])
-parser.add_argument("--config", "-c", type=str, default="config.json", help="Path to configuration file")
-parser.add_argument("--wandb_project", type=str, default="taxi-mcts", help="WandB project name")
+parser.add_argument("--pretrain_ckpt", type=str, default="pretrained_params.pkl", help=argparse.SUPPRESS)
+parser.add_argument("--config", "-c", type=str, default="config.json", help=argparse.SUPPRESS)
+parser.add_argument("--wandb_project", type=str, default="ride-sharing-q-learning", help="WandB project name")
 parser.add_argument("--use_untied", type=bool, default=True, help="untied heads for Q-network")
 parser.add_argument("--cache_dir", type=str, default="./cache", help="Directory for caching graph and distance data")
 parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for parallel distance computation")
@@ -156,6 +220,7 @@ parser.add_argument("--pretrain_learning_rate", type=float, default=None, help="
 parser.add_argument("--init_from_shortest_paths", action="store_true", help="Initialize Q-table from shortest path travel times (discrete mode only)")
 parser.add_argument("--init_all_time_slices", action="store_true", help="Initialize Q-table for all time slices (up to 100) instead of just time=0 (requires --init_from_shortest_paths)")
 parser.add_argument("--eval_only_sp", action="store_true", help="Run shortest-path baselines (continuous + discrete) and exit (discrete/Q-learning pipeline)")
+parser.add_argument("--eval_frequency", type=int, default=100, help="Q-learning evaluation frequency in episodes")
 parser.add_argument("--sample_starts_from_three_fixed", action="store_true", help="Sample starting nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Pickups still sampled from all nodes.")
 parser.add_argument("--sample_pickups_from_three_fixed", action="store_true", help="Sample pickup nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Starts sampled uniformly from all nodes.")
 parser.add_argument("--three_fixed_selection_method", type=str, default="random", choices=["random", "degree", "closeness", "betweenness"], help="Method to select the 3 fixed nodes: 'random' (default), 'degree' (degree centrality), 'closeness' (closeness centrality), 'betweenness' (betweenness centrality)")
@@ -200,6 +265,7 @@ if args.pickup_zones is not None:
 
 # Optimize JAX configuration
 optimize_jax_config()
+print_run_trace(args)
 
 # Create cache directory
 os.makedirs(args.cache_dir, exist_ok=True)
@@ -213,7 +279,7 @@ if args.params_dir is None:
         f"_cycle{args.cycle_length}"
         f"_epochs{args.epochs}"
         f"_agents{args.num_agents}"
-        f"_model{args.model}"
+        "_modelq_learning"
         ".pkl"
     )
 
@@ -318,7 +384,8 @@ def select_three_fixed_nodes(G, node_to_idx, args, node_to_zone=None, target="st
                     _, _, node_to_zone_temp, _, _ = load_graph(
                         place_name=args.place_name,
                         zone_shp=args.zone_shp,
-                        no_congestion=args.no_congestion
+                        no_congestion=args.no_congestion,
+                        manhattan_area=args.manhattan_area,
                     )
                     graph_nodes_set = set(all_nodes_list)
                     node_to_zone = {node: zone for node, zone in node_to_zone_temp.items() if node in graph_nodes_set}
@@ -559,23 +626,11 @@ ctx = RunContext(
     paths_dict=paths_dict,
 )
 if args.eval_only:
-    run_eval_only(args, ctx)
-    exit(0)
+    raise ValueError("This polished entrypoint only supports discrete Q-learning training. Use --eval_only_sp for the shortest-path baseline.")
 
-# Early-dispatch to modular training handlers
-else:
-    # If discrete mode is enabled, use Q-learning regardless of model selection
-    if args.discrete:
-        run_q_learning(args, ctx)
-        exit(0)
-    
-    # Otherwise, route to the selected model
-    if args.model == "dqn":
-        run_dqn(args, ctx)
-        exit(0)
-    elif args.model == "mcts":
-        run_mcts(args, ctx)
-        exit(0)
-    elif args.model == "ppo":
-        run_ppo(args, ctx)
-        exit(0)
+if not args.discrete:
+    raise ValueError("This polished entrypoint only supports the discrete tabular Q-learning pipeline. Pass --discrete.")
+
+from modes.train_q_learning import run_q_learning
+
+run_q_learning(args, ctx)

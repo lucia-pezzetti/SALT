@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import wandb
+import os
 
 from datetime import datetime
 
@@ -37,6 +38,9 @@ def run_q_learning(args, ctx: RunContext) -> None:
     
     print(f"Periodic evaluations during training will use {len(eval_starts)} combinations")
     print(f"Final evaluation will use {args.num_agents} agents with Hungarian matching (5×5 set combinations)")
+
+    fixed_starts_trace = np.array(ctx.env.fixed_starts).astype(int).tolist()
+    fixed_pickups_trace = np.array(ctx.env.fixed_pickups).astype(int).tolist()
 
     # Fast path: run only shortest-path baselines (continuous + discrete) and exit
     if getattr(args, "eval_only_sp", False):
@@ -198,36 +202,66 @@ def run_q_learning(args, ctx: RunContext) -> None:
         return
     
     # Initialize wandb
+    wandb_project = os.environ.get(
+        "WANDB_PROJECT",
+        getattr(args, "wandb_project", "ride-sharing-q-learning"),
+    )
     wandb.init(
-        project="ride-sharing-q-learning",
+        project=wandb_project,
         name=f"qlearning-{args.env_type}-{args.epochs}episodes-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         config={
+            "all_cli_args": dict(vars(args)),
+            "wandb_project": wandb_project,
             "env_type": args.env_type,
             "num_layers": args.num_layers,
             "layer_width": args.layer_width,
             "offset": args.offset,
+            "random_offsets": getattr(args, 'random_offsets', False),
+            "traffic_offset_seed": 42,
             "cycle_length": args.cycle_length,
             "no_congestion": args.no_congestion,
+            "noise": getattr(args, 'noise', False),
+            "noise_level": getattr(args, 'noise_level', 0.0),
             "place_name": args.place_name,
+            "zone_shp": getattr(args, 'zone_shp', None),
+            "manhattan_area": getattr(args, 'manhattan_area', None),
             "model": "q_learning",
             "discrete": True,
             "dt": getattr(args, 'dt', 1.0),
             "num_episodes": args.epochs,
             "num_agents": args.num_agents,
             "gamma": args.gamma,
+            "seed": args.seed,
             "num_nodes": ctx.env.num_nodes,
             "max_deg": ctx.env.max_deg,
             "max_steps": ctx.env.max_steps,
+            "max_training_steps_per_episode": 2 * ctx.max_length,
             "pickup_bonus": ctx.env.pickup_bonus,
             "timeout_penalty": ctx.env.timeout_penalty,
+            "sample_starts_from_three_fixed": getattr(args, 'sample_starts_from_three_fixed', False),
+            "sample_pickups_from_three_fixed": getattr(args, 'sample_pickups_from_three_fixed', False),
+            "three_fixed_selection_method": getattr(args, 'three_fixed_selection_method', None),
+            "fixed_starts_count": len(fixed_starts_trace),
+            "fixed_pickups_count": len(fixed_pickups_trace),
+            "fixed_starts": fixed_starts_trace,
+            "fixed_pickups_preview": fixed_pickups_trace[:50],
+            "fixed_pickups_is_truncated": len(fixed_pickups_trace) > 50,
             "eval_starts": eval_starts_list,
             "eval_pickups": eval_pickups_list,
             "eval_combinations": len(eval_starts),
+            "eval_frequency": getattr(args, 'eval_frequency', 100),
             "timestamp": datetime.now().isoformat(),
             "pretrain_enabled": getattr(args, 'pretrain_enabled', False),
             "num_pretrain_episodes": getattr(args, 'num_pretrain_episodes', 1000),
+            "pretrain_learning_rate": getattr(args, 'pretrain_learning_rate', None),
             "init_from_shortest_paths": getattr(args, 'init_from_shortest_paths', False),
             "init_all_time_slices": getattr(args, 'init_all_time_slices', False),
+            "init_q_table_path": getattr(args, 'init_q_table_path', None),
+            "q_table_path": getattr(args, 'q_table_path', None),
+            "q_table_dtype": getattr(args, 'q_table_dtype', 'float32'),
+            "learning_rate": 0.1,
+            "initial_q_value": 0.0,
+            "no_round_trip": getattr(args, 'no_round_trip', False),
             "epsilon_start": getattr(args, 'epsilon_start', 1.0),
             "epsilon_end": getattr(args, 'epsilon_end', 0.01),
             "epsilon_decay_fraction": getattr(args, 'epsilon_decay_fraction', 0.5),
@@ -303,7 +337,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         epsilon_start=epsilon_start,
         epsilon_end=epsilon_end,
         epsilon_decay_steps=epsilon_decay_steps,
-        eval_frequency=100,
+        eval_frequency=getattr(args, 'eval_frequency', 100),
         eval_starts=eval_starts,
         eval_pickups=eval_pickups,
         seed=args.seed,
@@ -1189,4 +1223,3 @@ def run_q_learning(args, ctx: RunContext) -> None:
     print("\n" + "="*60)
     print("Q-learning training completed!")
     print("="*60)
-

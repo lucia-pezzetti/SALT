@@ -4,8 +4,9 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 from shapely.geometry import Point
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple, Union
 import random
+import ast
 
 import jax
 from jax import numpy as jnp
@@ -14,8 +15,93 @@ from flax import struct
 
 from taxi_env import TaxiEnv
 
+SOUTH_MANHATTAN_ZONES = [
+    "Alphabet City",
+    "Battery Park",
+    "Battery Park City",
+    "Chinatown",
+    "Clinton East",
+    "Clinton West",
+    "East Chelsea",
+    "East Village",
+    "Financial District North",
+    "Financial District South",
+    "Flatiron",
+    "Garment District",
+    "Gramercy",
+    "Greenwich Village North",
+    "Greenwich Village South",
+    "Hudson Sq",
+    "Kips Bay",
+    "Little Italy/NoLiTa",
+    "Lower East Side",
+    "Meatpacking/West Village West",
+    "Midtown Center",
+    "Midtown East",
+    "Midtown North",
+    "Midtown South",
+    "Murray Hill",
+    "Penn Station/Madison Sq West",
+    "Seaport",
+    "SoHo",
+    "Stuy Town/Peter Cooper Village",
+    "Sutton Place/Turtle Bay North",
+    "Times Sq/Theatre District",
+    "TriBeCa/Civic Center",
+    "Two Bridges/Seward Park",
+    "UN/Turtle Bay South",
+    "Union Sq",
+    "West Chelsea/Hudson Yards",
+    "West Village",
+    "World Trade Center",
+]
+
+SMALL_MANHATTAN_AREA_ZONES = [
+    "Upper East Side North",
+    "Yorkville West",
+    "Upper East Side South",
+    "Lenox Hill West",
+]
+
+MANHATTAN_AREA_PRESETS = {
+    "south_manhattan": SOUTH_MANHATTAN_ZONES,
+    "small_manhattan_area": SMALL_MANHATTAN_AREA_ZONES,
+    "upper_east_side_small": SMALL_MANHATTAN_AREA_ZONES,
+}
+
+
+def resolve_manhattan_zones(
+    manhattan_area: Union[str, Sequence[str], None] = "south_manhattan",
+) -> List[str]:
+    """Resolve a Manhattan area preset or explicit zone-name list."""
+    if manhattan_area is None:
+        return list(SOUTH_MANHATTAN_ZONES)
+
+    if isinstance(manhattan_area, str):
+        area = manhattan_area.strip()
+        if area in MANHATTAN_AREA_PRESETS:
+            return list(MANHATTAN_AREA_PRESETS[area])
+        if area.startswith("["):
+            parsed = ast.literal_eval(area)
+            if not isinstance(parsed, list) or not all(isinstance(z, str) for z in parsed):
+                raise ValueError("--manhattan_area list syntax must contain only zone-name strings")
+            return parsed
+        return [area]
+
+    area_tokens = list(manhattan_area)
+    if len(area_tokens) == 1:
+        return resolve_manhattan_zones(area_tokens[0])
+    return [str(zone) for zone in area_tokens]
+
+
 # Load and preprocess graph
-def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_congestion: bool = False) -> nx.DiGraph:
+def load_graph(
+    place_name: str,
+    zone_shp: str,
+    network_type: str = "drive",
+    no_congestion: bool = False,
+    manhattan_area: Union[str, Sequence[str], None] = "south_manhattan",
+) -> nx.DiGraph:
     """
     Download and preprocess the OSMnx graph for a place, keeping only the largest strongly-connected component and adding 'congested_time'. Removes self-loops from the graph.
     """
@@ -54,14 +140,14 @@ def load_graph(place_name: str, zone_shp: str, network_type: str = "drive", no_c
 
     # Map zones to nodes, then filter
     locationID_to_nodes, zone_to_nodes, node_to_zone, nodes_gdf, zone_name_to_locationID = compute_zone_mappings(G_scc, zone_shp_path=zone_shp)
-    zone_names = ["Alphabet City", "Battery Park", "Battery Park City", "Chinatown", "Clinton East", "Clinton West", "East Chelsea", "East Village", "Financial District North", "Financial District South", "Flatiron", "Garment District", "Gramercy", "Greenwich Village North", "Greenwich Village South", "Hudson Sq", "Kips Bay", "Little Italy/NoLiTa", "Lower East Side", "Meatpacking/West Village West", "Midtown Center" , "Midtown East", "Midtown North", "Midtown South","Murray Hill", "Penn Station/Madison Sq West", "Seaport", "SoHo", "Stuy Town/Peter Cooper Village", "Sutton Place/Turtle Bay North", "Times Sq/Theatre District", "TriBeCa/Civic Center", "Two Bridges/Seward Park", "UN/Turtle Bay South", "Union Sq", "West Chelsea/Hudson Yards", "West Village", "World Trade Center"]
-    # zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West"] 
-    # zone_names = ["Upper East Side North", "Yorkville West", "Upper East Side South", "Lenox Hill West", "Lenox Hill East", "Yorkville East", "East Harlem South", "East Harlem North"] #, "Central Harlem", "Central Harlem North", "Manhattanville", "Hamlton Heights", "Morningside Heights", "Sutton Place/Turtle Bay North", "Manhattan Valley", "Upper West Side North", "Lincoln Square Easr", "Lincoln Square West", "Clinton East", "Clinton West", "Central Park", "Bloomingdale", "Upper West Side South", "Sutton Place/Turtle Bay South", "Midtown East", "Midtown North", "Midtown Center"]   
+    zone_names = resolve_manhattan_zones(manhattan_area)
     gdf_zones = gpd.read_file(zone_shp).to_crs("EPSG:4326") 
     filtered_zones = gdf_zones[gdf_zones["zone"].isin(zone_names)]
+    missing_zones = sorted(set(zone_names) - set(filtered_zones["zone"].tolist()))
+    if missing_zones:
+        raise ValueError(f"Unknown Manhattan zone name(s): {missing_zones}")
+    print(f"Using Manhattan area zones ({len(zone_names)}): {zone_names}")
     loc_ids = filtered_zones["LocationID"].tolist()
-    # Use regular print instead of jax.debug.print to avoid CPU backend requirement
-    # print(f"Selected location IDs: {loc_ids}")
     selected_nodes = [n for loc_id in loc_ids for n in zone_to_nodes.get(loc_id, [])]
     G_scc = G_scc.subgraph(selected_nodes).copy()
 
@@ -231,7 +317,8 @@ def full_setup(place_name: str,
                rides_csv: str,
                lookup_csv: str,
                zone_shp: str,
-               target_date: pd.Timestamp):
+               target_date: pd.Timestamp,
+               manhattan_area: Union[str, Sequence[str], None] = "south_manhattan"):
     """
     Convenience wrapper that returns:
       G_scc,
@@ -242,9 +329,13 @@ def full_setup(place_name: str,
       pickup_dist,
       cond_dest_dist
     """
-    G_scc = load_graph(place_name)
+    G_scc, nodes_gdf, n2z, z2n, _ = load_graph(
+        place_name=place_name,
+        zone_shp=zone_shp,
+        manhattan_area=manhattan_area,
+    )
     filtered = load_taxi_data(rides_csv, lookup_csv, target_date)
-    lid2n, z2n, n2z, nodes_gdf = compute_zone_mappings(G_scc, zone_shp)
+    lid2n, _, _, _, _ = compute_zone_mappings(G_scc, zone_shp)
     apply_congestion_model(G_scc)
     pu_dist, cd_dist = compute_distributions(filtered)
     return G_scc, lid2n, z2n, n2z, nodes_gdf, filtered, pu_dist, cd_dist
@@ -369,30 +460,13 @@ def fixed_starts_pickups(G: nx.DiGraph,
             fixed_pickups_idx = list(range(len(all_nodes)))
             print(f"Using all {len(fixed_pickups_idx)} nodes for pickups")
         
-        # Use regular print instead of jax.debug.print to avoid CPU backend requirement
-        # print(f"Fixed starts: {fixed_starts_idx}, fixed pickups: {fixed_pickups_idx}")
-        
         return fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node
-
-    # # Set seed if provided
-    # if seed is not None:
-    #     random.seed(seed)
-
-    # num_to_sample = 1
-    # sampled_indices_starts = random.sample(range(len(all_nodes)), num_to_sample)
-    # sampled_indices_pickups = random.sample(range(len(all_nodes)), num_to_sample)
-    # fixed_starts = [all_nodes[idx] for idx in sampled_indices_starts]
-    # fixed_pickups = [all_nodes[idx] for idx in sampled_indices_pickups]
-    # fixed_starts_idx = [node_to_idx[int(n)] for n in fixed_starts if int(n) in node_to_idx]
-    # fixed_pickups_idx = [node_to_idx[int(n)] for n in fixed_pickups if int(n) in node_to_idx]
 
     # Choose fixed start & pickup sets (here: all nodes)
     if all:
         fixed_starts_idx = list(range(len(all_nodes)))
         fixed_pickups_idx = list(range(len(all_nodes)))
     else:
-        # Filter zone_to_nodes to only include nodes that are actually in the graph
-        # (some nodes may have been pruned during graph construction)
         graph_nodes_set = set(all_nodes)
         filtered_zone_to_nodes = {
             loc_id: [n for n in nodes if n in graph_nodes_set]
@@ -411,7 +485,6 @@ def fixed_starts_pickups(G: nx.DiGraph,
                 continue
             if len(nodes) < 2:
                 # If zone has only 1 node after filtering, use it for both start and pickup
-                # (they'll be the same, but that's acceptable)
                 node = nodes[0]
                 starts.append(node)
                 pickups.append(node)
@@ -440,9 +513,6 @@ def fixed_starts_pickups(G: nx.DiGraph,
             min_len = min(len(fixed_starts_idx), len(fixed_pickups_idx))
             fixed_starts_idx = fixed_starts_idx[:min_len]
             fixed_pickups_idx = fixed_pickups_idx[:min_len]
-
-        # Use regular print instead of jax.debug.print to avoid CPU backend requirement
-        # print(f"Fixed starts: {fixed_starts_idx}, fixed pickups: {fixed_pickups_idx}")
 
     return fixed_starts_idx, fixed_pickups_idx, node_to_idx, idx_to_node
 
@@ -559,7 +629,6 @@ def estimate_returns(
     # Use pre-computed discounts
     discounts = estimate_state.discounts
     
-    # Rest of the function remains the same...
     grid_s, grid_p = jnp.meshgrid(starts, pickups, indexing="ij")
     s_rep = grid_s.ravel()
     p_rep = grid_p.ravel()
@@ -572,8 +641,6 @@ def estimate_returns(
         t, discount = t_and_discount
         st, acc = carry
         obs = obs_fn_batch(st)
-        # q = model.apply(params, obs['state_feats'], obs['action_feats'], 
-        #                st.neighbor_mask, obs['global_feats'])
         q = model.apply(params, obs, st.neighbor_mask)
         act = jnp.argmax(q, axis=-1)
         nxt, r, _, _ = env.step(st, act)
@@ -614,11 +681,10 @@ def offline_shortest_path_action(current_node, target_node, adj_list, travel_tim
     
     # Local travel time + remaining distance to target
     total_costs = neighbor_travel_times + distances[neighbors, target_node]
-    # Mask invalid neighbors using provided neighbor_mask
     total_costs = jnp.where(neighbor_mask, total_costs, jnp.inf)
     return jnp.argmin(total_costs)
 
-# Discrete shortest path actions (with epsilon for zero-time edges to break ties)
+# Discrete shortest path actions
 @jax.jit
 def offline_shortest_path_action_discrete(current_node, target_node, adj_list, travel_times, distances, neighbor_mask, epsilon=1e-6):
     """
@@ -641,7 +707,6 @@ def offline_shortest_path_action_discrete(current_node, target_node, adj_list, t
     neighbor_travel_times = travel_times[current_node]
     
     # Add epsilon to zero-time edges to break ties
-    # This prevents infinite loops when zero-cost edges exist
     neighbor_travel_times = jnp.where(
         neighbor_travel_times == 0.0,
         epsilon,
