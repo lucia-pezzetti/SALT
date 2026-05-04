@@ -8,11 +8,11 @@ cd "$SCRIPT_DIR"
 # Base cache directory - each process will get its own subdirectory
 export JAX_COMPILATION_CACHE_BASE=/tmp/jax_cache_parallel
 
-# CPU platform selection for the discrete Q-learning run.
+# NVIDIA GPU platform selection for the discrete Q-learning run.
 export JAX_ENABLE_X64=False
 export JAX_ENABLE_COMPILATION_CACHE=True
 export JAX_COMPILATION_CACHE_SIZE=1000
-export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+export JAX_PLATFORMS="${JAX_PLATFORMS:-cuda}"
 export ENABLE_PJRT_COMPATIBILITY="${ENABLE_PJRT_COMPATIBILITY:-1}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER}}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/${USER}-cache}"
@@ -39,7 +39,7 @@ echo "MPLCONFIGDIR: $MPLCONFIGDIR"
 
 # Activate Python environment
 CONDA_EXE="${CONDA_EXE:-/opt/anaconda3/bin/conda}"
-CONDA_ENV="${CONDA_ENV:-ride-sharing2}"
+CONDA_ENV="${CONDA_ENV:-ride-sharing}"
 if [ ! -x "$CONDA_EXE" ]; then
     echo "Could not find conda at $CONDA_EXE"
     echo "   Set CONDA_EXE=/path/to/conda or update run_main.sh."
@@ -57,13 +57,27 @@ import os
 import jax
 backend = jax.default_backend()
 devices = jax.devices()
+device_platforms = sorted({getattr(device, "platform", "unknown") for device in devices})
+requested_platforms = [
+    p.strip().lower()
+    for p in os.environ.get("JAX_PLATFORMS", "").split(",")
+    if p.strip()
+]
 print(f"JAX version: {jax.__version__}")
 print(f"JAX backend: {backend}")
 print(f"JAX devices: {devices}")
+print(f"JAX device platforms: {device_platforms}")
+if any(p in {"cuda", "gpu"} for p in requested_platforms):
+    if not any(p in {"cuda", "gpu"} for p in device_platforms) and backend.lower() not in {"cuda", "gpu"}:
+        raise SystemExit(
+            "Expected an NVIDIA CUDA JAX backend, but JAX did not expose a CUDA/GPU device. "
+            "Install the CUDA-enabled JAX package and check that the NVIDIA driver is visible. "
+            "For CPU fallback, run: JAX_PLATFORMS=cpu bash src/run_main.sh"
+        )
 if os.environ.get("CONDA_DEFAULT_ENV") == "ride-sharing-metal" and "metal" not in backend.lower():
     raise SystemExit(
         "Expected the JAX Metal GPU backend. "
-        "Use CONDA_ENV=ride-sharing2 JAX_PLATFORMS=cpu for CPU fallback."
+        "Use CONDA_ENV=ride-sharing JAX_PLATFORMS=cpu for CPU fallback."
     )
 PY
 

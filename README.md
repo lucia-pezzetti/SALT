@@ -10,8 +10,8 @@ git clone https://github.com/lucia-pezzetti/ride-sharing-simulator.git
 cd ride-sharing-simulator
 ```
 
-### 2. Run the setup script
-To install the required dependencies and automatically download and convert the data:
+### 2. Create the environment
+To install the required dependencies for an NVIDIA GPU machine:
 
 ```bash
 conda create -n ride-sharing python=3.10
@@ -30,13 +30,21 @@ The full TLC dataset is publicly available at [NYC TLC Trip Data](https://www.ny
 
 ## Code Pipeline
 
-The current repository implement the Manhattan discrete tabular Q-learning pipeline used for the experiments in the paper. The canonical launcher is:
+The current repository implements the Manhattan discrete tabular Q-learning pipeline used for the experiments in the paper. The canonical launcher is:
 
 ```bash
 bash src/run_main.sh
 ```
 
 The launcher activates the Conda environment configured by `CONDA_ENV` (default: `ride-sharing`), and runs `main.py` with the discrete Q-learning flags used for the experiment.
+
+By default, the launcher expects an NVIDIA CUDA backend through JAX:
+
+```bash
+JAX_PLATFORMS=cuda
+```
+
+If CUDA is not visible to JAX, the script exits before training starts. For a CPU-only fallback, override the platform explicitly:
 
 Useful overrides:
 
@@ -57,7 +65,7 @@ Available presets:
 --manhattan_area small_manhattan_area
 ```
 
-`small_manhattan_area` select:
+`small_manhattan_area` selects:
 
 ```text
 Upper East Side North
@@ -70,4 +78,4 @@ You can also pass explicit zone names:
 
 ```bash
 python src/main.py --discrete --manhattan_area "Upper East Side North" "Yorkville West" "Upper East Side South" "Lenox Hill West"
-``
+```
