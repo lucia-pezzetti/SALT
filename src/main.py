@@ -53,11 +53,11 @@ def print_run_trace(args):
     git_status = _git_value("status", "--short")
     metadata = {
         "argv": sys.argv,
-        "cwd": os.getcwd(),
+        "working_directory": os.path.basename(os.getcwd()),
         "git_commit": _git_value("rev-parse", "HEAD"),
         "git_dirty": bool(git_status),
         "git_status_short": git_status,
-        "python_executable": sys.executable,
+        "python_version": sys.version.split()[0],
         "jax_version": jax.__version__,
         "jax_backend": jax.default_backend(),
         "jax_devices": [str(device) for device in jax.devices()],

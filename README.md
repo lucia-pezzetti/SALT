@@ -6,7 +6,7 @@ This repository contains the code for the paper [A Separation Principle for Mult
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/lucia-pezzetti/ride-sharing-simulator.git
+git clone <repository-url>
 cd ride-sharing-simulator
 ```
 

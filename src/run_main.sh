@@ -14,14 +14,14 @@ export JAX_ENABLE_COMPILATION_CACHE=True
 export JAX_COMPILATION_CACHE_SIZE=1000
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cuda}"
 export ENABLE_PJRT_COMPATIBILITY="${ENABLE_PJRT_COMPATIBILITY:-1}"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER}}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/${USER}-cache}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/ride-sharing-matplotlib}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/ride-sharing-cache}"
 
 # Weights & Biases configuration
 export WANDB_PROJECT="${WANDB_PROJECT:-ride-sharing-optimized}"
 export WANDB_MODE="${WANDB_MODE:-online}"  # Use "offline" or "disabled" without internet.
-export WANDB_DIR="${WANDB_DIR:-/tmp/wandb-${USER}}"
-export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-/tmp/wandb-cache-${USER}}"
+export WANDB_DIR="${WANDB_DIR:-/tmp/ride-sharing-wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-/tmp/ride-sharing-wandb-cache}"
 
 # Create base cache directory
 mkdir -p $JAX_COMPILATION_CACHE_BASE
@@ -38,10 +38,10 @@ echo "WANDB_DIR: $WANDB_DIR"
 echo "MPLCONFIGDIR: $MPLCONFIGDIR"
 
 # Activate Python environment
-CONDA_EXE="${CONDA_EXE:-/opt/anaconda3/bin/conda}"
+CONDA_EXE="${CONDA_EXE:-$(command -v conda || true)}"
 CONDA_ENV="${CONDA_ENV:-ride-sharing}"
 if [ ! -x "$CONDA_EXE" ]; then
-    echo "Could not find conda at $CONDA_EXE"
+    echo "Could not find conda."
     echo "   Set CONDA_EXE=/path/to/conda or update run_main.sh."
     exit 1
 fi
@@ -124,7 +124,7 @@ for SEED in "${SEEDS[@]}"; do
     if JAX_COMPILATION_CACHE_DIR="${JAX_CACHE_DIR}" \
     python main.py \
         --env_type manhattan \
-        --zone_shp ../../Ride-sharing-Simulator/data/processed/taxi_zones.shp \
+        --zone_shp "${ZONE_SHP:-../data/processed/taxi_zones.shp}" \
         --manhattan_area south_manhattan \
         --discrete \
         --dt 1.0 \
