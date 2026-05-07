@@ -1,5 +1,5 @@
-# A Separation Principle for Multi-Agent Reinforcement Learning
-This repository contains the code for the paper [A Separation Principle for Multi-Agent Reinforcement Learning]().
+# Manhattan experiments
+This repository contains the code for the south manhattan experiments of the paper `A Separation Principle for Multi-Agent Reinforcement Learning`.
 
 ## Quickstart
 
@@ -26,7 +26,12 @@ conda activate ride-sharing
 ```
 
 ## Dataset
-The full TLC dataset is publicly available at [NYC TLC Trip Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
+The default Manhattan Q-learning run uses:
+
+- NYC TLC taxi zone shapefile, expected at `data/processed/taxi_zones.shp`
+- OpenStreetMap Manhattan road network, downloaded automatically with OSMnx
+
+The full TLC data source is [NYC TLC Trip Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
 
 ## Code Pipeline
 
@@ -79,3 +84,33 @@ You can also pass explicit zone names:
 ```bash
 python src/main.py --discrete --manhattan_area "Upper East Side North" "Yorkville West" "Upper East Side South" "Lenox Hill West"
 ```
+
+
+### NYC TLC / NYC Open Data
+
+The Manhattan experiments use the NYC Taxi & Limousine Commission taxi zone shapefile, expected at:
+
+```text
+data/processed/taxi_zones.shp
+```
+
+Source pages:
+
+- [NYC TLC Trip Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)
+- [NYC Taxi Zones on NYC Open Data](https://data.cityofnewyork.us/Transportation/NYC-Taxi-Zones/8meu-9t5y)
+- [NYC Open Data FAQ](https://opendata.cityofnewyork.us/faq/)
+
+NYC Open Data datasets are made available for public use, but they are provided as-is and without warranties as to accuracy, completeness, or fitness for a particular use. Users should consult the current NYC Open Data and TLC source pages for the authoritative terms, metadata, and documentation.
+
+### OpenStreetMap road network
+
+The Manhattan road network is downloaded automatically with OSMnx from OpenStreetMap.
+
+OpenStreetMap data is © OpenStreetMap contributors and is available under the Open Data Commons Open Database License, ODbL.
+
+Source pages:
+
+- [OpenStreetMap Copyright and License](https://www.openstreetmap.org/copyright)
+- [OpenStreetMap Foundation Attribution Guidelines](https://osmfoundation.org/wiki/Licence/Attribution_Guidelines)
+
+Any public outputs that use OpenStreetMap data should provide appropriate OpenStreetMap attribution. If this project distributes modified or derived OpenStreetMap databases, those outputs may also need to be distributed under the ODbL.
