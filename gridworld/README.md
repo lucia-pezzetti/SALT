@@ -1,6 +1,6 @@
 # Grid-world experiments
 
-Official implementation for the accompanying anonymous paper submission.
+This repository contains the code for the grid-world experiments of the paper `A Separation Principle for Multi-Agent Reinforcement Learning`.
 
 ## Requirements
 
