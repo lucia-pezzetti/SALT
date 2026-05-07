@@ -1,4 +1,4 @@
-# Separation Principle MARL under Action Noise
+# Grid-world experiments
 
 Official implementation for the accompanying anonymous paper submission.
 
