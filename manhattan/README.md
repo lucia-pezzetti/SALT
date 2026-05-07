@@ -1,5 +1,5 @@
 # Manhattan experiments
-This repository contains the code for the south manhattan experiments of the paper `A Separation Principle for Multi-Agent Reinforcement Learning`.
+This repository contains the code for the south manhattan experiments of the paper **A Separation Principle for Multi-Agent Reinforcement Learning**.
 
 ## Quickstart
 
