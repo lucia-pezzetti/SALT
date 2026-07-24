@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .env import GridConfig, ACTIONS, Pos
+from .env import GridConfig, ACTIONS, Pos, target_col_lo
 from .noise import NoiseConfig
 from .matching import terminal_ot_cost, target_coverage_rate
 
@@ -208,7 +208,7 @@ def train_qmix(
         pos_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         pos_c = np.zeros((E, N), dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=(E, M)).astype(np.int32)
-        col_lo = max(0, grid.w // 2)
+        col_lo = target_col_lo(grid)
         tgt_c = rng.integers(col_lo, grid.w, size=(E, M)).astype(np.int32)
         reached = np.zeros((E, N), dtype=bool)
         tgt_active = np.ones((E, M), dtype=bool)

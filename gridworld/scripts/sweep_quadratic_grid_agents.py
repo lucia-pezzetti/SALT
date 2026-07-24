@@ -116,10 +116,20 @@ def main() -> None:
     )
     ap.add_argument("--sep_ppo_batch_eps", type=int, default=64)
     ap.add_argument("--mappo_batch_eps", type=int, default=64)
+    ap.add_argument("--mappo", dest="run_mappo", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Train/evaluate MAPPO in each run (default on; --no-mappo skips it, "
+                         "e.g. to sweep only Sep-PPO vs MFQ vs MFQ-local).")
+    ap.add_argument(
+        "--run_mfq",
+        action="store_true",
+        help="Also train/evaluate the Mean-Field Q-learning (MFQ) baseline in each run.",
+    )
+    ap.add_argument("--mfq_batch_eps", type=int, default=64)
     ap.add_argument(
         "--sep_ppo_early_stop_patience",
         type=int,
-        default=20,
+        default=40,
         help="Forwarded early-stop patience for Sep-PPO (0 disables).",
     )
     ap.add_argument(
@@ -131,7 +141,7 @@ def main() -> None:
     ap.add_argument(
         "--sep_ppo_early_stop_plateau_window",
         type=int,
-        default=20,
+        default=40,
         help="Forwarded plateau window (batches) for Sep-PPO hybrid early stop.",
     )
     ap.add_argument(
@@ -149,7 +159,7 @@ def main() -> None:
     ap.add_argument(
         "--mappo_early_stop_patience",
         type=int,
-        default=20,
+        default=40,
         help="Forwarded early-stop patience for MAPPO (0 disables).",
     )
     ap.add_argument(
@@ -161,21 +171,101 @@ def main() -> None:
     ap.add_argument(
         "--mappo_early_stop_plateau_window",
         type=int,
-        default=20,
+        default=40,
         help="Forwarded plateau window (batches) for MAPPO hybrid early stop.",
     )
     ap.add_argument(
         "--mappo_early_stop_max_delta_reach",
         type=float,
-        default=0.005,
+        default=0.05,
         help="Forwarded max reach-rate moving-average delta for MAPPO plateau.",
     )
     ap.add_argument(
         "--mappo_early_stop_max_delta_reward",
         type=float,
-        default=0.10,
+        default=0.25,
         help="Forwarded max mean-reward moving-average delta for MAPPO plateau.",
     )
+    ap.add_argument(
+        "--early_stop_reach_target",
+        type=float,
+        default=0.99,
+        help="Stop a method once training reach rate is sustained >= this target "
+             "(applies to MAPPO, Sep-PPO, MFQ). 0 disables. Safe: only fires at target.",
+    )
+    ap.add_argument(
+        "--early_stop_min_reach",
+        type=float,
+        default=0.5,
+        help="MFQ / MFQ-local plateau stop only fires once the reach-rate moving "
+             "average is >= this floor, so it can't false-stop during early low-reach "
+             "exploration. 0 disables the guard.",
+    )
+    ap.add_argument(
+        "--mfq_early_stop_patience",
+        type=int,
+        default=40,
+        help="MFQ plateau early-stop patience in batches (0 disables the plateau stop).",
+    )
+    ap.add_argument(
+        "--mfq_early_stop_plateau_window",
+        type=int,
+        default=40,
+        help="MFQ plateau/target window in batches.",
+    )
+    ap.add_argument(
+        "--mfq_early_stop_max_delta_reach",
+        type=float,
+        default=0.05,
+        help="MFQ max reach-rate moving-average delta for the plateau stop.",
+    )
+    ap.add_argument(
+        "--mfq_early_stop_max_delta_reward",
+        type=float,
+        default=0.1,
+        help="MFQ max mean-reward moving-average delta for the plateau stop "
+             "(<=0 uses a reach-rate-only plateau, robust to reward scale).",
+    )
+    ap.add_argument(
+        "--mfq_explore_decay_cap_batches",
+        type=int,
+        default=5000,
+        help="Decay the MFQ tau/eps exploration schedule to its floor over this many "
+             "batches (default 5000), so scalability runs share the same schedule "
+             "regardless of the (interaction-matched) budget. 0 = full budget.",
+    )
+    ap.add_argument(
+        "--run_mfq_local",
+        action="store_true",
+        help="Also train/evaluate the faithful MFQ-local baseline (N-independent "
+             "density-map obs + local mean field) in each run.",
+    )
+    ap.add_argument("--mfq_local_batch_eps", type=int, default=64)
+    ap.add_argument("--mfq_local_obs_mode", type=str, default="fov",
+                    choices=["density_map", "fov"],
+                    help="MFQ-local target encoding: 'density_map' (K*K histogram) or "
+                         "'fov' ((2R+1)^2 presence window). Both N-independent.")
+    ap.add_argument("--mfq_local_density_bins", type=int, default=5,
+                    help="MFQ-local density_map resolution K (obs_dim = 5 + K*K).")
+    ap.add_argument("--mfq_local_fov_radius", type=int, default=3,
+                    help="MFQ-local fov window half-width R (obs_dim = 5 + (2R+1)^2).")
+    ap.add_argument("--mfq_local_mf_radius", type=int, default=3,
+                    help="MFQ-local mean-field neighbourhood radius (Chebyshev, grid cells).")
+    # Defaults mirror --mfq_* so MFQ-local stops on plateau like the other
+    # baselines instead of grinding the full interaction budget (a plateau below
+    # the 0.99 target would otherwise never early-stop).
+    ap.add_argument("--mfq_local_early_stop_patience", type=int, default=40,
+                    help="MFQ-local plateau early-stop patience in batches (0 disables).")
+    ap.add_argument("--mfq_local_early_stop_plateau_window", type=int, default=40,
+                    help="MFQ-local plateau/target window in batches.")
+    ap.add_argument("--mfq_local_early_stop_max_delta_reach", type=float, default=0.05,
+                    help="MFQ-local max reach-rate moving-average delta for the plateau stop.")
+    ap.add_argument("--mfq_local_early_stop_max_delta_reward", type=float, default=0.25,
+                    help="MFQ-local max mean-reward moving-average delta for the plateau stop "
+                         "(<=0 uses a reach-rate-only plateau, robust to reward scale).")
+    ap.add_argument("--mfq_local_explore_decay_cap_batches", type=int, default=5000,
+                    help="Decay the MFQ-local tau/eps exploration schedule to its floor over "
+                         "this many batches (default 5000). 0 = full budget.")
     ap.add_argument(
         "--reach_thresholds",
         type=str,
@@ -285,6 +375,12 @@ def main() -> None:
         mappo_batches, mappo_interactions = _batches_for_target_interactions(
             args.target_interactions, args.mappo_batch_eps, agents, horizon
         )
+        mfq_batches, mfq_interactions = _batches_for_target_interactions(
+            args.target_interactions, args.mfq_batch_eps, agents, horizon
+        )
+        mfq_local_batches, mfq_local_interactions = _batches_for_target_interactions(
+            args.target_interactions, args.mfq_local_batch_eps, agents, horizon
+        )
         cmd = [
             sys.executable,
             str(run_comparison),
@@ -312,6 +408,8 @@ def main() -> None:
             str(args.collision_penalty),
             "--eval_start_mode",
             "bottom_left",
+            # Drives both training and evaluation target sampling: the
+            # scalability experiment uses the whole grid.
             "--eval_target_region",
             "full_grid",
             "--outdir",
@@ -344,6 +442,10 @@ def main() -> None:
             str(args.mappo_early_stop_max_delta_reach),
             "--mappo_early_stop_max_delta_reward",
             str(args.mappo_early_stop_max_delta_reward),
+            "--early_stop_reach_target",
+            str(args.early_stop_reach_target),
+            "--early_stop_min_reach",
+            str(args.early_stop_min_reach),
             "--reach_thresholds",
             args.reach_thresholds,
             "--train_print_every_batches",
@@ -351,6 +453,56 @@ def main() -> None:
             "--stability_window",
             str(args.stability_window),
         ]
+        if args.run_mfq:
+            cmd.extend(
+                [
+                    "--run_mfq",
+                    "--mfq_batches",
+                    str(mfq_batches),
+                    "--mfq_batch_eps",
+                    str(args.mfq_batch_eps),
+                    "--mfq_early_stop_patience",
+                    str(args.mfq_early_stop_patience),
+                    "--mfq_early_stop_plateau_window",
+                    str(args.mfq_early_stop_plateau_window),
+                    "--mfq_early_stop_max_delta_reach",
+                    str(args.mfq_early_stop_max_delta_reach),
+                    "--mfq_early_stop_max_delta_reward",
+                    str(args.mfq_early_stop_max_delta_reward),
+                    "--mfq_explore_decay_cap_batches",
+                    str(args.mfq_explore_decay_cap_batches),
+                ]
+            )
+        if args.run_mfq_local:
+            cmd.extend(
+                [
+                    "--run_mfq_local",
+                    "--mfq_local_batches",
+                    str(mfq_local_batches),
+                    "--mfq_local_batch_eps",
+                    str(args.mfq_local_batch_eps),
+                    "--mfq_local_obs_mode",
+                    str(args.mfq_local_obs_mode),
+                    "--mfq_local_density_bins",
+                    str(args.mfq_local_density_bins),
+                    "--mfq_local_fov_radius",
+                    str(args.mfq_local_fov_radius),
+                    "--mfq_local_mf_radius",
+                    str(args.mfq_local_mf_radius),
+                    "--mfq_local_early_stop_patience",
+                    str(args.mfq_local_early_stop_patience),
+                    "--mfq_local_early_stop_plateau_window",
+                    str(args.mfq_local_early_stop_plateau_window),
+                    "--mfq_local_early_stop_max_delta_reach",
+                    str(args.mfq_local_early_stop_max_delta_reach),
+                    "--mfq_local_early_stop_max_delta_reward",
+                    str(args.mfq_local_early_stop_max_delta_reward),
+                    "--mfq_local_explore_decay_cap_batches",
+                    str(args.mfq_local_explore_decay_cap_batches),
+                ]
+            )
+        if not args.run_mappo:
+            cmd.append("--no-mappo")
         if args.wandb:
             cmd.append("--wandb")
         if args.print_eval_traces:
@@ -370,10 +522,21 @@ def main() -> None:
             f"  Sep-PPO: batches={sep_ppo_batches}, batch_eps={args.sep_ppo_batch_eps}, "
             f"effective={sep_ppo_interactions/1e6:.1f}M"
         )
-        print(
-            f"  MAPPO  : batches={mappo_batches}, batch_eps={args.mappo_batch_eps}, "
-            f"effective={mappo_interactions/1e6:.1f}M"
-        )
+        if args.run_mappo:
+            print(
+                f"  MAPPO  : batches={mappo_batches}, batch_eps={args.mappo_batch_eps}, "
+                f"effective={mappo_interactions/1e6:.1f}M"
+            )
+        if args.run_mfq:
+            print(
+                f"  MFQ    : batches={mfq_batches}, batch_eps={args.mfq_batch_eps}, "
+                f"effective={mfq_interactions/1e6:.1f}M"
+            )
+        if args.run_mfq_local:
+            print(
+                f"  MFQ-loc: batches={mfq_local_batches}, batch_eps={args.mfq_local_batch_eps}, "
+                f"effective={mfq_local_interactions/1e6:.1f}M"
+            )
         print(" ".join(cmd))
         if not args.dry_run:
             subprocess.run(cmd, check=True)

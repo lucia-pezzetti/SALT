@@ -59,6 +59,32 @@ JAX_PLATFORMS=cpu bash src/run_main.sh
 CONDA_ENV=ride-sharing bash src/run_main.sh
 ```
 
+## Dispatch baselines (isolating the OT layer)
+
+SALT dispatches taxis in two stages: an optimal-transport (Hungarian) assignment
+of taxis to pickups, followed by a learned single-taxi routing policy. To measure
+how much of the benefit comes from the assignment layer itself, pass
+`--eval_assignment_baselines`. At final evaluation this reports two extra
+baselines that reuse the **same learned routing policy** but replace SALT's OT
+assignment:
+
+1. **Random assignment** — taxis are matched to pickups by a random permutation.
+2. **Myopic nominal-shortest-path assignment** — Hungarian matching on the static
+   precomputed shortest-path distance matrix (ignoring congestion and
+   time-dependence), i.e. the cheap "nominal shortest-path" assignment resolved
+   at the start of the episode.
+
+Comparing these against SALT (OT on congestion/time-aware Q-value estimates +
+the same routing) isolates the value of the OT assignment layer. Example:
+
+```bash
+python src/main.py --discrete --eval_assignment_baselines \
+  --manhattan_area south_manhattan --num_agents 10
+```
+
+The per-agent and mean continuous travel times for both baselines are printed
+alongside the SALT and shortest-path results (and logged to W&B when enabled).
+
 ## Manhattan Area Selection
 
 The Manhattan experiment area is controlled by `--manhattan_area`.

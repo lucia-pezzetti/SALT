@@ -208,6 +208,9 @@ parser.add_argument("--sample_starts_from_three_fixed", action="store_true", hel
 parser.add_argument("--sample_pickups_from_three_fixed", action="store_true", help="Sample pickup nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Starts sampled uniformly from all nodes.")
 parser.add_argument("--three_fixed_selection_method", type=str, default="random", choices=["random", "degree", "closeness", "betweenness"], help="Method to select the 3 fixed nodes: 'random' (default), 'degree' (degree centrality), 'closeness' (closeness centrality), 'betweenness' (betweenness centrality)")
 parser.add_argument("--no_round_trip", action="store_true", help="Disable return trips in Q-learning training. Only forward trips (start→pickup) are run; the return leg (pickup→start) is skipped.")
+parser.add_argument("--eval_assignment_baselines", action="store_true", help="At final evaluation, also report two lightweight dispatch baselines that reuse the SAME learned routing policy but replace SALT's optimal-transport assignment: (1) random assignment, and (2) myopic nominal-shortest-path (static-distance Hungarian) assignment. Isolates the value of the OT layer.")
+parser.add_argument("--eval_reassignment_baselines", action="store_true", help="At final evaluation, also report shortest-path routing baselines that RE-solve the agent-target Hungarian assignment every K timesteps on offline distances (receding-horizon dispatch), for each K in --reassignment_periods. Contrasts with the static shortest-path baseline (assign once at t=0).")
+parser.add_argument("--reassignment_periods", type=str, default="5,10", help="Comma-separated reassignment intervals K (in timesteps) for --eval_reassignment_baselines.")
 
 args = parser.parse_args()
 

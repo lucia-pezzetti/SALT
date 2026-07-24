@@ -4,7 +4,7 @@ from typing import Tuple, Dict, Any, List, Optional
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .env import SingleAgentGoalGrid, GridConfig, ACTIONS
+from .env import SingleAgentGoalGrid, GridConfig, ACTIONS, target_col_lo
 from .noise import NoiseModel, NoiseConfig
 
 Pos = Tuple[int, int]
@@ -196,7 +196,7 @@ def train_goal_q_multiagent(
         pos_r = rng.integers(0, grid.h, size=M).astype(np.int32)
         pos_c = np.zeros(M, dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=M).astype(np.int32)
-        col_lo = max(0, grid.w // 2)
+        col_lo = target_col_lo(grid)
         tgt_c = rng.integers(col_lo, grid.w, size=M).astype(np.int32)
 
         if rng.random() < eps:

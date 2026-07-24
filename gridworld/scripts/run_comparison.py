@@ -73,6 +73,16 @@ from salt.qmix import (
     train_qmix,
     rollout_qmix,
 )
+from salt.mfq import (
+    MFQConfig,
+    train_mfq,
+    rollout_mfq,
+)
+from salt.mfq_local import (
+    MFQLocalConfig,
+    train_mfq_local,
+    rollout_mfq_local,
+)
 from salt.viz import plot_terminal_hist
 
 
@@ -86,7 +96,10 @@ def _sample_targets(
     """Sample *n* random targets from the requested grid region."""
     rng = np.random.default_rng(seed + 50_000)
     rows = rng.integers(0, h, size=n)
-    if region == "last_half":
+    if region == "last_ten":
+        col_lo = max(0, w - 10)
+        cols = rng.integers(col_lo, w, size=n)
+    elif region == "last_half":
         col_lo = max(0, w // 2)
         cols = rng.integers(col_lo, w, size=n)
     elif region == "full_grid":
@@ -386,6 +399,7 @@ def ensure_sep_a2c(
     early_stop_plateau_window_batches: int = 0,
     early_stop_max_delta_reach_rate: float = 0.0,
     early_stop_max_delta_mean_reward: float = 0.0,
+    early_stop_reach_target: float = 0.0,
     save_dir: str | None = None,
     wb_run=None,
     wb_prefix: str = "train",
@@ -412,6 +426,7 @@ def ensure_sep_a2c(
         early_stop_plateau_window_batches=early_stop_plateau_window_batches,
         early_stop_max_delta_reach_rate=early_stop_max_delta_reach_rate,
         early_stop_max_delta_mean_reward=early_stop_max_delta_mean_reward,
+        early_stop_reach_target=early_stop_reach_target,
     )
     model, metrics = train_goal_a2c(
         grid,
@@ -564,6 +579,7 @@ def ensure_sep_ppo(
     early_stop_plateau_window_batches: int = 0,
     early_stop_max_delta_reach_rate: float = 0.0,
     early_stop_max_delta_mean_reward: float = 0.0,
+    early_stop_reach_target: float = 0.0,
     save_dir: str | None = None, wb_run=None, wb_prefix: str = "train",
     log_every: int = 10,
     print_every: int = 10_000,
@@ -588,6 +604,7 @@ def ensure_sep_ppo(
         early_stop_plateau_window_batches=early_stop_plateau_window_batches,
         early_stop_max_delta_reach_rate=early_stop_max_delta_reach_rate,
         early_stop_max_delta_mean_reward=early_stop_max_delta_mean_reward,
+        early_stop_reach_target=early_stop_reach_target,
     )
     model, metrics = train_goal_ppo(
         grid, noise_cfg, n_agents=n_agents,
@@ -788,10 +805,13 @@ def main():
     ap.add_argument(
         "--eval_target_region",
         type=str,
-        choices=["last_half", "full_grid"],
-        default="last_half",
+        choices=["last_ten", "last_half", "full_grid"],
+        default="last_ten",
         help=(
-            "Region used to sample evaluation targets when --fixed_targets is not set. "
+            "Region used to sample both training and evaluation targets for all "
+            "methods (when --fixed_targets is not set). "
+            "'last_ten' samples from columns [grid_w-10, grid_w) (paper's Fig. 2: "
+            "cols 20-29 on the 11x30 grid), "
             "'last_half' samples from columns [grid_w//2, grid_w), "
             "'full_grid' samples from all columns."
         ),
@@ -825,7 +845,7 @@ def main():
         ),
     )
     ap.add_argument("--collision_penalty", type=float, default=0.0)
-    ap.add_argument("--goal_bonus", type=float, default=40.0)
+    ap.add_argument("--goal_bonus", type=float, default=0.0)
     # Separation policy settings.
     ap.add_argument(
         "--sep_method",
@@ -952,6 +972,10 @@ def main():
         help="Console progress print cadence in training batches (larger = less frequent).",
     )
     # Optional baseline settings.
+    ap.add_argument("--mappo", dest="run_mappo", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Train/evaluate the MAPPO baseline (default on; use --no-mappo "
+                         "to skip it, e.g. to compare only Sep-PPO vs MFQ vs MFQ-local).")
     ap.add_argument("--run_ippo", action="store_true", help="Also train/evaluate IPPO baseline")
     ap.add_argument("--ippo_batches", type=int, default=5000,
                     help="Number of IPPO update batches")
@@ -994,6 +1018,78 @@ def main():
             "Choices: relative_targets"
         ),
     )
+    ap.add_argument("--run_mfq", action="store_true",
+                    help="Also train/evaluate Mean-Field Q-learning (MFQ) baseline")
+    ap.add_argument("--mfq_batches", type=int, default=5000,
+                    help="Number of MFQ update batches")
+    ap.add_argument("--mfq_batch_eps", type=int, default=64,
+                    help="Episodes per MFQ batch")
+    ap.add_argument(
+        "--mfq_obs_modes",
+        type=str,
+        default="relative_targets",
+        help=(
+            "Comma-separated MFQ observation modes. "
+            "Choices: relative_targets"
+        ),
+    )
+    ap.add_argument("--mfq_early_stop_patience", type=int, default=0,
+                    help="MFQ plateau early-stop patience in batches (0 disables).")
+    ap.add_argument("--mfq_early_stop_plateau_window", type=int, default=0,
+                    help="MFQ plateau/target window in batches.")
+    ap.add_argument("--mfq_early_stop_max_delta_reach", type=float, default=0.0,
+                    help="MFQ max reach-rate moving-average delta for the plateau stop.")
+    ap.add_argument("--mfq_early_stop_max_delta_reward", type=float, default=0.0,
+                    help="MFQ max mean-reward moving-average delta for the plateau stop "
+                         "(<=0 uses a reach-rate-only plateau).")
+    ap.add_argument("--mfq_explore_decay_cap_batches", type=int, default=5000,
+                    help="Decay the MFQ tau/eps exploration schedule to its floor over "
+                         "this many batches (default 5000), or the whole run if shorter. "
+                         "0 means decay over the full batch budget.")
+    # MFQ-local: faithful Mean-Field Q-learning variant with an N-independent
+    # egocentric target-density observation and a *local* mean field.
+    ap.add_argument("--run_mfq_local", action="store_true",
+                    help="Also train/evaluate the faithful MFQ-local baseline "
+                         "(density-map obs + local mean field)")
+    ap.add_argument("--mfq_local_batches", type=int, default=5000,
+                    help="Number of MFQ-local update batches")
+    ap.add_argument("--mfq_local_batch_eps", type=int, default=64,
+                    help="Episodes per MFQ-local batch")
+    ap.add_argument("--mfq_local_obs_mode", type=str, default="density_map",
+                    choices=["density_map", "fov"],
+                    help="MFQ-local target encoding: 'density_map' (coarse K*K egocentric "
+                         "histogram) or 'fov' ((2R+1)^2 egocentric presence window). Both "
+                         "are independent of the number of agents.")
+    ap.add_argument("--mfq_local_density_bins", type=int, default=5,
+                    help="density_map resolution K (obs_dim = 5 + K*K)")
+    ap.add_argument("--mfq_local_fov_radius", type=int, default=2,
+                    help="fov window half-width R (obs_dim = 5 + (2R+1)^2)")
+    ap.add_argument("--mfq_local_mf_radius", type=int, default=3,
+                    help="Local mean-field neighbourhood radius (Chebyshev, grid cells)")
+    ap.add_argument("--mfq_local_early_stop_patience", type=int, default=0,
+                    help="MFQ-local plateau early-stop patience in batches (0 disables).")
+    ap.add_argument("--mfq_local_early_stop_plateau_window", type=int, default=0,
+                    help="MFQ-local plateau/target window in batches.")
+    ap.add_argument("--mfq_local_early_stop_max_delta_reach", type=float, default=0.0,
+                    help="MFQ-local max reach-rate moving-average delta for the plateau stop.")
+    ap.add_argument("--mfq_local_early_stop_max_delta_reward", type=float, default=0.0,
+                    help="MFQ-local max mean-reward moving-average delta for the plateau stop "
+                         "(<=0 uses a reach-rate-only plateau).")
+    ap.add_argument("--mfq_local_explore_decay_cap_batches", type=int, default=5000,
+                    help="Decay the MFQ-local tau/eps exploration schedule to its floor over "
+                         "this many batches (default 5000), or the whole run if shorter. "
+                         "0 means decay over the full batch budget.")
+    # Shared success stop: halt a method once its training reach rate is
+    # sustained >= target for the plateau window. Applies to MAPPO, Sep-PPO, MFQ,
+    # MFQ-local.
+    ap.add_argument("--early_stop_reach_target", type=float, default=0.0,
+                    help="Stop training once training reach rate is sustained >= this "
+                         "target (e.g. 0.99). 0 disables. Applies to MAPPO, Sep-PPO, MFQ, "
+                         "MFQ-local.")
+    ap.add_argument("--early_stop_min_reach", type=float, default=0.0,
+                    help="MFQ / MFQ-local plateau stop only fires once the reach-rate "
+                         "moving average is >= this floor, preventing a false stop during "
+                         "early low-reach exploration. 0 disables the guard.")
     # Output and logging.
     ap.add_argument("--outdir", type=str, default="runs/comparison")
     ap.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -1055,7 +1151,7 @@ def main():
     grid = GridConfig(
         h=args.grid_h, w=args.grid_w, horizon=args.horizon,
         rng_seed=args.seed, collision_penalty=args.collision_penalty,
-        goal_bonus=args.goal_bonus,
+        goal_bonus=args.goal_bonus, target_region=args.eval_target_region,
     )
     N = args.agents
     n_eval = args.eval_seeds
@@ -1092,7 +1188,7 @@ def main():
         "global": args.sep_a2c_policy_path_global,
     }
 
-    mappo_modes = _parse_relative_only_modes(args.mappo_obs_modes, "MAPPO")
+    mappo_modes = _parse_relative_only_modes(args.mappo_obs_modes, "MAPPO") if args.run_mappo else []
     mappo_cfg = MAPPOConfig(
         n_batches=args.mappo_batches,
         batch_episodes=args.mappo_batch_eps,
@@ -1101,6 +1197,7 @@ def main():
         early_stop_plateau_window_batches=args.mappo_early_stop_plateau_window,
         early_stop_max_delta_reach_rate=args.mappo_early_stop_max_delta_reach,
         early_stop_max_delta_mean_reward=args.mappo_early_stop_max_delta_reward,
+        early_stop_reach_target=args.early_stop_reach_target,
     )
     ippo_modes = (
         _parse_relative_only_modes(args.ippo_obs_modes, "IPPO")
@@ -1128,6 +1225,50 @@ def main():
         batch_episodes=args.vdn_batch_eps,
         eps_decay_episodes=max(1, (args.vdn_batches * args.vdn_batch_eps) // 2),
     )
+    mfq_modes = (
+        _parse_relative_only_modes(args.mfq_obs_modes, "MFQ")
+        if args.run_mfq else []
+    )
+    # Exploration-decay horizon: half the episode budget, optionally capped so it
+    # does not blow up when the interaction-matched budget yields a huge batch
+    # count (e.g. low-agent scalability runs). See --mfq_explore_decay_cap_batches.
+    # Decay tau/eps to their floors over the first `explore_decay_cap_batches`
+    # batches (default 5000), or the whole run if it is shorter.
+    _mfq_decay_batches = min(args.mfq_batches,
+                             args.mfq_explore_decay_cap_batches or args.mfq_batches)
+    mfq_decay_episodes = max(1, _mfq_decay_batches * args.mfq_batch_eps)
+    mfq_cfg = MFQConfig(
+        n_batches=args.mfq_batches,
+        batch_episodes=args.mfq_batch_eps,
+        tau_decay_episodes=mfq_decay_episodes,
+        eps_decay_episodes=mfq_decay_episodes,
+        early_stop_patience_batches=args.mfq_early_stop_patience,
+        early_stop_plateau_window_batches=args.mfq_early_stop_plateau_window,
+        early_stop_max_delta_reach_rate=args.mfq_early_stop_max_delta_reach,
+        early_stop_max_delta_mean_reward=args.mfq_early_stop_max_delta_reward,
+        early_stop_reach_target=args.early_stop_reach_target,
+        early_stop_min_reach=args.early_stop_min_reach,
+    )
+    mfq_local_modes = [args.mfq_local_obs_mode] if args.run_mfq_local else []
+    _mfq_local_decay_batches = min(args.mfq_local_batches,
+                                   args.mfq_local_explore_decay_cap_batches or args.mfq_local_batches)
+    mfq_local_decay_episodes = max(1, _mfq_local_decay_batches * args.mfq_local_batch_eps)
+    mfq_local_cfg = MFQLocalConfig(
+        n_batches=args.mfq_local_batches,
+        batch_episodes=args.mfq_local_batch_eps,
+        obs_mode=args.mfq_local_obs_mode,
+        density_bins=args.mfq_local_density_bins,
+        fov_radius=args.mfq_local_fov_radius,
+        mf_radius=args.mfq_local_mf_radius,
+        tau_decay_episodes=mfq_local_decay_episodes,
+        eps_decay_episodes=mfq_local_decay_episodes,
+        early_stop_patience_batches=args.mfq_local_early_stop_patience,
+        early_stop_plateau_window_batches=args.mfq_local_early_stop_plateau_window,
+        early_stop_max_delta_reach_rate=args.mfq_local_early_stop_max_delta_reach,
+        early_stop_max_delta_mean_reward=args.mfq_local_early_stop_max_delta_reward,
+        early_stop_reach_target=args.early_stop_reach_target,
+        early_stop_min_reach=args.early_stop_min_reach,
+    )
     # Keep logged curves comparable without storing every training batch.
     sep_log_every_q = max(1, args.sep_episodes // max(1, args.wandb_log_points))
     sep_log_every_ddqn = max(1, args.sep_ppo_batches // max(1, args.wandb_log_points))
@@ -1137,8 +1278,12 @@ def main():
     ippo_log_every = max(1, ippo_cfg.n_batches // max(1, args.wandb_log_points))
     qmix_log_every = max(1, qmix_cfg.n_batches // max(1, args.wandb_log_points))
     vdn_log_every = max(1, vdn_cfg.n_batches // max(1, args.wandb_log_points))
+    mfq_log_every = max(1, mfq_cfg.n_batches // max(1, args.wandb_log_points))
+    mfq_local_log_every = max(1, mfq_local_cfg.n_batches // max(1, args.wandb_log_points))
     sep_ppo_print_every = max(1, args.train_print_every_batches * args.sep_ppo_batch_eps)
     mappo_print_every = max(1, args.train_print_every_batches * args.mappo_batch_eps)
+    mfq_print_every = max(1, args.train_print_every_batches * args.mfq_batch_eps)
+    mfq_local_print_every = max(1, args.train_print_every_batches * args.mfq_local_batch_eps)
     all_results: List[dict] = []
 
     print(
@@ -1153,7 +1298,11 @@ def main():
         f" qmix={'on' if args.run_qmix else 'off'}"
         f"{f' qmix_modes={qmix_modes} every {qmix_log_every} batches;' if args.run_qmix else ';'} "
         f"vdn={'on' if args.run_vdn else 'off'}"
-        f"{f' vdn_modes={vdn_modes} every {vdn_log_every} batches' if args.run_vdn else ''}"
+        f"{f' vdn_modes={vdn_modes} every {vdn_log_every} batches;' if args.run_vdn else ''} "
+        f"mfq={'on' if args.run_mfq else 'off'}"
+        f"{f' mfq_modes={mfq_modes} every {mfq_log_every} batches' if args.run_mfq else ''} "
+        f"mfq_local={'on' if args.run_mfq_local else 'off'}"
+        f"{f' every {mfq_local_log_every} batches' if args.run_mfq_local else ''}"
     )
 
     selected_noise_kinds = [k.strip() for k in args.noise_mode.split(",") if k.strip()]
@@ -1222,6 +1371,7 @@ def main():
                     early_stop_plateau_window_batches=args.sep_ppo_early_stop_plateau_window,
                     early_stop_max_delta_reach_rate=args.sep_ppo_early_stop_max_delta_reach,
                     early_stop_max_delta_mean_reward=args.sep_ppo_early_stop_max_delta_reward,
+                    early_stop_reach_target=args.early_stop_reach_target,
                     save_dir=kind_dir, wb_run=wb_run,
                     wb_prefix=f"train_sep_ppo/{kind}",
                     log_every=sep_log_every_ppo,
@@ -1247,6 +1397,7 @@ def main():
                     early_stop_plateau_window_batches=args.sep_ppo_early_stop_plateau_window,
                     early_stop_max_delta_reach_rate=args.sep_ppo_early_stop_max_delta_reach,
                     early_stop_max_delta_mean_reward=args.sep_ppo_early_stop_max_delta_reward,
+                    early_stop_reach_target=args.early_stop_reach_target,
                     save_dir=kind_dir, wb_run=wb_run,
                     wb_prefix=f"train_sep_a2c/{kind}",
                     log_every=sep_log_every_a2c,
@@ -1275,14 +1426,14 @@ def main():
                     f"timing/{kind}/sep/{sep_method}/env_interactions": sep_env_interactions,
                 })
 
-        # Train MAPPO variants.
-        print(f"\n{'=' * 60}")
-        print(f"  MAPPO variants — {kind} noise  (p={args.p})  "
-              f"({mappo_cfg.n_batches}×{mappo_cfg.batch_episodes} eps each)")
-        print(f"{'=' * 60}")
+        # Train MAPPO variants (optional; --no-mappo skips it).
         mappo_by_mode: dict[str, dict] = {}
-
-        primary_mode = mappo_modes[0]
+        primary_mode = mappo_modes[0] if mappo_modes else None
+        if args.run_mappo:
+            print(f"\n{'=' * 60}")
+            print(f"  MAPPO variants — {kind} noise  (p={args.p})  "
+                  f"({mappo_cfg.n_batches}×{mappo_cfg.batch_episodes} eps each)")
+            print(f"{'=' * 60}")
         for mode in mappo_modes:
             cfg_mode = replace(mappo_cfg, obs_mode=mode)
             t0 = time.time()
@@ -1425,6 +1576,84 @@ def main():
                         f"timing/{kind}/vdn/{mode}/env_interactions": vdn_env_interactions,
                     })
 
+        # Train optional MFQ variants.
+        mfq_by_mode: dict[str, dict] = {}
+        mfq_primary_mode = None
+        if args.run_mfq:
+            print(f"\n{'=' * 60}")
+            print(f"  MFQ variants — {kind} noise  (p={args.p})  "
+                  f"({mfq_cfg.n_batches}×{mfq_cfg.batch_episodes} eps each)")
+            print(f"{'=' * 60}")
+            mfq_primary_mode = mfq_modes[0]
+            for mode in mfq_modes:
+                cfg_mode = replace(mfq_cfg, obs_mode=mode)
+                t0 = time.time()
+                mfq_q, mfq_train = train_mfq(
+                    grid, noise_cfg, N,
+                    cfg=cfg_mode, seed=args.seed, log_every=mfq_log_every,
+                    print_every=mfq_print_every,
+                    wb_run=wb_run, wb_prefix=f"train_mfq/{kind}/{mode}",
+                )
+                mfq_train_time = time.time() - t0
+                mfq_env_interactions = mfq_train["env_interactions"]
+                mfq_by_mode[mode] = {
+                    "q_net": mfq_q,
+                    "train": mfq_train,
+                    "train_time": mfq_train_time,
+                    "env_interactions": mfq_env_interactions,
+                }
+
+                import torch
+                torch.save(mfq_q.state_dict(), os.path.join(kind_dir, f"mfq_q_{mode}.pt"))
+                if mode == mfq_primary_mode:
+                    torch.save(mfq_q.state_dict(), os.path.join(kind_dir, "mfq_q.pt"))
+
+                if wb_run is not None:
+                    wb_run.log({
+                        f"timing/{kind}/mfq/{mode}/train_time_s": mfq_train_time,
+                        f"timing/{kind}/mfq/{mode}/env_interactions": mfq_env_interactions,
+                    })
+
+        # Train optional MFQ-local variant (faithful: density-map obs + local mean field).
+        mfq_local_by_mode: dict[str, dict] = {}
+        mfq_local_primary_mode = None
+        if args.run_mfq_local:
+            print(f"\n{'=' * 60}")
+            print(f"  MFQ-local — {kind} noise  (p={args.p})  "
+                  f"({mfq_local_cfg.n_batches}×{mfq_local_cfg.batch_episodes} eps each)")
+            print(f"{'=' * 60}")
+            mfq_local_primary_mode = mfq_local_modes[0]
+            for mode in mfq_local_modes:
+                cfg_mode = replace(mfq_local_cfg, obs_mode=mode)
+                t0 = time.time()
+                mfq_local_q, mfq_local_train = train_mfq_local(
+                    grid, noise_cfg, N,
+                    cfg=cfg_mode, seed=args.seed, log_every=mfq_local_log_every,
+                    print_every=mfq_local_print_every,
+                    wb_run=wb_run, wb_prefix=f"train_mfq_local/{kind}/{mode}",
+                )
+                mfq_local_train_time = time.time() - t0
+                mfq_local_env_interactions = mfq_local_train["env_interactions"]
+                mfq_local_by_mode[mode] = {
+                    "q_net": mfq_local_q,
+                    "train": mfq_local_train,
+                    "train_time": mfq_local_train_time,
+                    "env_interactions": mfq_local_env_interactions,
+                }
+
+                import torch
+                torch.save(mfq_local_q.state_dict(),
+                           os.path.join(kind_dir, f"mfq_local_q_{mode}.pt"))
+                if mode == mfq_local_primary_mode:
+                    torch.save(mfq_local_q.state_dict(),
+                               os.path.join(kind_dir, "mfq_local_q.pt"))
+
+                if wb_run is not None:
+                    wb_run.log({
+                        f"timing/{kind}/mfq_local/{mode}/train_time_s": mfq_local_train_time,
+                        f"timing/{kind}/mfq_local/{mode}/env_interactions": mfq_local_env_interactions,
+                    })
+
         # Estimate when training curves first stay above each reach-rate threshold.
         sep_reach_stabilization_by_method: dict[str, dict] = {}
         for sep_method in sep_methods:
@@ -1447,6 +1676,22 @@ def main():
             )
             for mode in mappo_modes
         }
+        mfq_reach_stabilization_by_mode = {
+            mode: _stable_reach_milestones(
+                train_curve=mfq_by_mode[mode]["train"].get("train_curve", []),
+                thresholds=reach_thresholds,
+                stability_window=args.stability_window,
+            )
+            for mode in mfq_modes
+        } if args.run_mfq else {}
+        mfq_local_reach_stabilization_by_mode = {
+            mode: _stable_reach_milestones(
+                train_curve=mfq_local_by_mode[mode]["train"].get("train_curve", []),
+                thresholds=reach_thresholds,
+                stability_window=args.stability_window,
+            )
+            for mode in mfq_local_modes
+        } if args.run_mfq_local else {}
 
         # Paired multi-seed evaluation with shared starts and targets.
         print(f"\n  Evaluating on {n_eval} seeds "
@@ -1459,6 +1704,10 @@ def main():
         ippo_all_by_mode: dict[str, List[dict]] = {m: [] for m in ippo_modes} if args.run_ippo else {}
         qmix_all_by_mode: dict[str, List[dict]] = {m: [] for m in qmix_modes} if args.run_qmix else {}
         vdn_all_by_mode: dict[str, List[dict]] = {m: [] for m in vdn_modes} if args.run_vdn else {}
+        mfq_all_by_mode: dict[str, List[dict]] = {m: [] for m in mfq_modes} if args.run_mfq else {}
+        mfq_local_all_by_mode: dict[str, List[dict]] = (
+            {m: [] for m in mfq_local_modes} if args.run_mfq_local else {}
+        )
 
         for s in range(n_eval):
             targets = _sample_targets(
@@ -1554,6 +1803,32 @@ def main():
                         start_rows=start_rows,
                     )
                     vdn_all_by_mode[mode].append(vdn_res)
+            if args.run_mfq:
+                for mode in mfq_modes:
+                    mfq_res = rollout_mfq(
+                        mfq_by_mode[mode]["q_net"],
+                        grid,
+                        noise_cfg,
+                        N,
+                        targets=targets,
+                        seed=s,
+                        obs_mode=mode,
+                        start_rows=start_rows,
+                    )
+                    mfq_all_by_mode[mode].append(mfq_res)
+            if args.run_mfq_local:
+                for mode in mfq_local_modes:
+                    mfq_local_res = rollout_mfq_local(
+                        mfq_local_by_mode[mode]["q_net"],
+                        grid,
+                        noise_cfg,
+                        N,
+                        targets=targets,
+                        seed=s,
+                        obs_mode=mode,
+                        start_rows=start_rows,
+                    )
+                    mfq_local_all_by_mode[mode].append(mfq_local_res)
 
             if collect_step_traces:
                 for sep_method in sep_methods:
@@ -1589,6 +1864,20 @@ def main():
                             f"VDN[{mode}]",
                             vdn_all_by_mode[mode][-1],
                         )
+                if args.run_mfq:
+                    for mode in mfq_modes:
+                        _print_eval_trace(
+                            s,
+                            f"MFQ[{mode}]",
+                            mfq_all_by_mode[mode][-1],
+                        )
+                if args.run_mfq_local:
+                    for mode in mfq_local_modes:
+                        _print_eval_trace(
+                            s,
+                            f"MFQ-local[{mode}]",
+                            mfq_local_all_by_mode[mode][-1],
+                        )
                 # Traces are for console debugging only; result files stay compact.
                 for sep_method in sep_methods:
                     sep_all_by_method[sep_method][-1].pop("step_traces", None)
@@ -1618,14 +1907,22 @@ def main():
             {mode: _aggregate(vdn_all_by_mode[mode]) for mode in vdn_modes}
             if args.run_vdn else {}
         )
+        mfq_agg_by_mode = (
+            {mode: _aggregate(mfq_all_by_mode[mode]) for mode in mfq_modes}
+            if args.run_mfq else {}
+        )
+        mfq_local_agg_by_mode = (
+            {mode: _aggregate(mfq_local_all_by_mode[mode]) for mode in mfq_local_modes}
+            if args.run_mfq_local else {}
+        )
 
         # Seed 0 is kept for plots and detailed per-algorithm outputs.
         sep_seed0_by_method = {m: sep_all_by_method[m][0] for m in sep_methods}
         sep_agg = sep_agg_by_method[primary_sep_method]
         sep_m = sep_seed0_by_method[primary_sep_method]
         mappo_seed0_by_mode = {mode: mappo_all_by_mode[mode][0] for mode in mappo_modes}
-        mappo_agg = mappo_agg_by_mode[primary_mode]
-        mappo_m = mappo_seed0_by_mode[primary_mode]
+        mappo_agg = mappo_agg_by_mode.get(primary_mode, {})
+        mappo_m = mappo_seed0_by_mode.get(primary_mode, {})
         ippo_seed0_by_mode = (
             {mode: ippo_all_by_mode[mode][0] for mode in ippo_modes}
             if args.run_ippo else {}
@@ -1644,6 +1941,18 @@ def main():
         )
         vdn_agg = vdn_agg_by_mode.get(vdn_primary_mode, {})
         vdn_m = vdn_seed0_by_mode.get(vdn_primary_mode, {})
+        mfq_seed0_by_mode = (
+            {mode: mfq_all_by_mode[mode][0] for mode in mfq_modes}
+            if args.run_mfq else {}
+        )
+        mfq_agg = mfq_agg_by_mode.get(mfq_primary_mode, {})
+        mfq_m = mfq_seed0_by_mode.get(mfq_primary_mode, {})
+        mfq_local_seed0_by_mode = (
+            {mode: mfq_local_all_by_mode[mode][0] for mode in mfq_local_modes}
+            if args.run_mfq_local else {}
+        )
+        mfq_local_agg = mfq_local_agg_by_mode.get(mfq_local_primary_mode, {})
+        mfq_local_m = mfq_local_seed0_by_mode.get(mfq_local_primary_mode, {})
 
         for sep_method in sep_methods:
             sagg = sep_agg_by_method[sep_method]
@@ -1708,6 +2017,28 @@ def main():
                       f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
                       f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
                       f"  ({tmode:.1f}s train)")
+        if args.run_mfq:
+            for mode in mfq_modes:
+                agg = mfq_agg_by_mode[mode]
+                tmode = mfq_by_mode[mode]["train_time"]
+                print(f"  MFQ[{mode}] → OT={agg['terminal_ot_cost_mean']:.1f}"
+                      f"±{agg['terminal_ot_cost_std']:.1f}"
+                      f"  reach={agg['reach_rate_mean']:.1%}"
+                      f"  cover={agg['target_coverage_mean']:.1%}"
+                      f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                      f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
+                      f"  ({tmode:.1f}s train)")
+        if args.run_mfq_local:
+            for mode in mfq_local_modes:
+                agg = mfq_local_agg_by_mode[mode]
+                tmode = mfq_local_by_mode[mode]["train_time"]
+                print(f"  MFQ-local[{mode}] → OT={agg['terminal_ot_cost_mean']:.1f}"
+                      f"±{agg['terminal_ot_cost_std']:.1f}"
+                      f"  reach={agg['reach_rate_mean']:.1%}"
+                      f"  cover={agg['target_coverage_mean']:.1%}"
+                      f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                      f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
+                      f"  ({tmode:.1f}s train)")
 
         if wb_run is not None:
             import wandb
@@ -1748,6 +2079,22 @@ def main():
                         wb_run.log({
                             f"eval/{kind}/vdn/{mode}/{k}_mean": agg[f"{k}_mean"],
                             f"eval/{kind}/vdn/{mode}/{k}_std": agg[f"{k}_std"],
+                        })
+            if args.run_mfq:
+                for mode in mfq_modes:
+                    agg = mfq_agg_by_mode[mode]
+                    for k in _EVAL_KEYS:
+                        wb_run.log({
+                            f"eval/{kind}/mfq/{mode}/{k}_mean": agg[f"{k}_mean"],
+                            f"eval/{kind}/mfq/{mode}/{k}_std": agg[f"{k}_std"],
+                        })
+            if args.run_mfq_local:
+                for mode in mfq_local_modes:
+                    agg = mfq_local_agg_by_mode[mode]
+                    for k in _EVAL_KEYS:
+                        wb_run.log({
+                            f"eval/{kind}/mfq_local/{mode}/{k}_mean": agg[f"{k}_mean"],
+                            f"eval/{kind}/mfq_local/{mode}/{k}_std": agg[f"{k}_std"],
                         })
 
         # Save per-noise-kind outputs.
@@ -1828,6 +2175,40 @@ def main():
                                    "all_seeds": v_all}, f, indent=2)
                     with open(os.path.join(kind_dir, "vdn_train.json"), "w") as f:
                         json.dump(v_train, f, indent=2, default=str)
+        if args.run_mfq:
+            for mode in mfq_modes:
+                mf_seed0 = mfq_seed0_by_mode[mode]
+                mf_agg = mfq_agg_by_mode[mode]
+                mf_all = mfq_all_by_mode[mode]
+                mf_train = mfq_by_mode[mode]["train"]
+                with open(os.path.join(kind_dir, f"mfq_{mode}_metrics.json"), "w") as f:
+                    json.dump({"seed0": mf_seed0, "aggregate": mf_agg,
+                               "all_seeds": mf_all}, f, indent=2)
+                with open(os.path.join(kind_dir, f"mfq_{mode}_train.json"), "w") as f:
+                    json.dump(mf_train, f, indent=2, default=str)
+                if mode == mfq_primary_mode:
+                    with open(os.path.join(kind_dir, "mfq_metrics.json"), "w") as f:
+                        json.dump({"seed0": mf_seed0, "aggregate": mf_agg,
+                                   "all_seeds": mf_all}, f, indent=2)
+                    with open(os.path.join(kind_dir, "mfq_train.json"), "w") as f:
+                        json.dump(mf_train, f, indent=2, default=str)
+        if args.run_mfq_local:
+            for mode in mfq_local_modes:
+                mfl_seed0 = mfq_local_seed0_by_mode[mode]
+                mfl_agg = mfq_local_agg_by_mode[mode]
+                mfl_all = mfq_local_all_by_mode[mode]
+                mfl_train = mfq_local_by_mode[mode]["train"]
+                with open(os.path.join(kind_dir, f"mfq_local_{mode}_metrics.json"), "w") as f:
+                    json.dump({"seed0": mfl_seed0, "aggregate": mfl_agg,
+                               "all_seeds": mfl_all}, f, indent=2)
+                with open(os.path.join(kind_dir, f"mfq_local_{mode}_train.json"), "w") as f:
+                    json.dump(mfl_train, f, indent=2, default=str)
+                if mode == mfq_local_primary_mode:
+                    with open(os.path.join(kind_dir, "mfq_local_metrics.json"), "w") as f:
+                        json.dump({"seed0": mfl_seed0, "aggregate": mfl_agg,
+                                   "all_seeds": mfl_all}, f, indent=2)
+                    with open(os.path.join(kind_dir, "mfq_local_train.json"), "w") as f:
+                        json.dump(mfl_train, f, indent=2, default=str)
 
         # Dedicated visualization rollout with shared starts and targets.
         viz_seed = args.seed + 900_000
@@ -1871,15 +2252,19 @@ def main():
                     start_rows=viz_start_rows,
                 )
 
-        viz_mappo = rollout_mappo(
-            mappo_by_mode[primary_mode]["actor"],
-            grid,
-            noise_cfg,
-            N,
-            targets=viz_targets,
-            seed=viz_seed,
-            obs_mode=primary_mode,
-            start_rows=viz_start_rows,
+        viz_mappo = (
+            rollout_mappo(
+                mappo_by_mode[primary_mode]["actor"],
+                grid,
+                noise_cfg,
+                N,
+                targets=viz_targets,
+                seed=viz_seed,
+                obs_mode=primary_mode,
+                start_rows=viz_start_rows,
+            )
+            if args.run_mappo and primary_mode is not None
+            else None
         )
         viz_ippo = (
             rollout_ippo(
@@ -1923,6 +2308,34 @@ def main():
             if args.run_vdn and vdn_primary_mode is not None
             else None
         )
+        viz_mfq = (
+            rollout_mfq(
+                mfq_by_mode[mfq_primary_mode]["q_net"],
+                grid,
+                noise_cfg,
+                N,
+                targets=viz_targets,
+                seed=viz_seed,
+                obs_mode=mfq_primary_mode,
+                start_rows=viz_start_rows,
+            )
+            if args.run_mfq and mfq_primary_mode is not None
+            else None
+        )
+        viz_mfq_local = (
+            rollout_mfq_local(
+                mfq_local_by_mode[mfq_local_primary_mode]["q_net"],
+                grid,
+                noise_cfg,
+                N,
+                targets=viz_targets,
+                seed=viz_seed,
+                obs_mode=mfq_local_primary_mode,
+                start_rows=viz_start_rows,
+            )
+            if args.run_mfq_local and mfq_local_primary_mode is not None
+            else None
+        )
 
         # Terminal histograms from seed-0 rollout.
         targets_0 = [tuple(t) for t in sep_m["targets"]]
@@ -1932,10 +2345,11 @@ def main():
                 [(int(p[0]), int(p[1])) for p in traj]
                 for traj in viz_sep_by_method[sep_method]["trajectories"]
             ]
-        trajectories_overlay[f"MAPPO[{primary_mode}]"] = [
-            [(int(p[0]), int(p[1])) for p in traj]
-            for traj in viz_mappo["trajectories"]
-        ]
+        if viz_mappo is not None:
+            trajectories_overlay[f"MAPPO[{primary_mode}]"] = [
+                [(int(p[0]), int(p[1])) for p in traj]
+                for traj in viz_mappo["trajectories"]
+            ]
         if viz_ippo is not None:
             trajectories_overlay[f"IPPO[{ippo_primary_mode}]"] = [
                 [(int(p[0]), int(p[1])) for p in traj]
@@ -1950,6 +2364,16 @@ def main():
             trajectories_overlay[f"VDN[{vdn_primary_mode}]"] = [
                 [(int(p[0]), int(p[1])) for p in traj]
                 for traj in viz_vdn["trajectories"]
+            ]
+        if viz_mfq is not None:
+            trajectories_overlay[f"MFQ[{mfq_primary_mode}]"] = [
+                [(int(p[0]), int(p[1])) for p in traj]
+                for traj in viz_mfq["trajectories"]
+            ]
+        if viz_mfq_local is not None:
+            trajectories_overlay[f"MFQ-local[{mfq_local_primary_mode}]"] = [
+                [(int(p[0]), int(p[1])) for p in traj]
+                for traj in viz_mfq_local["trajectories"]
             ]
         eval_traj_data_path = os.path.join(kind_dir, "eval_trajectories_viz.json")
         viz_payload = {
@@ -2059,6 +2483,24 @@ def main():
                         outpath=os.path.join(kind_dir, "terminal_hist_vdn.png"),
                         title=f"VDN — {kind} noise (p={args.p})",
                     )
+        mfq_hist_paths: dict[str, str] = {}
+        if args.run_mfq:
+            for mode in mfq_modes:
+                mfq_hist_path = os.path.join(kind_dir, f"terminal_hist_mfq_{mode}.png")
+                mfq_hist_paths[mode] = mfq_hist_path
+                plot_terminal_hist(
+                    grid.h, grid.w,
+                    agents_terminal=mfq_seed0_by_mode[mode]["final_positions"], targets=targets_0,
+                    outpath=mfq_hist_path,
+                    title=f"MFQ[{mode}] — {kind} noise (p={args.p})",
+                )
+                if mode == mfq_primary_mode:
+                    plot_terminal_hist(
+                        grid.h, grid.w,
+                        agents_terminal=mfq_seed0_by_mode[mode]["final_positions"], targets=targets_0,
+                        outpath=os.path.join(kind_dir, "terminal_hist_mfq.png"),
+                        title=f"MFQ — {kind} noise (p={args.p})",
+                    )
 
         if wb_run is not None:
             import wandb
@@ -2085,6 +2527,11 @@ def main():
                 for mode in vdn_modes:
                     img_payload[f"plots/{kind}/terminal_hist_vdn_{mode}"] = wandb.Image(
                         vdn_hist_paths[mode]
+                    )
+            if args.run_mfq:
+                for mode in mfq_modes:
+                    img_payload[f"plots/{kind}/terminal_hist_mfq_{mode}"] = wandb.Image(
+                        mfq_hist_paths[mode]
                     )
             wb_run.log(img_payload)
 
@@ -2114,6 +2561,14 @@ def main():
                 primary_mode, {}
             ),
             "mappo_reach_stabilization_by_mode": mappo_reach_stabilization_by_mode,
+            "mfq_reach_stabilization": mfq_reach_stabilization_by_mode.get(
+                mfq_primary_mode, {}
+            ) if args.run_mfq else {},
+            "mfq_reach_stabilization_by_mode": mfq_reach_stabilization_by_mode,
+            "mfq_local_reach_stabilization": mfq_local_reach_stabilization_by_mode.get(
+                mfq_local_primary_mode, {}
+            ) if args.run_mfq_local else {},
+            "mfq_local_reach_stabilization_by_mode": mfq_local_reach_stabilization_by_mode,
             "mappo_agg_by_mode": mappo_agg_by_mode,
             "ippo_agg": ippo_agg if args.run_ippo else {},
             "ippo_mode_primary": ippo_primary_mode if args.run_ippo else None,
@@ -2124,6 +2579,12 @@ def main():
             "vdn_agg": vdn_agg if args.run_vdn else {},
             "vdn_mode_primary": vdn_primary_mode if args.run_vdn else None,
             "vdn_agg_by_mode": vdn_agg_by_mode if args.run_vdn else {},
+            "mfq_agg": mfq_agg if args.run_mfq else {},
+            "mfq_mode_primary": mfq_primary_mode if args.run_mfq else None,
+            "mfq_agg_by_mode": mfq_agg_by_mode if args.run_mfq else {},
+            "mfq_local_agg": mfq_local_agg if args.run_mfq_local else {},
+            "mfq_local_mode_primary": mfq_local_primary_mode if args.run_mfq_local else None,
+            "mfq_local_agg_by_mode": mfq_local_agg_by_mode if args.run_mfq_local else {},
             "sep_seed0": sep_m,
             "sep_seed0_by_method": sep_seed0_by_method,
             "mappo_seed0": mappo_m,
@@ -2134,14 +2595,18 @@ def main():
             "qmix_seed0_by_mode": qmix_seed0_by_mode if args.run_qmix else {},
             "vdn_seed0": vdn_m if args.run_vdn else {},
             "vdn_seed0_by_mode": vdn_seed0_by_mode if args.run_vdn else {},
+            "mfq_seed0": mfq_m if args.run_mfq else {},
+            "mfq_seed0_by_mode": mfq_seed0_by_mode if args.run_mfq else {},
+            "mfq_local_seed0": mfq_local_m if args.run_mfq_local else {},
+            "mfq_local_seed0_by_mode": mfq_local_seed0_by_mode if args.run_mfq_local else {},
             "sep_train_time": sep_by_method[primary_sep_method]["train_time"],
             "sep_env_interactions": sep_by_method[primary_sep_method]["env_interactions"],
             "sep_train_time_by_method": {m: v["train_time"] for m, v in sep_by_method.items()},
             "sep_env_interactions_by_method": {
                 m: v["env_interactions"] for m, v in sep_by_method.items()
             },
-            "mappo_train_time": mappo_by_mode[primary_mode]["train_time"],
-            "mappo_env_interactions": mappo_by_mode[primary_mode]["env_interactions"],
+            "mappo_train_time": mappo_by_mode[primary_mode]["train_time"] if args.run_mappo and primary_mode is not None else float("nan"),
+            "mappo_env_interactions": mappo_by_mode[primary_mode]["env_interactions"] if args.run_mappo and primary_mode is not None else 0,
             "mappo_train_by_mode": {m: v["train"] for m, v in mappo_by_mode.items()},
             "mappo_train_time_by_mode": {m: v["train_time"] for m, v in mappo_by_mode.items()},
             "mappo_env_interactions_by_mode": {
@@ -2162,6 +2627,16 @@ def main():
             "vdn_env_interactions_by_mode": {
                 m: v["env_interactions"] for m, v in vdn_by_mode.items()
             } if args.run_vdn else {},
+            "mfq_train_by_mode": {m: v["train"] for m, v in mfq_by_mode.items()} if args.run_mfq else {},
+            "mfq_train_time_by_mode": {m: v["train_time"] for m, v in mfq_by_mode.items()} if args.run_mfq else {},
+            "mfq_env_interactions_by_mode": {
+                m: v["env_interactions"] for m, v in mfq_by_mode.items()
+            } if args.run_mfq else {},
+            "mfq_local_train_by_mode": {m: v["train"] for m, v in mfq_local_by_mode.items()} if args.run_mfq_local else {},
+            "mfq_local_train_time_by_mode": {m: v["train_time"] for m, v in mfq_local_by_mode.items()} if args.run_mfq_local else {},
+            "mfq_local_env_interactions_by_mode": {
+                m: v["env_interactions"] for m, v in mfq_local_by_mode.items()
+            } if args.run_mfq_local else {},
         })
 
     hdr_w = 104
@@ -2231,6 +2706,28 @@ def main():
                 v_mt = _fmt(va["mean_time_to_reach_mean"],
                             va["mean_time_to_reach_std"])
                 print(f"{'':12}  {f'VDN[{mode}]':<22} {v_ot:>12} {v_rr:>12} {v_cv:>12} {v_mt:>12}")
+        if args.run_mfq:
+            for mode in mfq_modes:
+                fa = r["mfq_agg_by_mode"][mode]
+                f_ot = _fmt(fa["terminal_ot_cost_mean"], fa["terminal_ot_cost_std"])
+                f_rr = _fmt(fa["reach_rate_mean"] * 100,
+                            fa["reach_rate_std"] * 100, prec=0)
+                f_cv = _fmt(fa["target_coverage_mean"] * 100,
+                            fa["target_coverage_std"] * 100, prec=0)
+                f_mt = _fmt(fa["mean_time_to_reach_mean"],
+                            fa["mean_time_to_reach_std"])
+                print(f"{'':12}  {f'MFQ[{mode}]':<22} {f_ot:>12} {f_rr:>12} {f_cv:>12} {f_mt:>12}")
+        if args.run_mfq_local:
+            for mode in mfq_local_modes:
+                la = r["mfq_local_agg_by_mode"][mode]
+                l_ot = _fmt(la["terminal_ot_cost_mean"], la["terminal_ot_cost_std"])
+                l_rr = _fmt(la["reach_rate_mean"] * 100,
+                            la["reach_rate_std"] * 100, prec=0)
+                l_cv = _fmt(la["target_coverage_mean"] * 100,
+                            la["target_coverage_std"] * 100, prec=0)
+                l_mt = _fmt(la["mean_time_to_reach_mean"],
+                            la["mean_time_to_reach_std"])
+                print(f"{'':12}  {f'MFQ-local[{mode}]':<22} {l_ot:>12} {l_rr:>12} {l_cv:>12} {l_mt:>12}")
         print("─" * hdr_w)
 
     print(f"\nTraining efficiency:")
@@ -2262,6 +2759,16 @@ def main():
                 v_int = r["vdn_env_interactions_by_mode"][mode]
                 v_t = r["vdn_train_time_by_mode"][mode]
                 print(f"               VDN[{mode:<15}] {v_int/1e6:.1f}M interactions, {v_t:.1f}s")
+        if args.run_mfq:
+            for mode in mfq_modes:
+                f_int = r["mfq_env_interactions_by_mode"][mode]
+                f_t = r["mfq_train_time_by_mode"][mode]
+                print(f"               MFQ[{mode:<15}] {f_int/1e6:.1f}M interactions, {f_t:.1f}s")
+        if args.run_mfq_local:
+            for mode in mfq_local_modes:
+                l_int = r["mfq_local_env_interactions_by_mode"][mode]
+                l_t = r["mfq_local_train_time_by_mode"][mode]
+                print(f"               MFQ-local[{mode:<9}] {l_int/1e6:.1f}M interactions, {l_t:.1f}s")
 
     with open(os.path.join(base_outdir, "comparison.json"), "w") as f:
         json.dump(all_results, f, indent=2, default=str)
@@ -2344,6 +2851,32 @@ def main():
                         agg["total_cost_mean"], agg["total_cost_std"],
                         r["vdn_train_time_by_mode"][mode],
                         r["vdn_env_interactions_by_mode"][mode],
+                    )
+            if args.run_mfq:
+                for mode in mfq_modes:
+                    agg = r["mfq_agg_by_mode"][mode]
+                    table.add_data(
+                        kind, f"MFQ[{mode}]",
+                        agg["terminal_ot_cost_mean"], agg["terminal_ot_cost_std"],
+                        agg["reach_rate_mean"], agg["reach_rate_std"],
+                        agg["target_coverage_mean"], agg["target_coverage_std"],
+                        agg["mean_time_to_reach_mean"], agg["mean_time_to_reach_std"],
+                        agg["total_cost_mean"], agg["total_cost_std"],
+                        r["mfq_train_time_by_mode"][mode],
+                        r["mfq_env_interactions_by_mode"][mode],
+                    )
+            if args.run_mfq_local:
+                for mode in mfq_local_modes:
+                    agg = r["mfq_local_agg_by_mode"][mode]
+                    table.add_data(
+                        kind, f"MFQ-local[{mode}]",
+                        agg["terminal_ot_cost_mean"], agg["terminal_ot_cost_std"],
+                        agg["reach_rate_mean"], agg["reach_rate_std"],
+                        agg["target_coverage_mean"], agg["target_coverage_std"],
+                        agg["mean_time_to_reach_mean"], agg["mean_time_to_reach_std"],
+                        agg["total_cost_mean"], agg["total_cost_std"],
+                        r["mfq_local_train_time_by_mode"][mode],
+                        r["mfq_local_env_interactions_by_mode"][mode],
                     )
         wb_run.log({"comparison_table": table})
 

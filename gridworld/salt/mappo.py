@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-from .env import GridConfig, ACTIONS, Pos
+from .env import GridConfig, ACTIONS, Pos, target_col_lo
 from .noise import NoiseConfig
 from .matching import terminal_ot_cost, target_coverage_rate
 
@@ -48,6 +48,9 @@ class MAPPOConfig:
     early_stop_plateau_window_batches: int = 0
     early_stop_max_delta_reach_rate: float = 0.0
     early_stop_max_delta_mean_reward: float = 0.0
+    # Success stop: halt once training reach rate is sustained >= this target
+    # for `plateau_window` (fallback `patience`) consecutive batches. 0 disables.
+    early_stop_reach_target: float = 0.0
 
 
 class Actor(nn.Module):
@@ -170,6 +173,7 @@ def train_mappo(
     batch_rewards_log: List[float] = []
     train_curve: List[Dict[str, float]] = []
     consecutive_small_updates = 0
+    consecutive_target_ok = 0
     early_stopped = False
     stop_reason = ""
     if wb_run is not None:
@@ -185,7 +189,7 @@ def train_mappo(
         pos_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         pos_c = np.zeros((E, N), dtype=np.int32)
         tgt_r = rng.integers(0, grid.h, size=(E, M)).astype(np.int32)
-        col_lo = max(0, grid.w // 2)
+        col_lo = target_col_lo(grid)
         tgt_c = rng.integers(col_lo, grid.w, size=(E, M)).astype(np.int32)
 
         reached = np.zeros((E, N), dtype=bool)
@@ -433,6 +437,21 @@ def train_mappo(
                 f"{p}/entropy": entropy_v,
                 f"{p}/clip_fraction": clip_frac_v,
             })
+
+        if cfg.early_stop_reach_target > 0.0:
+            if reach_rate >= cfg.early_stop_reach_target:
+                consecutive_target_ok += 1
+            else:
+                consecutive_target_ok = 0
+            tw = (cfg.early_stop_plateau_window_batches
+                  or cfg.early_stop_patience_batches or 1)
+            if consecutive_target_ok >= max(1, tw):
+                early_stopped = True
+                stop_reason = (f"reach rate >= {cfg.early_stop_reach_target:.0%} "
+                               f"for {consecutive_target_ok} batches")
+                print(f"[MAPPO-{noise_cfg.kind}|{obs_mode}] early stop at batch "
+                      f"{batch_idx + 1}: {stop_reason}")
+                break
 
         if cfg.early_stop_patience_batches > 0:
             small_update_ok = (

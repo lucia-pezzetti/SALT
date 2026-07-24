@@ -607,18 +607,21 @@ def run_q_learning(args, ctx: RunContext) -> None:
         'completions': all_completions,
     }
     
-    print(f"\nFinal Evaluation Results:")
-    print(f"  Average Reward: {final_eval['avg_reward']:.2f}")
-    print(f"  Average Steps: {final_eval['avg_steps']:.1f}")
-    print(f"  Completion Rate: {final_eval['completion_rate']:.2%}")
-    print(f"  Total evaluations: {len(all_rewards)} (25 set combinations × {B} agents)")
-    
-    # Log final metrics
-    wandb.log({
-        "final/avg_reward": final_eval['avg_reward'],
-        "final/avg_steps": final_eval['avg_steps'],
-        "final/completion_rate": final_eval['completion_rate'],
-    })
+    # Old learned-Q (assign-once) reporting: suppressed when the four-way
+    # reassignment comparison is active (result #1 there supersedes it).
+    if not getattr(args, "eval_reassignment_baselines", False):
+        print(f"\nFinal Evaluation Results:")
+        print(f"  Average Reward: {final_eval['avg_reward']:.2f}")
+        print(f"  Average Steps: {final_eval['avg_steps']:.1f}")
+        print(f"  Completion Rate: {final_eval['completion_rate']:.2%}")
+        print(f"  Total evaluations: {len(all_rewards)} (25 set combinations × {B} agents)")
+
+        # Log final metrics
+        wandb.log({
+            "final/avg_reward": final_eval['avg_reward'],
+            "final/avg_steps": final_eval['avg_steps'],
+            "final/completion_rate": final_eval['completion_rate'],
+        })
     
     # Shortest path baseline - CONTINUOUS (real-world comparison)
     def evaluate_shortest_path_baseline_continuous(starts, pickups):
@@ -764,7 +767,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     batch_reset = jax.jit(jax.vmap(lambda k, s, p: init_env(k, s, p, ctx.env.neighbor_mask_static), in_axes=(0, 0, 0)))
     
     def evaluate_q_learning_batched_impl(q_table, starts, pickups, eval_key, dt, max_time_slices, num_nodes, max_steps, use_continuous_eval):
-        """Batched GPU evaluation of Q-learning policy with path tracking."""
+        """Evaluation of Q-learning policy with path tracking."""
         num_eval = starts.shape[0]
         eval_keys = jax.random.split(eval_key, num_eval)
         eval_states, _ = batch_reset(eval_keys, starts, pickups)
@@ -863,7 +866,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     evaluate_q_learning_batched = jax.jit(evaluate_q_learning_batched_impl, static_argnums=(7, 8))
 
     def evaluate_sp_policy_batched_impl(starts, pickups, eval_key, max_steps, use_discrete):
-        """Batched GPU evaluation of shortest path policy with path tracking."""
+        """Evaluation of shortest path policy with path tracking."""
         num_eval = starts.shape[0]
         eval_keys = jax.random.split(eval_key, num_eval)
         eval_states, _ = batch_reset(eval_keys, starts, pickups)
@@ -969,17 +972,151 @@ def run_q_learning(args, ctx: RunContext) -> None:
     # Wrap with jit, making max_steps and use_discrete static
     evaluate_sp_policy_batched = jax.jit(evaluate_sp_policy_batched_impl, static_argnums=(3, 4))
 
-    # Evaluation loop with trajectory printing
-    eval_iter = 2
-    print_eval_trajectories = (
-        args.epochs == 0 and getattr(args, "init_q_table_path", None)
+    def evaluate_sp_reassign_batched(starts, pickups, eval_key, max_steps, reassign_every, use_discrete):
+        """Shortest-path routing with periodic JOINT reassignment (receding-horizon dispatch).
+
+        Every `reassign_every` timesteps the agent->target matching is re-solved with the
+        Hungarian algorithm on offline shortest-path distances between agents' CURRENT nodes
+        and the fixed target pool `pickups`; between reassignments each agent follows the
+        offline shortest path to its current target. Agents are stepped as a batch; the small
+        B x B Hungarian solve runs on host every K steps (K << horizon, B == num_agents).
+
+        A finished agent sits on its target (distance 0), so the Hungarian solution keeps it
+        there -- served targets are thus implicitly "consumed" with no special-casing.
+        Returns (total_times, total_rewards, completed) as numpy arrays, matching the columns
+        used by the other baselines.
+        """
+        num_eval = int(starts.shape[0])
+        eval_keys = jax.random.split(eval_key, num_eval)
+        states, _ = batch_reset(eval_keys, starts, pickups)
+        pool = jnp.asarray(pickups, dtype=jnp.int32)          # fixed candidate targets (B,)
+
+        total_times = np.zeros(num_eval, dtype=np.float32)
+        total_rewards = np.zeros(num_eval, dtype=np.float32)
+        completed = np.zeros(num_eval, dtype=bool)
+        key = eval_key
+
+        for step in range(int(max_steps)):
+            if bool(np.all(completed)):
+                break
+            # Periodic joint reassignment (step 0 already carries the initial matching).
+            if reassign_every > 0 and step > 0 and (step % reassign_every == 0):
+                cost = ctx.env.distances[states.current_node][:, pool]   # [B, B] offline SP distances
+                _, assignment = optax.assignment.hungarian_algorithm(cost)
+                states = states._replace(pickup_node=jnp.take(pool, assignment, axis=0))
+
+            if use_discrete:
+                actions = offline_shortest_path_action_discrete_batch(
+                    states.current_node, states.pickup_node, ctx.env.adj_list,
+                    q_agent.discrete_travel_times, ctx.env.distances,
+                    ctx.env.neighbor_mask_static[states.current_node], 1e-6,
+                )
+            else:
+                actions = offline_shortest_path_action_batch(
+                    states.current_node, states.pickup_node, ctx.env.adj_list,
+                    ctx.env.travel_times, ctx.env.distances,
+                    ctx.env.neighbor_mask_static[states.current_node],
+                )
+
+            key, sub = jax.random.split(key)
+            noise_keys = jax.random.split(sub, num_eval)
+            if use_discrete:
+                states, rewards, terminals, info = batch_step_discrete(states, actions, noise_keys)
+            else:
+                states, rewards, terminals, info = batch_step_continuous(states, actions, noise_keys)
+
+            active = ~completed
+            total_times += np.asarray(info['travel'] + info['wait'], dtype=np.float32) * active
+            total_rewards += np.asarray(rewards, dtype=np.float32) * active
+            completed = completed | np.asarray(terminals, dtype=bool)
+
+        return total_times, total_rewards, completed
+
+    # Per-agent-time version of the Q-return estimator (the built-in one broadcasts a
+    # single scalar time_idx; mid-episode agents are at different times).
+    from training.q_learning import _estimate_return_q_table_direct
+    _estimate_returns_time = jax.vmap(
+        _estimate_return_q_table_direct,
+        in_axes=(None, 0, 0, 0, None, None, None),  # q_table, start, pickup, time_idx(batched), ...
+        out_axes=0,
     )
+
+    def evaluate_q_reassign_batched(starts, init_pickups, pool_pickups, eval_key,
+                                    max_steps, use_continuous_eval):
+        """SALT evaluation with OT assignment RE-SOLVED every timestep.
+
+        Each step: estimate Q-returns (max_a Q) from every agent's CURRENT node and CURRENT
+        (discretized) time to every target in `pool_pickups`, solve the Hungarian assignment
+        on -returns, reassign each agent's target, then take one greedy learned-Q routing
+        step. `init_pickups` is the t=0 OT matching (so reset targets are valid); subsequent
+        steps re-solve. Batched over agents; the small B x B Hungarian runs on host each step.
+        """
+        num_eval = int(starts.shape[0])
+        eval_keys = jax.random.split(eval_key, num_eval)
+        states, _ = batch_reset(eval_keys, starts, init_pickups)
+        pool = jnp.asarray(pool_pickups, dtype=jnp.int32)
+        dt = q_agent.dt
+        mts = q_agent.max_time_slices
+        nn = ctx.env.num_nodes
+
+        total_times = np.zeros(num_eval, dtype=np.float32)
+        total_rewards = np.zeros(num_eval, dtype=np.float32)
+        completed = np.zeros(num_eval, dtype=bool)
+        key = eval_key
+
+        for step in range(int(max_steps)):
+            if bool(np.all(completed)):
+                break
+            # Re-solve OT every timestep (step 0 already carries the t=0 matching).
+            if step > 0:
+                cur = jnp.clip(states.current_node, 0, nn - 1)
+                t_idx = jnp.clip(jnp.int32(jnp.round(states.time / dt)), 0, mts - 1)  # (B,)
+                starts_exp = jnp.repeat(cur, num_eval)          # each agent x all targets
+                pool_exp = jnp.tile(pool, num_eval)
+                t_exp = jnp.repeat(t_idx, num_eval)
+                returns = _estimate_returns_time(
+                    q_agent.q_table, starts_exp, pool_exp, t_exp, nn, mts, ctx.env
+                )
+                cost = (-returns).reshape(num_eval, num_eval)   # [B agents, B targets]
+                _, assignment = optax.assignment.hungarian_algorithm(cost)
+                states = states._replace(pickup_node=jnp.take(pool, assignment, axis=0))
+
+            # Greedy learned-Q routing step (epsilon=0), same lookup as evaluate_batch_episodes.
+            curr = jnp.clip(states.current_node, 0, nn - 1)
+            pk = jnp.clip(states.pickup_node, 0, nn - 1)
+            ti = jnp.clip(jnp.int32(jnp.round(states.time / dt)), 0, mts - 1)
+            q_vals = q_agent.q_table[curr, pk, ti, :]
+            q_vals = jnp.where(states.neighbor_mask, q_vals, -jnp.inf)
+            actions = jnp.argmax(q_vals, axis=-1)
+
+            key, sub = jax.random.split(key)
+            noise_keys = jax.random.split(sub, num_eval)
+            if use_continuous_eval:
+                states, rewards, terminals, info = batch_step_continuous(states, actions, noise_keys)
+            else:
+                states, rewards, terminals, info = batch_step_discrete(states, actions, noise_keys)
+
+            active = ~completed
+            total_times += np.asarray(info['travel'] + info['wait'], dtype=np.float32) * active
+            total_rewards += np.asarray(rewards, dtype=np.float32) * active
+            completed = completed | np.asarray(terminals, dtype=bool)
+
+        return total_times, total_rewards, completed
+
+    reassignment_periods = []
+    if getattr(args, "eval_reassignment_baselines", False):
+        reassignment_periods = [
+            int(k) for k in str(getattr(args, "reassignment_periods", "5,10")).split(",") if k.strip()
+        ]
+
+    # Evaluation loop
+    eval_iter = 50
     eval_loop_key = jax.random.PRNGKey(args.seed + 1000)
     max_eval_steps = 2 * ctx.max_length
     
     print("\n" + "="*60)
-    print("Starting optimized batched GPU trajectory evaluation...")
-    print(f"🚀 Running {eval_iter} iterations with batched GPU evaluation")
+    print("Starting trajectory evaluation...")
+    print(f"Running {eval_iter} iterations")
     print("="*60)
     
     for i in range(eval_iter):
@@ -1012,7 +1149,26 @@ def run_q_learning(args, ctx: RunContext) -> None:
         cost_matrix_q = -returns_matrix
         _, assignment_q = optax.assignment.hungarian_algorithm(cost_matrix_q)
         matched_q_pickups = jnp.take(pickups_jax, assignment_q, axis=0)
-        
+
+        # Assignment-ablation baselines (R3-W1): reuse the SAME learned Q routing
+        # policy but swap out SALT's optimal-transport assignment. This isolates
+        # how much of SALT's benefit comes from the OT layer vs. the routing.
+        if getattr(args, "eval_assignment_baselines", False):
+            # Independent RNG derived from base_seed so the Q/SP eval streams
+            # below are byte-identical whether or not baselines are enabled.
+            baseline_key = jax.random.PRNGKey(base_seed + 555)
+            # (1) Random assignment: a random permutation of the pickups.
+            rand_perm = jax.random.permutation(baseline_key, num_pickups)
+            matched_rand_pickups = jnp.take(pickups_jax, rand_perm, axis=0)
+            # (2) Myopic nominal-shortest-path assignment: Hungarian on the static
+            #     precomputed distance matrix (ignores congestion / time). This is
+            #     the cheap "nominal shortest-path assignment" reassessed at t=0.
+            dist_cost = build_cost_matrix_from_distances(
+                starts_jax, pickups_jax, ctx.env.distances
+            )
+            _, assignment_myopic = optax.assignment.hungarian_algorithm(dist_cost)
+            matched_myopic_pickups = jnp.take(pickups_jax, assignment_myopic, axis=0)
+
         # Shortest path matching
         matched_sp_pickups_cont, _ = match_pickups(
             eval_starts, eval_pickups, sp_policy, base_seed + 1, use_discrete=False
@@ -1026,7 +1182,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         eval_loop_key, sp_cont_key = jax.random.split(eval_loop_key)
         eval_loop_key, sp_disc_key = jax.random.split(eval_loop_key)
         
-        print(f"\n Evaluation iteration {i+1}/{eval_iter} (batched GPU)")
+        print(f"\n Evaluation iteration {i+1}/{eval_iter}")
         
         # Q-learning continuous evaluation
         q_times_continuous, q_rewards_continuous, q_completed_continuous, q_paths_continuous, q_path_lens_continuous, q_step_rewards_continuous, q_step_times_continuous = evaluate_q_learning_batched(
@@ -1049,7 +1205,22 @@ def run_q_learning(args, ctx: RunContext) -> None:
         sp_times_discrete, sp_rewards_discrete, sp_completed_discrete, sp_paths_discrete, sp_path_lens_discrete, sp_step_rewards_discrete, sp_step_times_discrete = evaluate_sp_policy_batched(
             eval_starts, matched_sp_pickups_disc, sp_disc_key, max_eval_steps, use_discrete=True
         )
-        
+
+        # Assignment-ablation baselines: SAME learned routing, different assignment.
+        if getattr(args, "eval_assignment_baselines", False):
+            rand_eval_key = jax.random.PRNGKey(base_seed + 777)
+            myopic_eval_key = jax.random.PRNGKey(base_seed + 888)
+            rand_times_continuous = np.array(evaluate_q_learning_batched(
+                q_agent.q_table, eval_starts, matched_rand_pickups, rand_eval_key,
+                q_agent.dt, q_agent.max_time_slices, ctx.env.num_nodes, max_eval_steps,
+                use_continuous_eval=True,
+            )[0])
+            myopic_times_continuous = np.array(evaluate_q_learning_batched(
+                q_agent.q_table, eval_starts, matched_myopic_pickups, myopic_eval_key,
+                q_agent.dt, q_agent.max_time_slices, ctx.env.num_nodes, max_eval_steps,
+                use_continuous_eval=True,
+            )[0])
+
         # Convert to numpy and extract variable-length paths/step data
         q_times_continuous = np.array(q_times_continuous)
         q_times_discrete = np.array(q_times_discrete)
@@ -1085,58 +1256,86 @@ def run_q_learning(args, ctx: RunContext) -> None:
             sp_paths_discrete, sp_path_lens_discrete, sp_step_rewards_discrete, sp_step_times_discrete
         )
         
-        if print_eval_trajectories:
-            print(f"\nQ-Learning Trajectories (Continuous - Real World):")
-            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-                zip(eval_starts, matched_q_pickups, q_paths_continuous, q_times_continuous, q_rewards_continuous, q_step_rewards_continuous, q_step_times_continuous)
-            ):
-                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-                print(f"    Path: {' -> '.join(map(str, path))}")
-                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
+        # (Per-agent trajectory printing removed.)
 
-            print(f"\nQ-Learning Trajectories (Discrete - Training Environment):")
-            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-                zip(eval_starts, matched_q_pickups, q_paths_discrete, q_times_discrete, q_rewards_discrete, q_step_rewards_discrete, q_step_times_discrete)
-            ):
-                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-                print(f"    Path: {' -> '.join(map(str, path))}")
-                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
+        # Old per-iteration Q/SP time dump: suppressed under the four-way comparison
+        # (which prints its own clean summary and logs the four results to wandb).
+        if not getattr(args, "eval_reassignment_baselines", False):
+            print(f"\nQ-learning avg time (continuous): {q_times_continuous.tolist()}")
+            print(f"Q-learning avg time (discrete): {q_times_discrete.tolist()}")
+            print(f"SP (continuous) avg time: {sp_times_continuous.tolist()}")
+            print(f"SP (discrete) avg time: {sp_times_discrete.tolist()}")
 
-            print(f"\nShortest Path Trajectories (Continuous - Real World):")
-            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-                zip(eval_starts, matched_sp_pickups_cont, sp_paths_continuous, sp_times_continuous, sp_rewards_continuous, sp_step_rewards_continuous, sp_step_times_continuous)
-            ):
-                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-                print(f"    Path: {' -> '.join(map(str, path))}")
-                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
+            # Keep scalar means as additional context (new labels to avoid ambiguity).
+            print(f"Q-learning mean over agents (continuous): {np.mean(q_times_continuous):.2f}")
+            print(f"Q-learning mean over agents (discrete): {np.mean(q_times_discrete):.2f}")
+            print(f"SP mean over agents (continuous): {np.mean(sp_times_continuous):.2f}")
+            print(f"SP mean over agents (discrete): {np.mean(sp_times_discrete):.2f}")
 
-            print(f"\nShortest Path Trajectories (Discrete - Fair Comparison):")
-            for agent_idx, (start, pickup, path, time, reward, step_rewards, step_times) in enumerate(
-                zip(eval_starts, matched_sp_pickups_disc, sp_paths_discrete, sp_times_discrete, sp_rewards_discrete, sp_step_rewards_discrete, sp_step_times_discrete)
-            ):
-                print(f"  Agent {agent_idx+1}: Start={int(start)}, Pickup={int(pickup)}")
-                print(f"    Path: {' -> '.join(map(str, path))}")
-                print(f"    Time: {time:.2f}s, Total Reward: {reward:.2f}, Steps: {len(path)-1}")
-                print(f"    Rewards per step: {', '.join([f'Step {i+1}: {r:.2f}' for i, r in enumerate(step_rewards)])}")
-                print(f"    Times per step: {', '.join([f'Step {i+1}: {t:.2f}s' for i, t in enumerate(step_times)])}")
-        
-        print(f"\nQ-learning avg time (continuous): {q_times_continuous.tolist()}")
-        print(f"Q-learning avg time (discrete): {q_times_discrete.tolist()}")
-        print(f"SP (continuous) avg time: {sp_times_continuous.tolist()}")
-        print(f"SP (discrete) avg time: {sp_times_discrete.tolist()}")
+        if getattr(args, "eval_assignment_baselines", False):
+            print(
+                "\n--- Assignment ablations (same learned routing, no OT layer) ---"
+            )
+            print(f"Random-assignment avg time (continuous): {rand_times_continuous.tolist()}")
+            print(f"Myopic-nominal-SP-assignment avg time (continuous): {myopic_times_continuous.tolist()}")
+            print(f"Random-assignment mean over agents (continuous): {np.mean(rand_times_continuous):.2f}")
+            print(f"Myopic-nominal-SP-assignment mean over agents (continuous): {np.mean(myopic_times_continuous):.2f}")
+            print(
+                "SALT (OT + learned routing) mean over agents (continuous): "
+                f"{np.mean(q_times_continuous):.2f}"
+            )
+            if wandb.run is not None:
+                wandb.log({
+                    f"final_eval/iter{i}/random_assignment_mean_time_continuous": float(np.mean(rand_times_continuous)),
+                    f"final_eval/iter{i}/myopic_nominal_sp_assignment_mean_time_continuous": float(np.mean(myopic_times_continuous)),
+                    f"final_eval/iter{i}/salt_ot_mean_time_continuous": float(np.mean(q_times_continuous)),
+                })
 
-        # Keep scalar means as additional context (new labels to avoid ambiguity).
-        print(f"Q-learning mean over agents (continuous): {np.mean(q_times_continuous):.2f}")
-        print(f"Q-learning mean over agents (discrete): {np.mean(q_times_discrete):.2f}")
-        print(f"SP mean over agents (continuous): {np.mean(sp_times_continuous):.2f}")
-        print(f"SP mean over agents (discrete): {np.mean(sp_times_discrete):.2f}")
-        
+        # === Four-way final comparison (enabled by --eval_reassignment_baselines) ===
+        #   (1) SALT: learned-Q routing + OT assignment RE-SOLVED every timestep
+        #   (2) shortest-path, static (assign once at t=0)     [reuse sp_* computed above]
+        #   (3,4) shortest-path + reassignment every K (from --reassignment_periods)
+        if getattr(args, "eval_reassignment_baselines", False):
+            salt_t_cont, _, salt_c_cont = evaluate_q_reassign_batched(
+                eval_starts, matched_q_pickups, eval_pickups,
+                jax.random.PRNGKey(base_seed + 2500), max_eval_steps, use_continuous_eval=True,
+            )
+            salt_t_disc, _, salt_c_disc = evaluate_q_reassign_batched(
+                eval_starts, matched_q_pickups, eval_pickups,
+                jax.random.PRNGKey(base_seed + 2600), max_eval_steps, use_continuous_eval=False,
+            )
+            print("\n--- Final four-way comparison (mean time over agents) ---")
+            print(f"  (1) SALT (learned Q + OT every timestep): cont={np.mean(salt_t_cont):.2f}  disc={np.mean(salt_t_disc):.2f}")
+            print(f"  (2) Shortest-path static (assign@t=0):    cont={np.mean(sp_times_continuous):.2f}  disc={np.mean(sp_times_discrete):.2f}")
+            log_payload = {
+                f"final_eval/iter{i}/salt_reassign_every_step_mean_time_continuous": float(np.mean(salt_t_cont)),
+                f"final_eval/iter{i}/salt_reassign_every_step_mean_time_discrete": float(np.mean(salt_t_disc)),
+                f"final_eval/iter{i}/salt_reassign_every_step_completion_continuous": float(np.mean(salt_c_cont)),
+                f"final_eval/iter{i}/salt_reassign_every_step_completion_discrete": float(np.mean(salt_c_disc)),
+                f"final_eval/iter{i}/sp_static_mean_time_continuous": float(np.mean(sp_times_continuous)),
+                f"final_eval/iter{i}/sp_static_mean_time_discrete": float(np.mean(sp_times_discrete)),
+                f"final_eval/iter{i}/sp_static_completion_continuous": float(np.mean(sp_completed_continuous)),
+                f"final_eval/iter{i}/sp_static_completion_discrete": float(np.mean(sp_completed_discrete)),
+            }
+            for _k in reassignment_periods:
+                re_t_cont, _, re_c_cont = evaluate_sp_reassign_batched(
+                    eval_starts, matched_sp_pickups_cont, jax.random.PRNGKey(base_seed + 3000 + _k),
+                    max_eval_steps, _k, use_discrete=False,
+                )
+                re_t_disc, _, re_c_disc = evaluate_sp_reassign_batched(
+                    eval_starts, matched_sp_pickups_disc, jax.random.PRNGKey(base_seed + 4000 + _k),
+                    max_eval_steps, _k, use_discrete=True,
+                )
+                print(f"  (K={_k}) Shortest-path + reassign every {_k}:   cont={np.mean(re_t_cont):.2f}  disc={np.mean(re_t_disc):.2f}")
+                log_payload.update({
+                    f"final_eval/iter{i}/sp_reassign{_k}_mean_time_continuous": float(np.mean(re_t_cont)),
+                    f"final_eval/iter{i}/sp_reassign{_k}_mean_time_discrete": float(np.mean(re_t_disc)),
+                    f"final_eval/iter{i}/sp_reassign{_k}_completion_continuous": float(np.mean(re_c_cont)),
+                    f"final_eval/iter{i}/sp_reassign{_k}_completion_discrete": float(np.mean(re_c_disc)),
+                })
+            if wandb.run is not None:
+                wandb.log(log_payload)
+
     wandb.finish()
     print("\n" + "="*60)
     print("Q-learning training completed!")

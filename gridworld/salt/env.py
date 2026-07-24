@@ -16,6 +16,8 @@ class GridConfig:
     collision_penalty: float = 0.0
     goal_bonus: float = 10.0
     rng_seed: int = 0
+    # Region from which training targets are sampled. See target_col_lo().
+    target_region: str = "last_half"
 
 ACTIONS = {
     0: (-1, 0),  # up
@@ -27,6 +29,23 @@ ACTIONS = {
 
 def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+def target_col_lo(grid: GridConfig) -> int:
+    """Lowest column index for sampling training targets in ``grid``.
+
+    Regions (``grid.target_region``):
+    - ``"last_ten"``:  columns ``[w-10, w)`` — the paper's Fig. 2 setup
+      (columns 20-29 on the 11x30 grid).
+    - ``"last_half"``: columns ``[w//2, w)`` — legacy default.
+    - ``"full_grid"``: all columns ``[0, w)``.
+    """
+    region = getattr(grid, "target_region", "last_half")
+    if region == "last_ten":
+        return max(0, grid.w - 10)
+    if region == "full_grid":
+        return 0
+    return max(0, grid.w // 2)
 
 class SingleAgentGoalGrid:
     """

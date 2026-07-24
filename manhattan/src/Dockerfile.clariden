@@ -1,0 +1,26 @@
+# Container image for the Manhattan ride-sharing Q-learning run on Clariden (GH200 / aarch64).
+#
+# The CSCS container engine injects the host NVIDIA driver at runtime via its CUDA hook,
+# so the image only needs the CUDA user-space libs (pulled in by `jax[cuda12]`) + deps.
+# Base is a multi-arch NGC CUDA image; aarch64 is selected automatically on Clariden.
+#
+# Build + import to a squashfs on scratch (run on a Clariden login node, from the
+# manhattan/ directory so requirements.txt is in the build context):
+#   cd manhattan
+#   podman build --arch arm64 -f src/Dockerfile.clariden -t ride-sharing:0.6.0 .
+#   enroot import -o "$SCRATCH/images/ride-sharing-0.6.0.sqsh" podman://ride-sharing:0.6.0
+# Then point clariden.toml `image` at that .sqsh.
+FROM nvcr.io/nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 python3-pip python3.10-venv git \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python
+
+# Project Python dependencies (jax[cuda12]==0.6.0, geopandas, osmnx, networkx, wandb, ...).
+COPY requirements.txt /tmp/requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r /tmp/requirements.txt
+
+WORKDIR /workspace

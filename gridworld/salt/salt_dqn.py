@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .env import GridConfig, Pos
+from .env import GridConfig, Pos, target_col_lo
 from .noise import NoiseConfig
 from .salt_ppo import _obs_sep
 
@@ -253,7 +253,7 @@ def train_goal_deep_double_dqn(
         starts_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         starts_c = np.zeros((E, N), dtype=np.int32)
         targets_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
-        col_lo = max(0, grid.w // 2)
+        col_lo = target_col_lo(grid)
         targets_c = rng.integers(col_lo, grid.w, size=(E, N)).astype(np.int32)
         goals_r = np.empty((E, N), dtype=np.int32)
         goals_c = np.empty((E, N), dtype=np.int32)

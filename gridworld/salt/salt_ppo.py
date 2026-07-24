@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-from .env import GridConfig, SingleAgentGoalGrid, Pos
+from .env import GridConfig, SingleAgentGoalGrid, Pos, target_col_lo
 from .noise import NoiseConfig
 
 # The small tensor workloads here are faster with bounded intra-op parallelism.
@@ -40,6 +40,9 @@ class SepPPOConfig:
     early_stop_plateau_window_batches: int = 0
     early_stop_max_delta_reach_rate: float = 0.0
     early_stop_max_delta_mean_reward: float = 0.0
+    # Success stop: halt once training reach rate is sustained >= this target
+    # for `plateau_window` (fallback `patience`) consecutive batches. 0 disables.
+    early_stop_reach_target: float = 0.0
 
 
 class _Actor(nn.Module):
@@ -227,6 +230,7 @@ def train_goal_ppo(
     reach_log: List[float] = []
     train_curve: List[Dict[str, float]] = []
     consecutive_small_updates = 0
+    consecutive_target_ok = 0
     early_stopped = False
     stop_reason = ""
     if wb_run is not None:
@@ -249,7 +253,7 @@ def train_goal_ppo(
         starts_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         starts_c = np.zeros((E, N), dtype=np.int32)
         targets_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
-        col_lo = max(0, grid.w // 2)
+        col_lo = target_col_lo(grid)
         targets_c = rng.integers(col_lo, grid.w, size=(E, N)).astype(np.int32)
         goals_r = np.empty((E, N), dtype=np.int32)
         goals_c = np.empty((E, N), dtype=np.int32)
@@ -428,6 +432,21 @@ def train_goal_ppo(
                 f"{p}/entropy": entropy_v,
             })
 
+        if cfg.early_stop_reach_target > 0.0:
+            if mean_reach >= cfg.early_stop_reach_target:
+                consecutive_target_ok += 1
+            else:
+                consecutive_target_ok = 0
+            tw = (cfg.early_stop_plateau_window_batches
+                  or cfg.early_stop_patience_batches or 1)
+            if consecutive_target_ok >= max(1, tw):
+                early_stopped = True
+                stop_reason = (f"reach rate >= {cfg.early_stop_reach_target:.0%} "
+                               f"for {consecutive_target_ok} batches")
+                print(f"[SepPPO-{noise_cfg.kind}] early stop at batch "
+                      f"{batch_idx + 1}: {stop_reason}")
+                break
+
         if cfg.early_stop_patience_batches > 0:
             small_update_ok = (
                 cfg.early_stop_min_rel_policy_update <= 0.0
@@ -527,6 +546,7 @@ def train_goal_a2c(
     reach_log: List[float] = []
     train_curve: List[Dict[str, float]] = []
     consecutive_small_updates = 0
+    consecutive_target_ok = 0
     early_stopped = False
     stop_reason = ""
     if wb_run is not None:
@@ -549,7 +569,7 @@ def train_goal_a2c(
         starts_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
         starts_c = np.zeros((E, N), dtype=np.int32)
         targets_r = rng.integers(0, grid.h, size=(E, N)).astype(np.int32)
-        col_lo = max(0, grid.w // 2)
+        col_lo = target_col_lo(grid)
         targets_c = rng.integers(col_lo, grid.w, size=(E, N)).astype(np.int32)
         goals_r = np.empty((E, N), dtype=np.int32)
         goals_c = np.empty((E, N), dtype=np.int32)
@@ -721,6 +741,21 @@ def train_goal_a2c(
                 f"{p}/critic_loss": critic_loss_v,
                 f"{p}/entropy": entropy_v,
             })
+
+        if cfg.early_stop_reach_target > 0.0:
+            if mean_reach >= cfg.early_stop_reach_target:
+                consecutive_target_ok += 1
+            else:
+                consecutive_target_ok = 0
+            tw = (cfg.early_stop_plateau_window_batches
+                  or cfg.early_stop_patience_batches or 1)
+            if consecutive_target_ok >= max(1, tw):
+                early_stopped = True
+                stop_reason = (f"reach rate >= {cfg.early_stop_reach_target:.0%} "
+                               f"for {consecutive_target_ok} batches")
+                print(f"[SepPPO-{noise_cfg.kind}] early stop at batch "
+                      f"{batch_idx + 1}: {stop_reason}")
+                break
 
         if cfg.early_stop_patience_batches > 0:
             small_update_ok = (

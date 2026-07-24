@@ -1,0 +1,25 @@
+# CSCS container-engine Environment Definition File (EDF) for the Manhattan run.
+# Use with:  srun --environment=./clariden.toml ...   (or #SBATCH --environment=...)
+#
+# `image` points at the squashfs built from Dockerfile.clariden (see that file).
+# Adjust the paths below to your project checkout and scratch.
+
+image = "${SCRATCH}/images/ride-sharing-0.6.0.sqsh"
+
+# Alternative (no custom build): start from an NGC JAX base and rely on baked deps.
+# image = "nvcr.io#nvidia/jax:24.10-py3"
+
+# Bind-mount scratch and your repo so code/data/outputs live on the parallel FS,
+# and code edits don't require an image rebuild.
+mounts = [
+    "${SCRATCH}:${SCRATCH}",
+    "${HOME}/SALT/manhattan:/workspace",   # <-- set to your checkout location
+]
+
+workdir = "/workspace/src"
+
+[env]
+JAX_PLATFORMS = "cuda"
+XLA_PYTHON_CLIENT_PREALLOCATE = "false"
+WANDB_MODE = "offline"
+USE_CONTAINER = "1"

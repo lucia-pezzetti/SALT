@@ -19,7 +19,7 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/ride-sharing-cache}"
 
 # Weights & Biases configuration
 export WANDB_PROJECT="${WANDB_PROJECT:-ride-sharing-optimized}"
-export WANDB_MODE="${WANDB_MODE:-online}"  # Use "offline" or "disabled" without internet.
+export WANDB_MODE="${WANDB_MODE:-offline}"  # Offline by default (CSCS compute nodes have no internet); `wandb sync` later. Set WANDB_MODE=online locally.
 export WANDB_DIR="${WANDB_DIR:-/tmp/ride-sharing-wandb}"
 export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-/tmp/ride-sharing-wandb-cache}"
 
@@ -139,13 +139,15 @@ for SEED in "${SEEDS[@]}"; do
         --epsilon_start 1.0 \
         --eval_frequency 10000 \
         --random_offsets \
-        --num_agents 10 \
+        --num_agents 5 \
         --cycle_length 90 \
         --cache_dir ./cache \
         --num_workers 4 \
         --seed ${SEED} \
         --q_table_path ./q_tables/qlearning_south_manhattan_test_5M_epochs_seed0.pkl \
         --init_from_shortest_paths \
+        --eval_reassignment_baselines \
+        --reassignment_periods 5,10 \
         > ${LOG_FILE} 2>&1; then
         echo "Completed seed ${SEED}"
     else
