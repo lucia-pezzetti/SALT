@@ -13,7 +13,7 @@ image = "${SCRATCH}/images/ride-sharing-0.6.0.sqsh"
 # and code edits don't require an image rebuild.
 mounts = [
     "${SCRATCH}:${SCRATCH}",
-    "${HOME}/SALT/manhattan:/workspace",   # <-- set to your checkout location
+    "${SCRATCH}/SALT/manhattan:/workspace",   # <-- your checkout on scratch (NOT $HOME: 50GB, config only)
 ]
 
 workdir = "/workspace/src"

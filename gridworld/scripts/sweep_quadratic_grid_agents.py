@@ -260,7 +260,7 @@ def main() -> None:
                     help="MFQ-local plateau/target window in batches.")
     ap.add_argument("--mfq_local_early_stop_max_delta_reach", type=float, default=0.05,
                     help="MFQ-local max reach-rate moving-average delta for the plateau stop.")
-    ap.add_argument("--mfq_local_early_stop_max_delta_reward", type=float, default=0.25,
+    ap.add_argument("--mfq_local_early_stop_max_delta_reward", type=float, default=0.2,
                     help="MFQ-local max mean-reward moving-average delta for the plateau stop "
                          "(<=0 uses a reach-rate-only plateau, robust to reward scale).")
     ap.add_argument("--mfq_local_explore_decay_cap_batches", type=int, default=5000,

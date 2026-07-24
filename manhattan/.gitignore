@@ -19,7 +19,6 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # Data, geospatial files, and generated artifacts
-data/
 shapefiles/
 *.parquet
 *.csv
@@ -54,8 +53,6 @@ src/*.txt
 src/*.json
 
 # Shell scripts: keep only the canonical discrete Q-learning launcher.
-src/*.sh
-!src/run_main.sh
 
 # Keep the repository focused on the run_main.sh discrete Q-learning pipeline.
 /main.py
