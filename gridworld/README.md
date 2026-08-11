@@ -52,9 +52,18 @@ For a short smoke test, reduce the training batches, target interactions, and ev
 cooperative-MARL baselines are opt-in:
 
 - `--run_ippo` — Independent PPO
+- `--run_happo` — **Heterogeneous-Agent PPO** (Kuba et al., 2022)
 - `--run_qmix` — QMIX
 - `--run_vdn` — Value Decomposition Networks
 - `--run_mfq` — **Mean-Field Q-learning** (Yang et al., 2018)
+
+HAPPO (`--run_happo`) is a CTDE actor-critic that, unlike MAPPO, uses
+non-shared per-agent actors updated **sequentially** with the heterogeneous-agent
+advantage decomposition (each agent's clipped surrogate is scaled by the
+cumulative product of the previously-updated agents' policy ratios). It shares a
+centralized critic and the same environment, reward decomposition and metrics as
+the other baselines, so HAPPO-vs-MAPPO isolates the effect of the sequential
+trust-region update.
 
 The mean-field baseline (`--run_mfq`) conditions a shared per-agent Q-network on
 the population **mean action** and is the natural point of comparison for the

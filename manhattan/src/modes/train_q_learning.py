@@ -237,7 +237,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
             "max_steps": ctx.env.max_steps,
             "max_training_steps_per_episode": 2 * ctx.max_length,
             "pickup_bonus": ctx.env.pickup_bonus,
-            "timeout_penalty": ctx.env.timeout_penalty,
+            "horizon_continuation_value": "negative_nominal_shortest_path_remaining_travel_time",
             "sample_starts_from_three_fixed": getattr(args, 'sample_starts_from_three_fixed', False),
             "sample_pickups_from_three_fixed": getattr(args, 'sample_pickups_from_three_fixed', False),
             "three_fixed_selection_method": getattr(args, 'three_fixed_selection_method', None),
@@ -250,6 +250,10 @@ def run_q_learning(args, ctx: RunContext) -> None:
             "eval_pickups": eval_pickups_list,
             "eval_combinations": len(eval_starts),
             "eval_frequency": getattr(args, 'eval_frequency', 100),
+            "checkpoint_frequency": getattr(args, 'checkpoint_frequency', 0),
+            "episode_offset": getattr(args, 'episode_offset', 0),
+            "total_epochs_for_schedule": getattr(args, 'total_epochs_for_schedule', None),
+            "skip_final_eval": getattr(args, 'skip_final_eval', False),
             "timestamp": datetime.now().isoformat(),
             "pretrain_enabled": getattr(args, 'pretrain_enabled', False),
             "num_pretrain_episodes": getattr(args, 'num_pretrain_episodes', 1000),
@@ -274,12 +278,18 @@ def run_q_learning(args, ctx: RunContext) -> None:
     epsilon_start = getattr(args, 'epsilon_start', 1.0)
     epsilon_end = getattr(args, 'epsilon_end', 0.01)
     epsilon_decay_fraction = getattr(args, 'epsilon_decay_fraction', 0.5)  # Fraction of training steps for decay
+    schedule_epochs = getattr(args, 'total_epochs_for_schedule', None) or args.epochs
+    episode_offset = getattr(args, 'episode_offset', 0)
     
-    total_training_steps = args.epochs * 2 * ctx.max_length
+    total_training_steps = schedule_epochs * 2 * ctx.max_length
     epsilon_decay_steps = int(total_training_steps * epsilon_decay_fraction) if total_training_steps > 0 else 0
     
     if total_training_steps > 0:
         print(f"\nEpsilon Decay Schedule:")
+        if schedule_epochs != args.epochs or episode_offset:
+            print(f"  Chunk episodes: {args.epochs:,}")
+            print(f"  Episode offset: {episode_offset:,}")
+            print(f"  Schedule total episodes: {schedule_epochs:,}")
         print(f"  Total training steps: {total_training_steps:,}")
         print(f"  Epsilon decay steps: {epsilon_decay_steps:,}")
         print(f"  Epsilon will decay from {epsilon_start} to {epsilon_end} over {epsilon_decay_steps:,} steps")
@@ -296,6 +306,14 @@ def run_q_learning(args, ctx: RunContext) -> None:
     # Check if shortest path initialization is enabled
     init_from_shortest_paths = getattr(args, 'init_from_shortest_paths', False)
     init_all_time_slices = getattr(args, 'init_all_time_slices', False)
+    q_table_path = getattr(args, 'q_table_path', None)
+    resume_existing_q_table = bool(q_table_path and os.path.exists(q_table_path))
+    if init_from_shortest_paths and (resume_existing_q_table or episode_offset > 0):
+        print(
+            "[resume] Existing Q-table or nonzero episode offset detected; "
+            "skipping --init_from_shortest_paths to preserve learned values."
+        )
+        init_from_shortest_paths = False
     
     # If initialization is used and pretraining is enabled, use a lower learning rate for pretraining
     # to avoid overwriting good initialization values
@@ -343,7 +361,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         pretrain_enabled=pretrain_enabled,
         num_pretrain_episodes=num_pretrain_episodes,
         pretrain_log_fn=pretrain_log_fn if pretrain_enabled else None,
-        save_path=args.q_table_path,
+        save_path=None if getattr(args, 'read_only_q_table', False) else args.q_table_path,
         load_path=args.q_table_path,
         initial_q_value=initial_q_value,
         init_from_shortest_paths=init_from_shortest_paths,
@@ -352,19 +370,28 @@ def run_q_learning(args, ctx: RunContext) -> None:
         init_q_table_path=getattr(args, 'init_q_table_path', None),
         no_round_trip=getattr(args, 'no_round_trip', False),
         q_table_dtype=getattr(args, 'q_table_dtype', 'float32'),
+        checkpoint_frequency=getattr(args, 'checkpoint_frequency', 0),
+        episode_offset=episode_offset,
+        total_episodes_for_schedule=schedule_epochs,
     )
+    if getattr(args, 'skip_final_eval', False):
+        print("\nSkipping final evaluation (--skip_final_eval).")
+        wandb.finish()
+        return
     
     # Final evaluation with matching for multiple agents
     print(f"\n{'='*60}")
     print("Final Evaluation (with Hungarian matching)")
     print(f"{'='*60}")
+    eval_seed = args.seed if getattr(args, 'eval_seed', None) is None else args.eval_seed
+    print(f"Final evaluation RNG seed: {eval_seed}")
     
     B = args.num_agents
     num_start_sets = 5
     num_pickup_sets = 5
     
     # Sample 5 sets of B starts and 5 sets of B pickups
-    final_eval_key = jax.random.PRNGKey(args.seed + 9999)
+    final_eval_key = jax.random.PRNGKey(eval_seed + 9999)
     all_start_sets = []
     all_pickup_sets = []
     
@@ -486,7 +513,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     
     for start_set_idx, start_set in enumerate(all_start_sets):
         for pickup_set_idx, pickup_set in enumerate(all_pickup_sets):
-            base_seed = args.seed + start_set_idx * 1000 + pickup_set_idx * 100
+            base_seed = eval_seed + start_set_idx * 1000 + pickup_set_idx * 100
             
             # Perform Hungarian matching for Q-learning
             matched_pickups, _ = match_pickups(
@@ -972,7 +999,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     # Wrap with jit, making max_steps and use_discrete static
     evaluate_sp_policy_batched = jax.jit(evaluate_sp_policy_batched_impl, static_argnums=(3, 4))
 
-    def evaluate_sp_reassign_batched(starts, pickups, eval_key, max_steps, reassign_every, use_discrete):
+    def evaluate_sp_reassign_batched(starts, pickups, eval_key, max_steps, reassign_every, use_discrete, return_paths=False):
         """Shortest-path routing with periodic JOINT reassignment (receding-horizon dispatch).
 
         Every `reassign_every` timesteps the agent->target matching is re-solved with the
@@ -995,6 +1022,10 @@ def run_q_learning(args, ctx: RunContext) -> None:
         total_rewards = np.zeros(num_eval, dtype=np.float32)
         completed = np.zeros(num_eval, dtype=bool)
         key = eval_key
+        if return_paths:
+            paths = [[int(node)] for node in np.asarray(starts).tolist()]
+            target_history = [[int(node)] for node in np.asarray(pickups).tolist()]
+            step_time_history = [[] for _ in range(num_eval)]
 
         for step in range(int(max_steps)):
             if bool(np.all(completed)):
@@ -1026,10 +1057,21 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 states, rewards, terminals, info = batch_step_continuous(states, actions, noise_keys)
 
             active = ~completed
-            total_times += np.asarray(info['travel'] + info['wait'], dtype=np.float32) * active
+            step_times = np.asarray(info['travel'] + info['wait'], dtype=np.float32)
+            total_times += step_times * active
             total_rewards += np.asarray(rewards, dtype=np.float32) * active
+            if return_paths:
+                next_nodes = np.asarray(states.current_node).tolist()
+                targets = np.asarray(states.pickup_node).tolist()
+                for agent_idx in range(num_eval):
+                    if active[agent_idx]:
+                        paths[agent_idx].append(int(next_nodes[agent_idx]))
+                        target_history[agent_idx].append(int(targets[agent_idx]))
+                        step_time_history[agent_idx].append(float(step_times[agent_idx]))
             completed = completed | np.asarray(terminals, dtype=bool)
 
+        if return_paths:
+            return total_times, total_rewards, completed, paths, target_history, step_time_history
         return total_times, total_rewards, completed
 
     # Per-agent-time version of the Q-return estimator (the built-in one broadcasts a
@@ -1042,7 +1084,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     )
 
     def evaluate_q_reassign_batched(starts, init_pickups, pool_pickups, eval_key,
-                                    max_steps, use_continuous_eval):
+                                    max_steps, use_continuous_eval, return_paths=False):
         """SALT evaluation with OT assignment RE-SOLVED every timestep.
 
         Each step: estimate Q-returns (max_a Q) from every agent's CURRENT node and CURRENT
@@ -1063,6 +1105,10 @@ def run_q_learning(args, ctx: RunContext) -> None:
         total_rewards = np.zeros(num_eval, dtype=np.float32)
         completed = np.zeros(num_eval, dtype=bool)
         key = eval_key
+        if return_paths:
+            paths = [[int(node)] for node in np.asarray(starts).tolist()]
+            target_history = [[int(node)] for node in np.asarray(init_pickups).tolist()]
+            step_time_history = [[] for _ in range(num_eval)]
 
         for step in range(int(max_steps)):
             if bool(np.all(completed)):
@@ -1097,10 +1143,21 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 states, rewards, terminals, info = batch_step_discrete(states, actions, noise_keys)
 
             active = ~completed
-            total_times += np.asarray(info['travel'] + info['wait'], dtype=np.float32) * active
+            step_times = np.asarray(info['travel'] + info['wait'], dtype=np.float32)
+            total_times += step_times * active
             total_rewards += np.asarray(rewards, dtype=np.float32) * active
+            if return_paths:
+                next_nodes = np.asarray(states.current_node).tolist()
+                targets = np.asarray(states.pickup_node).tolist()
+                for agent_idx in range(num_eval):
+                    if active[agent_idx]:
+                        paths[agent_idx].append(int(next_nodes[agent_idx]))
+                        target_history[agent_idx].append(int(targets[agent_idx]))
+                        step_time_history[agent_idx].append(float(step_times[agent_idx]))
             completed = completed | np.asarray(terminals, dtype=bool)
 
+        if return_paths:
+            return total_times, total_rewards, completed, paths, target_history, step_time_history
         return total_times, total_rewards, completed
 
     reassignment_periods = []
@@ -1110,8 +1167,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
         ]
 
     # Evaluation loop
-    eval_iter = 50
-    eval_loop_key = jax.random.PRNGKey(args.seed + 1000)
+    eval_iter = getattr(args, "final_eval_iterations", 50)
+    eval_loop_key = jax.random.PRNGKey(eval_seed + 1000)
     max_eval_steps = 2 * ctx.max_length
     
     print("\n" + "="*60)
@@ -1126,7 +1183,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         start_keys, pickup_keys, base_key = eval_keys[:B], eval_keys[B:2*B], eval_keys[-1]
         eval_starts = jnp.array([jax.random.choice(k, ctx.env.fixed_starts) for k in start_keys])
         eval_pickups = jnp.array([jax.random.choice(k, ctx.env.fixed_pickups) for k in pickup_keys])
-        base_seed = int(args.seed + i * 1000)
+        base_seed = int(eval_seed + i * 1000)
         
         # Use fast Q-table-based matching for Q-learning (same as training)
         from training.q_learning import _estimate_returns_batch_q_table_direct
@@ -1296,10 +1353,26 @@ def run_q_learning(args, ctx: RunContext) -> None:
         #   (2) shortest-path, static (assign once at t=0)     [reuse sp_* computed above]
         #   (3,4) shortest-path + reassignment every K (from --reassignment_periods)
         if getattr(args, "eval_reassignment_baselines", False):
-            salt_t_cont, _, salt_c_cont = evaluate_q_reassign_batched(
-                eval_starts, matched_q_pickups, eval_pickups,
-                jax.random.PRNGKey(base_seed + 2500), max_eval_steps, use_continuous_eval=True,
-            )
+            print_eval_trajectories = getattr(args, "print_eval_trajectories", False)
+            sp_reassign_trajectory_debug = {}
+            if print_eval_trajectories:
+                (
+                    salt_t_cont,
+                    _,
+                    salt_c_cont,
+                    salt_paths_cont,
+                    salt_targets_cont,
+                    salt_step_times_cont,
+                ) = evaluate_q_reassign_batched(
+                    eval_starts, matched_q_pickups, eval_pickups,
+                    jax.random.PRNGKey(base_seed + 2500), max_eval_steps,
+                    use_continuous_eval=True, return_paths=True,
+                )
+            else:
+                salt_t_cont, _, salt_c_cont = evaluate_q_reassign_batched(
+                    eval_starts, matched_q_pickups, eval_pickups,
+                    jax.random.PRNGKey(base_seed + 2500), max_eval_steps, use_continuous_eval=True,
+                )
             salt_t_disc, _, salt_c_disc = evaluate_q_reassign_batched(
                 eval_starts, matched_q_pickups, eval_pickups,
                 jax.random.PRNGKey(base_seed + 2600), max_eval_steps, use_continuous_eval=False,
@@ -1318,10 +1391,27 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 f"final_eval/iter{i}/sp_static_completion_discrete": float(np.mean(sp_completed_discrete)),
             }
             for _k in reassignment_periods:
-                re_t_cont, _, re_c_cont = evaluate_sp_reassign_batched(
-                    eval_starts, matched_sp_pickups_cont, jax.random.PRNGKey(base_seed + 3000 + _k),
-                    max_eval_steps, _k, use_discrete=False,
-                )
+                if print_eval_trajectories:
+                    (
+                        re_t_cont,
+                        _,
+                        re_c_cont,
+                        re_paths_cont,
+                        re_targets_cont,
+                        re_step_times_cont,
+                    ) = evaluate_sp_reassign_batched(
+                        eval_starts, matched_sp_pickups_cont,
+                        jax.random.PRNGKey(base_seed + 3000 + _k),
+                        max_eval_steps, _k, use_discrete=False, return_paths=True,
+                    )
+                    sp_reassign_trajectory_debug[_k] = (
+                        re_t_cont, re_c_cont, re_paths_cont, re_targets_cont, re_step_times_cont
+                    )
+                else:
+                    re_t_cont, _, re_c_cont = evaluate_sp_reassign_batched(
+                        eval_starts, matched_sp_pickups_cont, jax.random.PRNGKey(base_seed + 3000 + _k),
+                        max_eval_steps, _k, use_discrete=False,
+                    )
                 re_t_disc, _, re_c_disc = evaluate_sp_reassign_batched(
                     eval_starts, matched_sp_pickups_disc, jax.random.PRNGKey(base_seed + 4000 + _k),
                     max_eval_steps, _k, use_discrete=True,
@@ -1335,6 +1425,56 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 })
             if wandb.run is not None:
                 wandb.log(log_payload)
+            if print_eval_trajectories:
+                def _int_list(values):
+                    return [int(x) for x in np.asarray(values).tolist()]
+
+                def _round_list(values):
+                    return [round(float(x), 2) for x in values]
+
+                print("\n--- Trajectory debug (continuous evaluation, node ids) ---")
+                print(f"  starts={_int_list(eval_starts)}")
+                print(f"  candidate_pickups={_int_list(eval_pickups)}")
+                print(f"  salt_initial_targets={_int_list(matched_q_pickups)}")
+                print(f"  sp_static_targets={_int_list(matched_sp_pickups_cont)}")
+                q_completed_cont = np.asarray(q_completed_continuous, dtype=bool)
+                sp_completed_cont = np.asarray(sp_completed_continuous, dtype=bool)
+                for agent_idx in range(args.num_agents):
+                    print(f"  agent {agent_idx}:")
+                    print(
+                        "    SALT reassign-every-step: "
+                        f"completed={bool(salt_c_cont[agent_idx])} "
+                        f"time={float(salt_t_cont[agent_idx]):.2f} "
+                        f"path={salt_paths_cont[agent_idx]} "
+                        f"targets={salt_targets_cont[agent_idx]} "
+                        f"step_times={_round_list(salt_step_times_cont[agent_idx])}"
+                    )
+                    print(
+                        "    SALT static-assignment:    "
+                        f"completed={bool(q_completed_cont[agent_idx])} "
+                        f"time={float(q_times_continuous[agent_idx]):.2f} "
+                        f"path={q_paths_continuous[agent_idx]} "
+                        f"target={int(np.asarray(matched_q_pickups)[agent_idx])} "
+                        f"step_times={_round_list(q_step_times_continuous[agent_idx])}"
+                    )
+                    print(
+                        "    SP static:                 "
+                        f"completed={bool(sp_completed_cont[agent_idx])} "
+                        f"time={float(sp_times_continuous[agent_idx]):.2f} "
+                        f"path={sp_paths_continuous[agent_idx]} "
+                        f"target={int(np.asarray(matched_sp_pickups_cont)[agent_idx])} "
+                        f"step_times={_round_list(sp_step_times_continuous[agent_idx])}"
+                    )
+                    for _k in reassignment_periods:
+                        re_t_cont, re_c_cont, re_paths_cont, re_targets_cont, re_step_times_cont = sp_reassign_trajectory_debug[_k]
+                        print(
+                            f"    SP reassign every {_k}:      "
+                            f"completed={bool(re_c_cont[agent_idx])} "
+                            f"time={float(re_t_cont[agent_idx]):.2f} "
+                            f"path={re_paths_cont[agent_idx]} "
+                            f"targets={re_targets_cont[agent_idx]} "
+                            f"step_times={_round_list(re_step_times_cont[agent_idx])}"
+                        )
 
     wandb.finish()
     print("\n" + "="*60)

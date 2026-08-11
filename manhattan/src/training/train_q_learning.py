@@ -24,6 +24,11 @@ from training.q_learning import (
 from utils import offline_shortest_path_action
 
 
+def remaining_travel_terminal_value(env: TaxiEnv, current_nodes, pickup_nodes):
+    """Estimate continuation value from nominal shortest-path travel time."""
+    return -env.distances[current_nodes, pickup_nodes] / 60.0
+
+
 class PerformanceProfiler:
     """Profiler for tracking time spent in different parts of the code."""
     
@@ -215,12 +220,23 @@ def pretrain_q_learning_on_shortest_path(
             next_state, reward, done, info = q_agent.step_with_discretization(
                 state, expert_action, action_key, noise_key=noise_key
             )
+            horizon_truncated = (not done) and (step == max_steps_per_episode - 1)
+            if horizon_truncated:
+                continuation_value = remaining_travel_terminal_value(
+                    env,
+                    next_state.current_node,
+                    next_state.pickup_node,
+                )
+                reward_for_update = reward + q_agent.gamma * continuation_value
+            else:
+                reward_for_update = reward
+            done_for_update = done or horizon_truncated
             
             # Update Q-value using expert action
-            q_agent.update_q_value(state, expert_action, reward, next_state, done)
+            q_agent.update_q_value(state, expert_action, reward_for_update, next_state, done_for_update)
             
             # Update statistics
-            episode_reward += float(reward)
+            episode_reward += float(reward_for_update)
             episode_length += 1
             
             # Move to next state
@@ -322,6 +338,9 @@ def train_q_learning(
     init_q_table_path: Optional[str] = None,
     no_round_trip: bool = False,
     q_table_dtype: str = "float32",
+    checkpoint_frequency: int = 0,
+    episode_offset: int = 0,
+    total_episodes_for_schedule: Optional[int] = None,
 ):
     """
     Train a tabular Q-learning agent.
@@ -354,6 +373,9 @@ def train_q_learning(
                                overwriting good initialization values.
         no_round_trip: If True, skip return trips (only forward trips start→pickup are run).
         q_table_dtype: Q-table dtype ('float32', 'float16', or 'bfloat16').
+        checkpoint_frequency: Save the Q-table every N episodes; 0 disables periodic saves.
+        episode_offset: Number of episodes already completed in earlier chunks.
+        total_episodes_for_schedule: Intended total episodes across chunks for epsilon/matching schedules.
         
     Returns:
         Trained Q-learning agent
@@ -366,6 +388,11 @@ def train_q_learning(
     if load_path is not None and Path(load_path).exists():
         print(f"Loading Q-table from {load_path}")
         q_agent = TabularQLearning.load(env, load_path)
+        q_agent.learning_rate = learning_rate
+        q_agent.gamma = discount_factor
+        q_agent.epsilon_start = epsilon_start
+        q_agent.epsilon_end = epsilon_end
+        q_agent.epsilon_decay_steps = epsilon_decay_steps
         # Use loaded agent's max_time_slices if available, otherwise use computed value
         max_time_slices = getattr(q_agent, 'max_time_slices', computed_max_time_slices)
         if max_time_slices != computed_max_time_slices:
@@ -396,6 +423,8 @@ def train_q_learning(
     est_gib = (env.num_nodes * env.num_nodes * max_time_slices * env.max_deg * bytes_per_entry) / (1024 ** 3)
     print(f"  Q-table dtype: {q_table_dtype}")
     print(f"  Estimated Q-table memory: {est_gib:.2f} GiB")
+    print(f"  Pickup bonus: {env.pickup_bonus:.2f}")
+    print("  Horizon continuation value: negative nominal shortest-path remaining travel time")
     print(f"{'='*60}\n")
     
     # Initialize Q-table from saved file if specified
@@ -421,6 +450,22 @@ def train_q_learning(
     
     # Initialize profiler
     profiler = PerformanceProfiler(enabled=enable_profiling)
+    checkpoint_frequency = int(checkpoint_frequency or 0)
+    episode_offset = int(episode_offset or 0)
+    schedule_episodes = int(total_episodes_for_schedule or num_episodes)
+    if schedule_episodes <= 0:
+        schedule_episodes = max(1, num_episodes)
+
+    def save_checkpoint(reason: str, completed_episodes: int) -> None:
+        if save_path is None:
+            return
+        final_path = Path(save_path)
+        tmp_path = final_path.with_name(final_path.name + ".tmp")
+        print(f"[checkpoint] {reason}: saving Q-table at global episode {completed_episodes} -> {final_path}")
+        q_agent.q_table.block_until_ready()
+        q_agent.save(str(tmp_path))
+        tmp_path.replace(final_path)
+        print(f"[checkpoint] saved {final_path}")
     
     fixed_starts = jnp.asarray(fixed_starts)
     fixed_pickups = jnp.asarray(fixed_pickups)
@@ -623,7 +668,7 @@ def train_q_learning(
         episode_lengths = jnp.zeros(num_agents, dtype=jnp.int32)
         episode_dones = jnp.zeros(num_agents, dtype=jnp.bool_)
         
-        def step_fn(carry, step_idx):
+        def run_step(carry, step_idx, apply_horizon_value):
             (states, q_table, episode_rewards, episode_lengths, episode_dones, key) = carry
             
             # Mask for active (not done) agents
@@ -657,6 +702,24 @@ def train_q_learning(
                 states, actions, action_keys,
                 discrete_travel_times, dt, env
             )
+
+            if apply_horizon_value:
+                horizon_truncations = active_mask & (~dones)
+                continuation_values = remaining_travel_terminal_value(
+                    env,
+                    next_states.current_node,
+                    next_states.pickup_node,
+                )
+                adjusted_rewards = rewards + jnp.where(
+                    horizon_truncations,
+                    jnp.asarray(gamma, dtype=jnp.float32) * continuation_values,
+                    0.0,
+                )
+                rewards_for_update = adjusted_rewards
+                q_update_dones = dones | horizon_truncations
+            else:
+                rewards_for_update = rewards
+                q_update_dones = dones
             
             # Update Q-values for all agents
             q_table_new = _batched_update_q_values_vectorized(
@@ -667,13 +730,13 @@ def train_q_learning(
                 states.neighbor_mask,
                 states.done,
                 actions,
-                rewards,
+                rewards_for_update,
                 next_states.current_node,
                 next_states.pickup_node,
                 next_states.time,
                 next_states.neighbor_mask,
                 next_states.done,
-                dones,
+                q_update_dones,
                 learning_rate,
                 gamma,
                 dt,
@@ -682,19 +745,28 @@ def train_q_learning(
             )
             
             # Update statistics (only for agents that are not done)
-            episode_rewards_new = episode_rewards + jnp.where(active_mask, rewards, 0.0)
+            episode_rewards_new = episode_rewards + jnp.where(active_mask, rewards_for_update, 0.0)
             episode_lengths_new = episode_lengths + jnp.where(active_mask, 1, 0)
             episode_dones_new = episode_dones | dones
             
             new_carry = (next_states, q_table_new, episode_rewards_new, episode_lengths_new, episode_dones_new, key_new)
             
             return new_carry, None
-        
-        # Run episode with scan over step indices
-        step_indices = jnp.arange(max_steps, dtype=jnp.int32)
+
+        def regular_step(carry, step_idx):
+            return run_step(carry, step_idx, False)
+
+        if max_steps < 1:
+            raise ValueError("max_steps must be positive")
+
+        # Keep terminal-SP work completely outside the repeated scan body.
         carry = (states, q_table, episode_rewards, episode_lengths, episode_dones, key)
-        
-        final_carry, _ = jax.lax.scan(step_fn, carry, step_indices)
+        if max_steps > 1:
+            regular_step_indices = jnp.arange(max_steps - 1, dtype=jnp.int32)
+            carry, _ = jax.lax.scan(regular_step, carry, regular_step_indices)
+
+        final_step_idx = jnp.int32(max_steps - 1)
+        final_carry, _ = run_step(carry, final_step_idx, True)
         
         final_states, final_q_table, final_rewards, final_lengths, final_dones, final_key = final_carry
         
@@ -729,15 +801,22 @@ def train_q_learning(
         # Each episode runs agents_per_episode agents in parallel
         # With round trips: 2*num_agents (forward + return), without: num_agents (forward only)
         agents_multiplier = 1 if no_round_trip else 2
-        total_training_steps = num_episodes * agents_multiplier * max_steps_per_episode
+        total_training_steps = schedule_episodes * agents_multiplier * max_steps_per_episode
         matching_epsilon_start = 1.0
         matching_epsilon_end = 0.1
         if no_round_trip:
             print("[CONFIG] Round trips DISABLED: only forward trips (start→pickup) will be run.")
+        if episode_offset:
+            print(f"[resume] Starting this chunk at global episode offset {episode_offset:,}.")
+        if total_episodes_for_schedule is not None:
+            print(f"[resume] Scheduling epsilon/matching over {schedule_episodes:,} total episodes.")
+        if checkpoint_frequency > 0:
+            print(f"[checkpoint] Periodic Q-table saves every {checkpoint_frequency:,} local episodes.")
         
         for episode in range(num_episodes):
+            global_episode = episode_offset + episode
             # Calculate training step at the start of episode
-            training_step = episode * max_steps_per_episode
+            training_step = global_episode * max_steps_per_episode
             
             # Sample num_agents starts and pickups (JIT-compiled)
             with profiler.time_block("sampling_starts_pickups"):
@@ -750,7 +829,8 @@ def train_q_learning(
             # Epsilon-greedy matching: random with prob epsilon, optimal with prob (1-epsilon)
             if num_agents > 1:
                 with profiler.time_block("matching"):
-                    progress = jnp.minimum(jnp.float32(training_step) / jnp.float32(total_training_steps), 1.0)
+                    matching_step = global_episode * agents_multiplier * max_steps_per_episode
+                    progress = jnp.minimum(jnp.float32(matching_step) / jnp.float32(total_training_steps), 1.0)
                     matching_epsilon = matching_epsilon_start * (1.0 - progress) + matching_epsilon_end * progress
                     
                     key, forward_match_key, return_match_key = jax_random.split(key, 3)
@@ -928,6 +1008,7 @@ def train_q_learning(
                     if wandb.run is not None:
                         wandb.log({
                             'training/episode': episode + 1,
+                            'training/global_episode': global_episode + 1,
                             # Forward trip statistics
                             'training/forward_avg_reward': avg_reward,
                             'training/forward_avg_length': avg_length,
@@ -1138,6 +1219,7 @@ def train_q_learning(
                     if wandb.run is not None:
                         wandb.log({
                             'evaluation/episode': episode + 1,
+                            'evaluation/global_episode': global_episode + 1,
                             'evaluation/avg_reward': eval_results['avg_reward'],
                             'evaluation/avg_steps': eval_results['avg_steps'],
                             'evaluation/completion_rate': eval_results['completion_rate'],
@@ -1145,6 +1227,8 @@ def train_q_learning(
                             'evaluation/discrete_avg_steps': eval_results_discrete['avg_steps'],
                             'evaluation/discrete_completion_rate': eval_results_discrete['completion_rate'],
                         })
+            if checkpoint_frequency > 0 and (episode + 1) % checkpoint_frequency == 0:
+                save_checkpoint("periodic", global_episode + 1)
     else:
         # Evaluation-only mode: no training episodes
         print("Skipping training (epochs=0). Q-table will be evaluated as-is.\n")
@@ -1154,8 +1238,7 @@ def train_q_learning(
     else:
         print("Evaluation-only mode completed!")
     if save_path is not None:
-        print(f"Saving Q-table to {save_path}")
-        q_agent.save(save_path)
+        save_checkpoint("final", episode_offset + num_episodes)
     
     # Print performance profiling summary
     profiler.print_summary(num_episodes=num_episodes)

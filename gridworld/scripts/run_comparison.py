@@ -63,6 +63,11 @@ from salt.ippo import (
     train_ippo,
     rollout_ippo,
 )
+from salt.happo import (
+    HAPPOConfig,
+    train_happo,
+    rollout_happo,
+)
 from salt.vdn import (
     VDNConfig,
     train_vdn,
@@ -990,6 +995,21 @@ def main():
             "Choices: relative_targets"
         ),
     )
+    ap.add_argument("--run_happo", action="store_true",
+                    help="Also train/evaluate HAPPO baseline (Kuba et al., 2022)")
+    ap.add_argument("--happo_batches", type=int, default=5000,
+                    help="Number of HAPPO update batches")
+    ap.add_argument("--happo_batch_eps", type=int, default=64,
+                    help="Episodes per HAPPO batch")
+    ap.add_argument(
+        "--happo_obs_modes",
+        type=str,
+        default="relative_targets",
+        help=(
+            "Comma-separated HAPPO observation modes. "
+            "Choices: relative_targets"
+        ),
+    )
     ap.add_argument("--run_qmix", action="store_true", help="Also train/evaluate QMIX baseline")
     ap.add_argument("--qmix_batches", type=int, default=5000,
                     help="Number of QMIX update batches")
@@ -1207,6 +1227,14 @@ def main():
         n_batches=args.ippo_batches,
         batch_episodes=args.ippo_batch_eps,
     )
+    happo_modes = (
+        _parse_relative_only_modes(args.happo_obs_modes, "HAPPO")
+        if args.run_happo else []
+    )
+    happo_cfg = HAPPOConfig(
+        n_batches=args.happo_batches,
+        batch_episodes=args.happo_batch_eps,
+    )
     qmix_modes = (
         _parse_relative_only_modes(args.qmix_obs_modes, "QMIX")
         if args.run_qmix else []
@@ -1276,6 +1304,7 @@ def main():
     sep_log_every_a2c = sep_log_every_ppo
     mappo_log_every = max(1, mappo_cfg.n_batches // max(1, args.wandb_log_points))
     ippo_log_every = max(1, ippo_cfg.n_batches // max(1, args.wandb_log_points))
+    happo_log_every = max(1, happo_cfg.n_batches // max(1, args.wandb_log_points))
     qmix_log_every = max(1, qmix_cfg.n_batches // max(1, args.wandb_log_points))
     vdn_log_every = max(1, vdn_cfg.n_batches // max(1, args.wandb_log_points))
     mfq_log_every = max(1, mfq_cfg.n_batches // max(1, args.wandb_log_points))
@@ -1295,6 +1324,8 @@ def main():
         f"mappo_modes={mappo_modes}; "
         f"ippo={'on' if args.run_ippo else 'off'}"
         f"{f' ippo_modes={ippo_modes} every {ippo_log_every} batches;' if args.run_ippo else ';'} "
+        f"happo={'on' if args.run_happo else 'off'}"
+        f"{f' happo_modes={happo_modes} every {happo_log_every} batches;' if args.run_happo else ';'} "
         f" qmix={'on' if args.run_qmix else 'off'}"
         f"{f' qmix_modes={qmix_modes} every {qmix_log_every} batches;' if args.run_qmix else ';'} "
         f"vdn={'on' if args.run_vdn else 'off'}"
@@ -1502,6 +1533,43 @@ def main():
                         f"timing/{kind}/ippo/{mode}/env_interactions": ippo_env_interactions,
                     })
 
+        # Train optional HAPPO variants (Kuba et al., 2022).
+        happo_by_mode: dict[str, dict] = {}
+        happo_primary_mode = None
+        if args.run_happo:
+            print(f"\n{'=' * 60}")
+            print(f"  HAPPO variants — {kind} noise  (p={args.p})  "
+                  f"({happo_cfg.n_batches}×{happo_cfg.batch_episodes} eps each)")
+            print(f"{'=' * 60}")
+            happo_primary_mode = happo_modes[0]
+            for mode in happo_modes:
+                cfg_mode = replace(happo_cfg, obs_mode=mode)
+                t0 = time.time()
+                happo_actor, happo_train = train_happo(
+                    grid, noise_cfg, N,
+                    cfg=cfg_mode, seed=args.seed, log_every=happo_log_every,
+                    wb_run=wb_run, wb_prefix=f"train_happo/{kind}/{mode}",
+                )
+                happo_train_time = time.time() - t0
+                happo_env_interactions = happo_train["env_interactions"]
+                happo_by_mode[mode] = {
+                    "actor": happo_actor,
+                    "train": happo_train,
+                    "train_time": happo_train_time,
+                    "env_interactions": happo_env_interactions,
+                }
+
+                import torch
+                torch.save(happo_actor.state_dict(), os.path.join(kind_dir, f"happo_actor_{mode}.pt"))
+                if mode == happo_primary_mode:
+                    torch.save(happo_actor.state_dict(), os.path.join(kind_dir, "happo_actor.pt"))
+
+                if wb_run is not None:
+                    wb_run.log({
+                        f"timing/{kind}/happo/{mode}/train_time_s": happo_train_time,
+                        f"timing/{kind}/happo/{mode}/env_interactions": happo_env_interactions,
+                    })
+
         # Train optional QMIX variants.
         qmix_by_mode: dict[str, dict] = {}
         qmix_primary_mode = None
@@ -1702,6 +1770,7 @@ def main():
         )
         mappo_all_by_mode: dict[str, List[dict]] = {m: [] for m in mappo_modes}
         ippo_all_by_mode: dict[str, List[dict]] = {m: [] for m in ippo_modes} if args.run_ippo else {}
+        happo_all_by_mode: dict[str, List[dict]] = {m: [] for m in happo_modes} if args.run_happo else {}
         qmix_all_by_mode: dict[str, List[dict]] = {m: [] for m in qmix_modes} if args.run_qmix else {}
         vdn_all_by_mode: dict[str, List[dict]] = {m: [] for m in vdn_modes} if args.run_vdn else {}
         mfq_all_by_mode: dict[str, List[dict]] = {m: [] for m in mfq_modes} if args.run_mfq else {}
@@ -1777,6 +1846,19 @@ def main():
                         start_rows=start_rows,
                     )
                     ippo_all_by_mode[mode].append(ippo_res)
+            if args.run_happo:
+                for mode in happo_modes:
+                    happo_res = rollout_happo(
+                        happo_by_mode[mode]["actor"],
+                        grid,
+                        noise_cfg,
+                        N,
+                        targets=targets,
+                        seed=s,
+                        obs_mode=mode,
+                        start_rows=start_rows,
+                    )
+                    happo_all_by_mode[mode].append(happo_res)
             if args.run_qmix:
                 for mode in qmix_modes:
                     qmix_res = rollout_qmix(
@@ -1850,6 +1932,13 @@ def main():
                             f"IPPO[{mode}]",
                             ippo_all_by_mode[mode][-1],
                         )
+                if args.run_happo:
+                    for mode in happo_modes:
+                        _print_eval_trace(
+                            s,
+                            f"HAPPO[{mode}]",
+                            happo_all_by_mode[mode][-1],
+                        )
                 if args.run_qmix:
                     for mode in qmix_modes:
                         _print_eval_trace(
@@ -1899,6 +1988,10 @@ def main():
             {mode: _aggregate(ippo_all_by_mode[mode]) for mode in ippo_modes}
             if args.run_ippo else {}
         )
+        happo_agg_by_mode = (
+            {mode: _aggregate(happo_all_by_mode[mode]) for mode in happo_modes}
+            if args.run_happo else {}
+        )
         qmix_agg_by_mode = (
             {mode: _aggregate(qmix_all_by_mode[mode]) for mode in qmix_modes}
             if args.run_qmix else {}
@@ -1929,6 +2022,12 @@ def main():
         )
         ippo_agg = ippo_agg_by_mode.get(ippo_primary_mode, {})
         ippo_m = ippo_seed0_by_mode.get(ippo_primary_mode, {})
+        happo_seed0_by_mode = (
+            {mode: happo_all_by_mode[mode][0] for mode in happo_modes}
+            if args.run_happo else {}
+        )
+        happo_agg = happo_agg_by_mode.get(happo_primary_mode, {})
+        happo_m = happo_seed0_by_mode.get(happo_primary_mode, {})
         qmix_seed0_by_mode = (
             {mode: qmix_all_by_mode[mode][0] for mode in qmix_modes}
             if args.run_qmix else {}
@@ -1989,6 +2088,17 @@ def main():
                 agg = ippo_agg_by_mode[mode]
                 tmode = ippo_by_mode[mode]["train_time"]
                 print(f"  IPPO[{mode}] → OT={agg['terminal_ot_cost_mean']:.1f}"
+                      f"±{agg['terminal_ot_cost_std']:.1f}"
+                      f"  reach={agg['reach_rate_mean']:.1%}"
+                      f"  cover={agg['target_coverage_mean']:.1%}"
+                      f"  t_incl={agg['mean_time_to_reach_including_unreached_mean']:.1f}"
+                      f"±{agg['mean_time_to_reach_including_unreached_std']:.1f}"
+                      f"  ({tmode:.1f}s train)")
+        if args.run_happo:
+            for mode in happo_modes:
+                agg = happo_agg_by_mode[mode]
+                tmode = happo_by_mode[mode]["train_time"]
+                print(f"  HAPPO[{mode}] → OT={agg['terminal_ot_cost_mean']:.1f}"
                       f"±{agg['terminal_ot_cost_std']:.1f}"
                       f"  reach={agg['reach_rate_mean']:.1%}"
                       f"  cover={agg['target_coverage_mean']:.1%}"
@@ -2063,6 +2173,14 @@ def main():
                         wb_run.log({
                             f"eval/{kind}/ippo/{mode}/{k}_mean": agg[f"{k}_mean"],
                             f"eval/{kind}/ippo/{mode}/{k}_std": agg[f"{k}_std"],
+                        })
+            if args.run_happo:
+                for mode in happo_modes:
+                    agg = happo_agg_by_mode[mode]
+                    for k in _EVAL_KEYS:
+                        wb_run.log({
+                            f"eval/{kind}/happo/{mode}/{k}_mean": agg[f"{k}_mean"],
+                            f"eval/{kind}/happo/{mode}/{k}_std": agg[f"{k}_std"],
                         })
             if args.run_qmix:
                 for mode in qmix_modes:
@@ -2141,6 +2259,23 @@ def main():
                                    "all_seeds": i_all}, f, indent=2)
                     with open(os.path.join(kind_dir, "ippo_train.json"), "w") as f:
                         json.dump(i_train, f, indent=2, default=str)
+        if args.run_happo:
+            for mode in happo_modes:
+                h_seed0 = happo_seed0_by_mode[mode]
+                h_agg = happo_agg_by_mode[mode]
+                h_all = happo_all_by_mode[mode]
+                h_train = happo_by_mode[mode]["train"]
+                with open(os.path.join(kind_dir, f"happo_{mode}_metrics.json"), "w") as f:
+                    json.dump({"seed0": h_seed0, "aggregate": h_agg,
+                               "all_seeds": h_all}, f, indent=2)
+                with open(os.path.join(kind_dir, f"happo_{mode}_train.json"), "w") as f:
+                    json.dump(h_train, f, indent=2, default=str)
+                if mode == happo_primary_mode:
+                    with open(os.path.join(kind_dir, "happo_metrics.json"), "w") as f:
+                        json.dump({"seed0": h_seed0, "aggregate": h_agg,
+                                   "all_seeds": h_all}, f, indent=2)
+                    with open(os.path.join(kind_dir, "happo_train.json"), "w") as f:
+                        json.dump(h_train, f, indent=2, default=str)
         if args.run_qmix:
             for mode in qmix_modes:
                 q_seed0 = qmix_seed0_by_mode[mode]
@@ -2280,6 +2415,20 @@ def main():
             if args.run_ippo and ippo_primary_mode is not None
             else None
         )
+        viz_happo = (
+            rollout_happo(
+                happo_by_mode[happo_primary_mode]["actor"],
+                grid,
+                noise_cfg,
+                N,
+                targets=viz_targets,
+                seed=viz_seed,
+                obs_mode=happo_primary_mode,
+                start_rows=viz_start_rows,
+            )
+            if args.run_happo and happo_primary_mode is not None
+            else None
+        )
         viz_qmix = (
             rollout_qmix(
                 qmix_by_mode[qmix_primary_mode]["q_net"],
@@ -2354,6 +2503,11 @@ def main():
             trajectories_overlay[f"IPPO[{ippo_primary_mode}]"] = [
                 [(int(p[0]), int(p[1])) for p in traj]
                 for traj in viz_ippo["trajectories"]
+            ]
+        if viz_happo is not None:
+            trajectories_overlay[f"HAPPO[{happo_primary_mode}]"] = [
+                [(int(p[0]), int(p[1])) for p in traj]
+                for traj in viz_happo["trajectories"]
             ]
         if viz_qmix is not None:
             trajectories_overlay[f"QMIX[{qmix_primary_mode}]"] = [
@@ -2447,6 +2601,24 @@ def main():
                         outpath=os.path.join(kind_dir, "terminal_hist_ippo.png"),
                         title=f"IPPO — {kind} noise (p={args.p})",
                     )
+        happo_hist_paths: dict[str, str] = {}
+        if args.run_happo:
+            for mode in happo_modes:
+                happo_hist_path = os.path.join(kind_dir, f"terminal_hist_happo_{mode}.png")
+                happo_hist_paths[mode] = happo_hist_path
+                plot_terminal_hist(
+                    grid.h, grid.w,
+                    agents_terminal=happo_seed0_by_mode[mode]["final_positions"], targets=targets_0,
+                    outpath=happo_hist_path,
+                    title=f"HAPPO[{mode}] — {kind} noise (p={args.p})",
+                )
+                if mode == happo_primary_mode:
+                    plot_terminal_hist(
+                        grid.h, grid.w,
+                        agents_terminal=happo_seed0_by_mode[mode]["final_positions"], targets=targets_0,
+                        outpath=os.path.join(kind_dir, "terminal_hist_happo.png"),
+                        title=f"HAPPO — {kind} noise (p={args.p})",
+                    )
         qmix_hist_paths: dict[str, str] = {}
         if args.run_qmix:
             for mode in qmix_modes:
@@ -2518,6 +2690,11 @@ def main():
                     img_payload[f"plots/{kind}/terminal_hist_ippo_{mode}"] = wandb.Image(
                         ippo_hist_paths[mode]
                     )
+            if args.run_happo:
+                for mode in happo_modes:
+                    img_payload[f"plots/{kind}/terminal_hist_happo_{mode}"] = wandb.Image(
+                        happo_hist_paths[mode]
+                    )
             if args.run_qmix:
                 for mode in qmix_modes:
                     img_payload[f"plots/{kind}/terminal_hist_qmix_{mode}"] = wandb.Image(
@@ -2573,6 +2750,9 @@ def main():
             "ippo_agg": ippo_agg if args.run_ippo else {},
             "ippo_mode_primary": ippo_primary_mode if args.run_ippo else None,
             "ippo_agg_by_mode": ippo_agg_by_mode if args.run_ippo else {},
+            "happo_agg": happo_agg if args.run_happo else {},
+            "happo_mode_primary": happo_primary_mode if args.run_happo else None,
+            "happo_agg_by_mode": happo_agg_by_mode if args.run_happo else {},
             "qmix_agg": qmix_agg if args.run_qmix else {},
             "qmix_mode_primary": qmix_primary_mode if args.run_qmix else None,
             "qmix_agg_by_mode": qmix_agg_by_mode if args.run_qmix else {},
@@ -2591,6 +2771,8 @@ def main():
             "mappo_seed0_by_mode": mappo_seed0_by_mode,
             "ippo_seed0": ippo_m if args.run_ippo else {},
             "ippo_seed0_by_mode": ippo_seed0_by_mode if args.run_ippo else {},
+            "happo_seed0": happo_m if args.run_happo else {},
+            "happo_seed0_by_mode": happo_seed0_by_mode if args.run_happo else {},
             "qmix_seed0": qmix_m if args.run_qmix else {},
             "qmix_seed0_by_mode": qmix_seed0_by_mode if args.run_qmix else {},
             "vdn_seed0": vdn_m if args.run_vdn else {},
@@ -2617,6 +2799,11 @@ def main():
             "ippo_env_interactions_by_mode": {
                 m: v["env_interactions"] for m, v in ippo_by_mode.items()
             } if args.run_ippo else {},
+            "happo_train_by_mode": {m: v["train"] for m, v in happo_by_mode.items()} if args.run_happo else {},
+            "happo_train_time_by_mode": {m: v["train_time"] for m, v in happo_by_mode.items()} if args.run_happo else {},
+            "happo_env_interactions_by_mode": {
+                m: v["env_interactions"] for m, v in happo_by_mode.items()
+            } if args.run_happo else {},
             "qmix_train_by_mode": {m: v["train"] for m, v in qmix_by_mode.items()} if args.run_qmix else {},
             "qmix_train_time_by_mode": {m: v["train_time"] for m, v in qmix_by_mode.items()} if args.run_qmix else {},
             "qmix_env_interactions_by_mode": {
@@ -2684,6 +2871,17 @@ def main():
                 i_mt = _fmt(ia["mean_time_to_reach_mean"],
                             ia["mean_time_to_reach_std"])
                 print(f"{'':12}  {f'IPPO[{mode}]':<22} {i_ot:>12} {i_rr:>12} {i_cv:>12} {i_mt:>12}")
+        if args.run_happo:
+            for mode in happo_modes:
+                ha = r["happo_agg_by_mode"][mode]
+                h_ot = _fmt(ha["terminal_ot_cost_mean"], ha["terminal_ot_cost_std"])
+                h_rr = _fmt(ha["reach_rate_mean"] * 100,
+                            ha["reach_rate_std"] * 100, prec=0)
+                h_cv = _fmt(ha["target_coverage_mean"] * 100,
+                            ha["target_coverage_std"] * 100, prec=0)
+                h_mt = _fmt(ha["mean_time_to_reach_mean"],
+                            ha["mean_time_to_reach_std"])
+                print(f"{'':12}  {f'HAPPO[{mode}]':<22} {h_ot:>12} {h_rr:>12} {h_cv:>12} {h_mt:>12}")
         if args.run_qmix:
             for mode in qmix_modes:
                 qa = r["qmix_agg_by_mode"][mode]
@@ -2749,6 +2947,11 @@ def main():
                 i_int = r["ippo_env_interactions_by_mode"][mode]
                 i_t = r["ippo_train_time_by_mode"][mode]
                 print(f"               IPPO[{mode:<14}] {i_int/1e6:.1f}M interactions, {i_t:.1f}s")
+        if args.run_happo:
+            for mode in happo_modes:
+                h_int = r["happo_env_interactions_by_mode"][mode]
+                h_t = r["happo_train_time_by_mode"][mode]
+                print(f"               HAPPO[{mode:<13}] {h_int/1e6:.1f}M interactions, {h_t:.1f}s")
         if args.run_qmix:
             for mode in qmix_modes:
                 q_int = r["qmix_env_interactions_by_mode"][mode]
@@ -2825,6 +3028,19 @@ def main():
                         agg["total_cost_mean"], agg["total_cost_std"],
                         r["ippo_train_time_by_mode"][mode],
                         r["ippo_env_interactions_by_mode"][mode],
+                    )
+            if args.run_happo:
+                for mode in happo_modes:
+                    agg = r["happo_agg_by_mode"][mode]
+                    table.add_data(
+                        kind, f"HAPPO[{mode}]",
+                        agg["terminal_ot_cost_mean"], agg["terminal_ot_cost_std"],
+                        agg["reach_rate_mean"], agg["reach_rate_std"],
+                        agg["target_coverage_mean"], agg["target_coverage_std"],
+                        agg["mean_time_to_reach_mean"], agg["mean_time_to_reach_std"],
+                        agg["total_cost_mean"], agg["total_cost_std"],
+                        r["happo_train_time_by_mode"][mode],
+                        r["happo_env_interactions_by_mode"][mode],
                     )
             if args.run_qmix:
                 for mode in qmix_modes:

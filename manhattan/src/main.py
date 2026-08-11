@@ -138,8 +138,13 @@ parser.add_argument(
 parser.add_argument("--num_agents", type=int, default=1, help="Number of agents in the environment")
 parser.add_argument("--base_time", type=float, default=1.0, help="Base travel time for grid environment")
 parser.add_argument("--max_steps", type=int, default=300, help="Maximum number of steps per episode")
-parser.add_argument("--pickup_bonus", type=float, default=5.0, help="Bonus for picking up a passenger")
-parser.add_argument("--timeout_penalty", type=float, default=-5.0, help="Penalty for timeout")
+parser.add_argument("--pickup_bonus", type=float, default=50.0, help="Bonus for picking up a passenger")
+parser.add_argument(
+    "--timeout_penalty",
+    type=float,
+    default=None,
+    help="Deprecated and ignored. Horizon truncations use negative shortest-path remaining travel time.",
+)
 parser.add_argument("--n_expert_samples", type=int, default=5000, help="Number of expert samples for pretraining")
 parser.add_argument("--hidden_dims", nargs='+', type=int, default=[512, 512], help="Hidden dimensions for the neural network")
 parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for training")
@@ -204,6 +209,14 @@ parser.add_argument("--init_from_shortest_paths", action="store_true", help="Ini
 parser.add_argument("--init_all_time_slices", action="store_true", help="Initialize Q-table for all time slices (up to 100) instead of just time=0 (requires --init_from_shortest_paths)")
 parser.add_argument("--eval_only_sp", action="store_true", help="Run shortest-path baselines (continuous + discrete) and exit (discrete/Q-learning pipeline)")
 parser.add_argument("--eval_frequency", type=int, default=100, help="Q-learning evaluation frequency in episodes")
+parser.add_argument("--checkpoint_frequency", type=int, default=0, help="Save the Q-table every N training episodes. Use 0 to save only at the end.")
+parser.add_argument("--episode_offset", type=int, default=0, help="Number of already-completed episodes when resuming chunked training; used for epsilon/matching schedules.")
+parser.add_argument("--total_epochs_for_schedule", type=int, default=None, help="Total intended episodes across all chunks, used to keep epsilon/matching schedules consistent while running shorter chunks.")
+parser.add_argument("--skip_final_eval", action="store_true", help="Skip the expensive final evaluation block. Useful for intermediate chunks that only need to checkpoint the Q-table.")
+parser.add_argument("--read_only_q_table", action="store_true", help="Load --q_table_path without saving it back. Useful for concurrent evaluation-only jobs.")
+parser.add_argument("--final_eval_iterations", type=int, default=50, help="Number of final trajectory-evaluation instances per seed. Figure 4 in the paper used 500 per seed.")
+parser.add_argument("--eval_seed", type=int, default=None, help="Optional RNG seed for final evaluation. Defaults to --seed.")
+parser.add_argument("--print_eval_trajectories", action="store_true", help="Print per-agent final-evaluation trajectories to the log. Intended for small evaluation-only sanity checks.")
 parser.add_argument("--sample_starts_from_three_fixed", action="store_true", help="Sample starting nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Pickups still sampled from all nodes.")
 parser.add_argument("--sample_pickups_from_three_fixed", action="store_true", help="Sample pickup nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Starts sampled uniformly from all nodes.")
 parser.add_argument("--three_fixed_selection_method", type=str, default="random", choices=["random", "degree", "closeness", "betweenness"], help="Method to select the 3 fixed nodes: 'random' (default), 'degree' (degree centrality), 'closeness' (closeness centrality), 'betweenness' (betweenness centrality)")
@@ -213,6 +226,27 @@ parser.add_argument("--eval_reassignment_baselines", action="store_true", help="
 parser.add_argument("--reassignment_periods", type=str, default="5,10", help="Comma-separated reassignment intervals K (in timesteps) for --eval_reassignment_baselines.")
 
 args = parser.parse_args()
+
+if args.timeout_penalty is not None:
+    print(
+        "Warning: --timeout_penalty is deprecated and ignored; horizon truncations "
+        "use negative nominal shortest-path remaining travel time."
+    )
+if args.checkpoint_frequency < 0:
+    raise ValueError("--checkpoint_frequency must be non-negative")
+if args.episode_offset < 0:
+    raise ValueError("--episode_offset must be non-negative")
+if args.total_epochs_for_schedule is not None and args.total_epochs_for_schedule <= 0:
+    raise ValueError("--total_epochs_for_schedule must be positive when provided")
+if args.final_eval_iterations <= 0:
+    raise ValueError("--final_eval_iterations must be positive")
+if args.read_only_q_table and args.epochs != 0:
+    raise ValueError("--read_only_q_table is intended for evaluation-only runs with --epochs 0")
+if args.total_epochs_for_schedule is not None and args.total_epochs_for_schedule < args.episode_offset + args.epochs:
+    print(
+        "Warning: --total_epochs_for_schedule is smaller than "
+        "--episode_offset + --epochs; epsilon/matching schedules will clamp at the end."
+    )
 
 # Validate fixed evaluation parameters
 if args.fixed_eval:
@@ -544,7 +578,6 @@ env = TaxiEnv(
     paths_dict=paths_dict,
     node_coordinates=node_coordinates,  # Pass normalized coordinates for Euclidean distance
     pickup_bonus=args.pickup_bonus,
-    timeout_penalty=args.timeout_penalty,
     gamma=args.gamma,
     noise_mask=noise_mask,  # Per-step congestion noise (None = deterministic)
 )

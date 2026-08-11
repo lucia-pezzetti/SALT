@@ -85,6 +85,56 @@ python src/main.py --discrete --eval_assignment_baselines \
 The per-agent and mean continuous travel times for both baselines are printed
 alongside the SALT and shortest-path results (and logged to W&B when enabled).
 
+## Static, deterministic dynamic, and SALT routing
+
+The Manhattan environment has two sources of non-stationarity: deterministic
+time variation from traffic-signal phases, and stochastic per-edge travel-time
+noise. This distinction matters when interpreting shortest-path baselines.
+
+1. **Static shortest path** uses one offline distance matrix computed from the
+   nominal congested edge travel times. It assigns taxis to pickups once at
+   `t=0` and then follows the nominal shortest path. This is cheap and
+   reproducible, but it ignores both signal phase and stochastic delays.
+2. **Deterministic dynamic shortest path** removes the stochastic component
+   while keeping the known time-varying signal dynamics. For a fixed finite
+   horizon and the same time discretization used by Q-learning, the exact
+   single-taxi problem can be solved in polynomial time by augmenting the graph
+   with time, i.e. states `(node, time_index)`, and running dynamic programming
+   or a shortest-path algorithm on the time-expanded graph. This gives the
+   optimal policy for the deterministic model, not for the original stochastic
+   environment.
+3. **SALT** learns time-aware expected returns under the stochastic environment
+   and uses those returns inside the optimal-transport assignment. It therefore
+   targets the deployed decision problem rather than the deterministic
+   relaxation.
+
+Including the deterministic dynamic shortest-path solution can be useful as a
+diagnostic or oracle baseline: it isolates the value of time awareness by
+showing how much performance is available from exploiting the known signal
+schedule alone. It should not replace the main stochastic comparison, however.
+If the baseline is evaluated with the stochastic noise switched off, it solves a
+different problem; if it is allowed to optimize against realized noise, it
+becomes clairvoyant. Even with noise removed, the time-expanded solve can be much
+larger than the static baseline, and it does not address the stochastic
+robustness that SALT is designed to learn. For that reason, it is best reported
+as a deterministic-oracle ablation, placed between the static shortest-path
+baseline and SALT in the comparison.
+
+The existing `--eval_reassignment_baselines` option is a practical
+receding-horizon shortest-path comparison: it periodically re-solves the
+agent-pickup assignment from the agents' current nodes, but the routing policy
+still uses offline nominal shortest-path distances. It is therefore stronger
+than the static assign-once baseline, but it is not the full deterministic
+dynamic shortest-path oracle described above.
+
+When a Q-learning trajectory reaches the training horizon without completing,
+the last update uses the nominal shortest-path travel time remaining from the
+post-step node to the assigned pickup as a continuation value. In reward units,
+the terminal target is
+`last_step_reward + gamma * (-remaining_travel_seconds / 60)`. This avoids a
+fixed timeout penalty whose size is unrelated to how far the agent remains from
+its target.
+
 ## Manhattan Area Selection
 
 The Manhattan experiment area is controlled by `--manhattan_area`.

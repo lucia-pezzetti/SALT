@@ -58,9 +58,8 @@ class TaxiEnv(eqx.Module):
     max_wait_time: float
     green_durations: jnp.ndarray  # [num_nodes, max_deg]
     offsets: jnp.ndarray          # [num_nodes, max_deg]
-    # Congestion weight & timeout
+    # Reward and discount parameters
     pickup_bonus: float = 50.0  # bonus for reaching the pickup
-    timeout_penalty: float
     global_state_dim: int
     gamma: float
     # Per-step congestion noise: noise_mask[i,j] is the max extra fraction for edge (i,j).
@@ -80,8 +79,7 @@ class TaxiEnv(eqx.Module):
         traffic_params: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],  # (periods, green_durations, offsets) each [num_nodes, max_deg]
         paths_dict: Optional[dict] = None,
         node_coordinates: Optional[jnp.ndarray] = None,  # [num_nodes, 2] - normalized lat/lon coordinates
-        pickup_bonus: float = 5.0,
-        timeout_penalty: float = -50.0,
+        pickup_bonus: float = 50.0,
         gamma: float = 0.99,
         noise_mask: Optional[jnp.ndarray] = None,  # [num_nodes, max_deg] - per-edge noise ceiling
     ):
@@ -114,7 +112,6 @@ class TaxiEnv(eqx.Module):
 
         # congestion params
         self.pickup_bonus = pickup_bonus
-        self.timeout_penalty = timeout_penalty
         self.gamma = gamma
 
         # Traffic params
