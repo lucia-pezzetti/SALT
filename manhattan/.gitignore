@@ -98,3 +98,17 @@ src/create_boxplots.py
 src/clear_cache.py
 src/setup_wandb_dashboard.py
 src/visualize_manhattan_log.py
+
+
+src/run_rank.sh
+src/submit_clariden.sbatch
+src/submit_clariden_ce.sbatch
+
+clariden_results/
+src/figure4_manhattan_plot.py
+src/run_eval_5agents_trajectories.sh
+src/run_eval_fleet_rank.sh
+src/submit_clariden_chunks.sh
+src/submit_clariden_eval_5agents_trajectories.sbatch
+src/submit_clariden_eval_ce.sbatch
+src/submit_clariden_fleet_eval.sh

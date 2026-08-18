@@ -24,6 +24,14 @@ from training.q_learning import (
 from utils import offline_shortest_path_action
 
 
+def _hungarian_columns_by_row(cost_matrix: jnp.ndarray) -> jnp.ndarray:
+    """Return the assigned column for each row of a square cost matrix."""
+    if cost_matrix.shape[0] != cost_matrix.shape[1]:
+        raise ValueError("Manhattan fleet matching requires a square cost matrix")
+    rows, cols = optax.assignment.hungarian_algorithm(cost_matrix)
+    return jnp.full((cost_matrix.shape[0],), -1, dtype=cols.dtype).at[rows].set(cols)
+
+
 def remaining_travel_terminal_value(env: TaxiEnv, current_nodes, pickup_nodes):
     """Estimate continuation value from nominal shortest-path travel time."""
     return -env.distances[current_nodes, pickup_nodes] / 60.0
@@ -627,7 +635,7 @@ def train_q_learning(
             returns_matrix = returns_flat.reshape(num_starts, num_pickups)
             
             # Hungarian algorithm
-            _, assignment = optax.assignment.hungarian_algorithm(-returns_matrix)
+            assignment = _hungarian_columns_by_row(-returns_matrix)
             return pickups[assignment]
         
         # Use cond to only compute optimal matching when needed
@@ -868,6 +876,8 @@ def train_q_learning(
                             q_agent.env,
                         )
                     
+            else:
+                # A single agent needs no assignment step.
                 matched_pickups = pickups
                 if not no_round_trip:
                     return_starts = matched_pickups
@@ -1070,7 +1080,7 @@ def train_q_learning(
                             
                             # Perform Hungarian matching using Q-table at time=0
                             returns_matrix = q_agent.estimate_returns_for_matching(start_set, pickup_set, time_idx=start_time_idx)
-                            _, assignment = optax.assignment.hungarian_algorithm(-returns_matrix)
+                            assignment = _hungarian_columns_by_row(-returns_matrix)
                             matched_pickups = pickup_set[assignment]
                             
                             # Evaluate matched pairs (continuous)

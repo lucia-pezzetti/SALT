@@ -217,6 +217,7 @@ parser.add_argument("--read_only_q_table", action="store_true", help="Load --q_t
 parser.add_argument("--final_eval_iterations", type=int, default=50, help="Number of final trajectory-evaluation instances per seed. Figure 4 in the paper used 500 per seed.")
 parser.add_argument("--eval_seed", type=int, default=None, help="Optional RNG seed for final evaluation. Defaults to --seed.")
 parser.add_argument("--print_eval_trajectories", action="store_true", help="Print per-agent final-evaluation trajectories to the log. Intended for small evaluation-only sanity checks.")
+parser.add_argument("--print_q_cycle_diagnostics", action="store_true", help="For failed learned-Q trajectories, print compact diagnostics for long two-node cycles (requires --print_eval_trajectories).")
 parser.add_argument("--sample_starts_from_three_fixed", action="store_true", help="Sample starting nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Pickups still sampled from all nodes.")
 parser.add_argument("--sample_pickups_from_three_fixed", action="store_true", help="Sample pickup nodes with repetition from three fixed nodes (chosen at start of training and kept fixed). Starts sampled uniformly from all nodes.")
 parser.add_argument("--three_fixed_selection_method", type=str, default="random", choices=["random", "degree", "closeness", "betweenness"], help="Method to select the 3 fixed nodes: 'random' (default), 'degree' (degree centrality), 'closeness' (closeness centrality), 'betweenness' (betweenness centrality)")
@@ -242,6 +243,8 @@ if args.final_eval_iterations <= 0:
     raise ValueError("--final_eval_iterations must be positive")
 if args.read_only_q_table and args.epochs != 0:
     raise ValueError("--read_only_q_table is intended for evaluation-only runs with --epochs 0")
+if args.print_q_cycle_diagnostics and not args.print_eval_trajectories:
+    raise ValueError("--print_q_cycle_diagnostics requires --print_eval_trajectories")
 if args.total_epochs_for_schedule is not None and args.total_epochs_for_schedule < args.episode_offset + args.epochs:
     print(
         "Warning: --total_epochs_for_schedule is smaller than "

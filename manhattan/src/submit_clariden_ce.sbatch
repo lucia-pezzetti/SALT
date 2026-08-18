@@ -17,17 +17,21 @@
 #SBATCH --cpus-per-task=72
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/slurm-%j.out
-#SBATCH --environment=./clariden.toml   # container engine EDF; applies to all srun steps
+# Container environment is supplied on each srun step below.
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs cache q_tables
 
-# 1) Warm the shared graph/distance cache with a single rank (avoids the 4-way build race).
-if ! ls cache/simple_distances_*.pkl >/dev/null 2>&1; then
-    echo "=== warming graph/distance cache (single rank, in container) ==="
-    EPOCHS=2000 srun --ntasks=1 --gpus-per-task=1 --cpus-per-task=72 bash run_rank.sh
+CE_ENV=(--environment=./clariden.toml)
+
+# Optional cache warmup. Keep disabled for the Manhattan path: main.py currently
+# disables persistent Manhattan graph/distance cache files, so this would just run
+# an extra short training chunk and write to the real Q-table.
+if [ "${RUN_CACHE_WARMUP:-0}" = "1" ]; then
+    echo "=== optional cache warmup (single rank, in container) ==="
+    EPOCHS="${WARMUP_EPOCHS:-2000}" srun "${CE_ENV[@]}" --ntasks=1 --gpus-per-task=1 --cpus-per-task=72 bash run_rank.sh
 fi
 
 # 2) Real run: 4 ranks, one GPU each, seeds 0..3.
 echo "=== 4-way parallel run in container (seeds 0..3) ==="
-srun --ntasks-per-node=4 --gpus-per-task=1 --cpus-per-task=72 bash run_rank.sh
+srun "${CE_ENV[@]}" --ntasks-per-node=4 --gpus-per-task=1 --cpus-per-task=72 bash run_rank.sh

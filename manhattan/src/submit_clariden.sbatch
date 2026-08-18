@@ -20,14 +20,14 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs cache q_tables
 
-# 1) Warm the SHARED graph/distance cache with a single rank. All 4 ranks build the
-#    same cache file (offset=0.0), so a concurrent first-build would race. A short
-#    run just materialises ./cache/simple_graph_*.pkl and ./cache/simple_distances_*.pkl.
-if ! ls cache/simple_distances_*.pkl >/dev/null 2>&1; then
-    echo "=== warming graph/distance cache (single rank) ==="
-    EPOCHS=2000 srun --ntasks=1 --gpus-per-task=1 --cpus-per-task=72 bash run_rank.sh
+# Optional cache warmup. Keep disabled for the Manhattan path: main.py currently
+# disables persistent Manhattan graph/distance cache files, so this would just run
+# an extra short training chunk and write to the real Q-table.
+if [ "${RUN_CACHE_WARMUP:-0}" = "1" ]; then
+    echo "=== optional cache warmup (single rank) ==="
+    EPOCHS="${WARMUP_EPOCHS:-2000}" srun --ntasks=1 --gpus-per-task=1 --cpus-per-task=72 bash run_rank.sh
 fi
 
-# 2) Real run: 4 ranks, one GPU each, seeds 0..3 in parallel.
+# Real run: 4 ranks, one GPU each, seeds 0..3 in parallel.
 echo "=== 4-way parallel run (seeds 0..3) ==="
 srun --ntasks-per-node=4 --gpus-per-task=1 --cpus-per-task=72 bash run_rank.sh

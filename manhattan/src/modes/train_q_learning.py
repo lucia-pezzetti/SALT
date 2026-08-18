@@ -16,6 +16,41 @@ from utils import offline_shortest_path_action, offline_shortest_path_action_dis
 from .context import RunContext
 
 
+def _hungarian_columns_by_row(cost_matrix: jnp.ndarray) -> jnp.ndarray:
+    """Return the assigned column for each row of a square cost matrix."""
+    if cost_matrix.shape[0] != cost_matrix.shape[1]:
+        raise ValueError("Manhattan fleet matching requires a square cost matrix")
+    rows, cols = optax.assignment.hungarian_algorithm(cost_matrix)
+    return jnp.full((cost_matrix.shape[0],), -1, dtype=cols.dtype).at[rows].set(cols)
+
+
+def _hungarian_with_completed_locked(
+    cost_matrix: jnp.ndarray,
+    completed: np.ndarray,
+    previous_assignment: np.ndarray,
+) -> np.ndarray:
+    """Solve a square assignment while preserving completed agent-target pairs."""
+    completed = np.asarray(completed, dtype=bool)
+    if not np.any(completed):
+        return np.asarray(_hungarian_columns_by_row(cost_matrix), dtype=np.int32)
+
+    constrained = np.asarray(cost_matrix, dtype=np.float32).copy()
+    finite = np.abs(constrained[np.isfinite(constrained)])
+    scale = float(np.max(finite)) if finite.size else 1.0
+    penalty = (2 * constrained.shape[0] + 1) * max(scale, 1.0) + 1.0
+    constrained[~np.isfinite(constrained)] = penalty
+
+    locked_columns = np.asarray(previous_assignment, dtype=np.int32)[completed]
+    constrained[:, locked_columns] = penalty
+    for row, col in zip(np.flatnonzero(completed), locked_columns):
+        constrained[row, :] = penalty
+        constrained[row, col] = 0.0
+
+    return np.asarray(
+        _hungarian_columns_by_row(jnp.asarray(constrained)), dtype=np.int32
+    )
+
+
 def run_q_learning(args, ctx: RunContext) -> None:
     """Run tabular Q-learning training when discrete=True."""
     print("="*60)
@@ -146,7 +181,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
             
             # Use Hungarian matching to assign pickups to starts
             cost_matrix = ctx.distances[eval_starts, :][:, eval_pickups]
-            _, assignment = optax.assignment.hungarian_algorithm(cost_matrix)
+            assignment = _hungarian_columns_by_row(cost_matrix)
             matched_pickups = eval_pickups[assignment]
             
             # Evaluate for this iteration
@@ -502,7 +537,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         cost_matrix = -returns_matrix  # Negative because Hungarian minimizes cost
         
         # Hungarian algorithm
-        _, assignment = optax.assignment.hungarian_algorithm(cost_matrix)
+        assignment = _hungarian_columns_by_row(cost_matrix)
         matched_pickups = jnp.take(pickups_jax, assignment, axis=0)
         return matched_pickups, cost_matrix
     
@@ -775,7 +810,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         # Fast: Just use precomputed distance matrix (no simulation needed!)
         cost_matrix = build_cost_matrix_from_distances(starts, pickups, ctx.env.distances)
-        _, assignment = optax.assignment.hungarian_algorithm(cost_matrix)
+        assignment = _hungarian_columns_by_row(cost_matrix)
         matched_pickups = jnp.take(jnp.array(pickups, dtype=jnp.int32), assignment, axis=0)
         return matched_pickups, cost_matrix
     
@@ -801,7 +836,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         total_times = jnp.zeros(num_eval, dtype=jnp.float32)
         total_rewards = jnp.zeros(num_eval, dtype=jnp.float32)
-        completed = jnp.zeros(num_eval, dtype=bool)
+        completed = eval_states.done
         max_eval_steps = max_steps  # Now static, so can use directly
         
         # Track paths, step rewards, and step times (fixed-size buffers)
@@ -900,7 +935,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         total_times = jnp.zeros(num_eval, dtype=jnp.float32)
         total_rewards = jnp.zeros(num_eval, dtype=jnp.float32)
-        completed = jnp.zeros(num_eval, dtype=bool)
+        completed = eval_states.done
         max_eval_steps = max_steps
         
         path_buffer = jnp.zeros((num_eval, max_eval_steps + 1), dtype=jnp.int32)
@@ -1008,8 +1043,8 @@ def run_q_learning(args, ctx: RunContext) -> None:
         offline shortest path to its current target. Agents are stepped as a batch; the small
         B x B Hungarian solve runs on host every K steps (K << horizon, B == num_agents).
 
-        A finished agent sits on its target (distance 0), so the Hungarian solution keeps it
-        there -- served targets are thus implicitly "consumed" with no special-casing.
+        Completed agents remain paired with the targets they served, so those target slots
+        cannot be reassigned to active agents.
         Returns (total_times, total_rewards, completed) as numpy arrays, matching the columns
         used by the other baselines.
         """
@@ -1017,10 +1052,11 @@ def run_q_learning(args, ctx: RunContext) -> None:
         eval_keys = jax.random.split(eval_key, num_eval)
         states, _ = batch_reset(eval_keys, starts, pickups)
         pool = jnp.asarray(pickups, dtype=jnp.int32)          # fixed candidate targets (B,)
+        assignment = np.arange(num_eval, dtype=np.int32)
 
         total_times = np.zeros(num_eval, dtype=np.float32)
         total_rewards = np.zeros(num_eval, dtype=np.float32)
-        completed = np.zeros(num_eval, dtype=bool)
+        completed = np.asarray(states.done, dtype=bool)
         key = eval_key
         if return_paths:
             paths = [[int(node)] for node in np.asarray(starts).tolist()]
@@ -1033,7 +1069,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
             # Periodic joint reassignment (step 0 already carries the initial matching).
             if reassign_every > 0 and step > 0 and (step % reassign_every == 0):
                 cost = ctx.env.distances[states.current_node][:, pool]   # [B, B] offline SP distances
-                _, assignment = optax.assignment.hungarian_algorithm(cost)
+                assignment = _hungarian_with_completed_locked(cost, completed, assignment)
                 states = states._replace(pickup_node=jnp.take(pool, assignment, axis=0))
 
             if use_discrete:
@@ -1083,27 +1119,29 @@ def run_q_learning(args, ctx: RunContext) -> None:
         out_axes=0,
     )
 
-    def evaluate_q_reassign_batched(starts, init_pickups, pool_pickups, eval_key,
-                                    max_steps, use_continuous_eval, return_paths=False):
+    def evaluate_q_reassign_batched(starts, init_pickups, eval_key, max_steps,
+                                    use_continuous_eval, return_paths=False):
         """SALT evaluation with OT assignment RE-SOLVED every timestep.
 
         Each step: estimate Q-returns (max_a Q) from every agent's CURRENT node and CURRENT
-        (discretized) time to every target in `pool_pickups`, solve the Hungarian assignment
+        (discretized) time to every target in the fixed pool, solve the Hungarian assignment
         on -returns, reassign each agent's target, then take one greedy learned-Q routing
-        step. `init_pickups` is the t=0 OT matching (so reset targets are valid); subsequent
-        steps re-solve. Batched over agents; the small B x B Hungarian runs on host each step.
+        step. `init_pickups` is both the t=0 OT matching and a reordered view of the fixed
+        target pool. Completed agents remain locked to the target slots they served.
+        Batched over agents; the small B x B Hungarian runs on host each step.
         """
         num_eval = int(starts.shape[0])
         eval_keys = jax.random.split(eval_key, num_eval)
         states, _ = batch_reset(eval_keys, starts, init_pickups)
-        pool = jnp.asarray(pool_pickups, dtype=jnp.int32)
+        pool = jnp.asarray(init_pickups, dtype=jnp.int32)
+        assignment = np.arange(num_eval, dtype=np.int32)
         dt = q_agent.dt
         mts = q_agent.max_time_slices
         nn = ctx.env.num_nodes
 
         total_times = np.zeros(num_eval, dtype=np.float32)
         total_rewards = np.zeros(num_eval, dtype=np.float32)
-        completed = np.zeros(num_eval, dtype=bool)
+        completed = np.asarray(states.done, dtype=bool)
         key = eval_key
         if return_paths:
             paths = [[int(node)] for node in np.asarray(starts).tolist()]
@@ -1124,7 +1162,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     q_agent.q_table, starts_exp, pool_exp, t_exp, nn, mts, ctx.env
                 )
                 cost = (-returns).reshape(num_eval, num_eval)   # [B agents, B targets]
-                _, assignment = optax.assignment.hungarian_algorithm(cost)
+                assignment = _hungarian_with_completed_locked(cost, completed, assignment)
                 states = states._replace(pickup_node=jnp.take(pool, assignment, axis=0))
 
             # Greedy learned-Q routing step (epsilon=0), same lookup as evaluate_batch_episodes.
@@ -1204,7 +1242,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         )
         returns_matrix = returns_flat.reshape(num_starts, num_pickups)
         cost_matrix_q = -returns_matrix
-        _, assignment_q = optax.assignment.hungarian_algorithm(cost_matrix_q)
+        assignment_q = _hungarian_columns_by_row(cost_matrix_q)
         matched_q_pickups = jnp.take(pickups_jax, assignment_q, axis=0)
 
         # Assignment-ablation baselines (R3-W1): reuse the SAME learned Q routing
@@ -1223,7 +1261,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
             dist_cost = build_cost_matrix_from_distances(
                 starts_jax, pickups_jax, ctx.env.distances
             )
-            _, assignment_myopic = optax.assignment.hungarian_algorithm(dist_cost)
+            assignment_myopic = _hungarian_columns_by_row(dist_cost)
             matched_myopic_pickups = jnp.take(pickups_jax, assignment_myopic, axis=0)
 
         # Shortest path matching
@@ -1354,6 +1392,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         #   (3,4) shortest-path + reassignment every K (from --reassignment_periods)
         if getattr(args, "eval_reassignment_baselines", False):
             print_eval_trajectories = getattr(args, "print_eval_trajectories", False)
+            print_q_cycle_diagnostics = getattr(args, "print_q_cycle_diagnostics", False)
             sp_reassign_trajectory_debug = {}
             if print_eval_trajectories:
                 (
@@ -1364,27 +1403,47 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     salt_targets_cont,
                     salt_step_times_cont,
                 ) = evaluate_q_reassign_batched(
-                    eval_starts, matched_q_pickups, eval_pickups,
+                    eval_starts, matched_q_pickups,
                     jax.random.PRNGKey(base_seed + 2500), max_eval_steps,
                     use_continuous_eval=True, return_paths=True,
                 )
             else:
                 salt_t_cont, _, salt_c_cont = evaluate_q_reassign_batched(
-                    eval_starts, matched_q_pickups, eval_pickups,
+                    eval_starts, matched_q_pickups,
                     jax.random.PRNGKey(base_seed + 2500), max_eval_steps, use_continuous_eval=True,
                 )
             salt_t_disc, _, salt_c_disc = evaluate_q_reassign_batched(
-                eval_starts, matched_q_pickups, eval_pickups,
+                eval_starts, matched_q_pickups,
                 jax.random.PRNGKey(base_seed + 2600), max_eval_steps, use_continuous_eval=False,
             )
             print("\n--- Final four-way comparison (mean time over agents) ---")
-            print(f"  (1) SALT (learned Q + OT every timestep): cont={np.mean(salt_t_cont):.2f}  disc={np.mean(salt_t_disc):.2f}")
-            print(f"  (2) Shortest-path static (assign@t=0):    cont={np.mean(sp_times_continuous):.2f}  disc={np.mean(sp_times_discrete):.2f}")
+            print(
+                "  (1) SALT (learned Q + OT every timestep): "
+                f"cont={np.mean(salt_t_cont):.2f}  disc={np.mean(salt_t_disc):.2f}  "
+                f"completion_cont={np.mean(salt_c_cont):.2%}  "
+                f"completion_disc={np.mean(salt_c_disc):.2%}"
+            )
+            print(
+                "  (1b) SALT static-assignment:               "
+                f"cont={np.mean(q_times_continuous):.2f}  disc={np.mean(q_times_discrete):.2f}  "
+                f"completion_cont={np.mean(q_completed_continuous):.2%}  "
+                f"completion_disc={np.mean(q_completed_discrete):.2%}"
+            )
+            print(
+                "  (2) Shortest-path static (assign@t=0):    "
+                f"cont={np.mean(sp_times_continuous):.2f}  disc={np.mean(sp_times_discrete):.2f}  "
+                f"completion_cont={np.mean(sp_completed_continuous):.2%}  "
+                f"completion_disc={np.mean(sp_completed_discrete):.2%}"
+            )
             log_payload = {
                 f"final_eval/iter{i}/salt_reassign_every_step_mean_time_continuous": float(np.mean(salt_t_cont)),
                 f"final_eval/iter{i}/salt_reassign_every_step_mean_time_discrete": float(np.mean(salt_t_disc)),
                 f"final_eval/iter{i}/salt_reassign_every_step_completion_continuous": float(np.mean(salt_c_cont)),
                 f"final_eval/iter{i}/salt_reassign_every_step_completion_discrete": float(np.mean(salt_c_disc)),
+                f"final_eval/iter{i}/salt_static_mean_time_continuous": float(np.mean(q_times_continuous)),
+                f"final_eval/iter{i}/salt_static_mean_time_discrete": float(np.mean(q_times_discrete)),
+                f"final_eval/iter{i}/salt_static_completion_continuous": float(np.mean(q_completed_continuous)),
+                f"final_eval/iter{i}/salt_static_completion_discrete": float(np.mean(q_completed_discrete)),
                 f"final_eval/iter{i}/sp_static_mean_time_continuous": float(np.mean(sp_times_continuous)),
                 f"final_eval/iter{i}/sp_static_mean_time_discrete": float(np.mean(sp_times_discrete)),
                 f"final_eval/iter{i}/sp_static_completion_continuous": float(np.mean(sp_completed_continuous)),
@@ -1416,7 +1475,12 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     eval_starts, matched_sp_pickups_disc, jax.random.PRNGKey(base_seed + 4000 + _k),
                     max_eval_steps, _k, use_discrete=True,
                 )
-                print(f"  (K={_k}) Shortest-path + reassign every {_k}:   cont={np.mean(re_t_cont):.2f}  disc={np.mean(re_t_disc):.2f}")
+                print(
+                    f"  (K={_k}) Shortest-path + reassign every {_k}:   "
+                    f"cont={np.mean(re_t_cont):.2f}  disc={np.mean(re_t_disc):.2f}  "
+                    f"completion_cont={np.mean(re_c_cont):.2%}  "
+                    f"completion_disc={np.mean(re_c_disc):.2%}"
+                )
                 log_payload.update({
                     f"final_eval/iter{i}/sp_reassign{_k}_mean_time_continuous": float(np.mean(re_t_cont)),
                     f"final_eval/iter{i}/sp_reassign{_k}_mean_time_discrete": float(np.mean(re_t_disc)),
@@ -1431,6 +1495,122 @@ def run_q_learning(args, ctx: RunContext) -> None:
 
                 def _round_list(values):
                     return [round(float(x), 2) for x in values]
+
+                def _alternating_cycle_segments(path, min_backtracks=3):
+                    """Return maximal path-index ranges containing repeated A-B-A moves."""
+                    backtracks = [
+                        idx for idx in range(2, len(path))
+                        if path[idx] == path[idx - 2]
+                    ]
+                    if not backtracks:
+                        return []
+
+                    runs = []
+                    run_start = run_end = backtracks[0]
+                    for idx in backtracks[1:]:
+                        if idx == run_end + 1:
+                            run_end = idx
+                        else:
+                            if run_end - run_start + 1 >= min_backtracks:
+                                runs.append((run_start - 2, run_end))
+                            run_start = run_end = idx
+                    if run_end - run_start + 1 >= min_backtracks:
+                        runs.append((run_start - 2, run_end))
+                    return runs
+
+                def _trajectory_phases(path, step_times):
+                    """Reconstruct the pre-action traffic phase from observed step times."""
+                    phases = [0.0]
+                    for step_idx, observed_time in enumerate(step_times):
+                        current = int(path[step_idx])
+                        next_node = int(path[step_idx + 1])
+                        valid = np.asarray(ctx.env.neighbor_mask_static[current], dtype=bool)
+                        neighbors = np.asarray(ctx.env.adj_list[current], dtype=np.int32)
+                        matching_actions = np.flatnonzero(valid & (neighbors == next_node))
+                        if matching_actions.size:
+                            period = float(ctx.env.periods[current, int(matching_actions[0])])
+                        else:
+                            period = float(np.max(np.asarray(ctx.env.periods[current])))
+                        phases.append((phases[-1] + float(observed_time)) % period)
+                    return phases
+
+                def _print_q_cycle_diagnostic(label, path, targets, step_times):
+                    segments = _alternating_cycle_segments(path)
+                    if not segments:
+                        print(f"      {label} cycle diagnosis: no long two-node cycle found")
+                        return
+
+                    phases = _trajectory_phases(path, step_times)
+                    print(
+                        f"      {label} cycle diagnosis: {len(segments)} long cycle(s); "
+                        "Q=learned value, SP=nominal edge+remaining time, wait=nominal wait now"
+                    )
+                    for segment_idx, (start_idx, end_idx) in enumerate(segments[:4], start=1):
+                        cycle_nodes = sorted({int(node) for node in path[start_idx:end_idx + 1]})
+                        cycle_targets = sorted({
+                            int(targets[min(step + 1, len(targets) - 1)])
+                            for step in range(start_idx, min(end_idx, len(step_times)))
+                        })
+                        print(
+                            f"        cycle {segment_idx}: nodes={cycle_nodes} "
+                            f"path_steps={start_idx}-{end_idx} targets={cycle_targets}"
+                        )
+
+                        cycle_steps = list(range(start_idx, min(end_idx, len(step_times))))
+                        if len(cycle_steps) > 8:
+                            middle = cycle_steps[len(cycle_steps) // 2]
+                            shown_steps = cycle_steps[:3] + [middle] + cycle_steps[-3:]
+                        else:
+                            shown_steps = cycle_steps
+                        if end_idx < len(step_times):
+                            shown_steps.append(end_idx)  # Include the action that exits the cycle.
+                        shown_steps = list(dict.fromkeys(shown_steps))
+
+                        for step_idx in shown_steps:
+                            current = int(path[step_idx])
+                            observed_next = int(path[step_idx + 1])
+                            target = int(targets[min(step_idx + 1, len(targets) - 1)])
+                            phase = float(phases[step_idx])
+                            time_idx = int(np.clip(round(phase / q_agent.dt), 0, q_agent.max_time_slices - 1))
+
+                            valid = np.asarray(ctx.env.neighbor_mask_static[current], dtype=bool)
+                            neighbors = np.asarray(ctx.env.adj_list[current], dtype=np.int32)
+                            q_values = np.asarray(
+                                q_agent.q_table[current, target, time_idx, :], dtype=np.float32
+                            )
+                            q_action = int(np.argmax(np.where(valid, q_values, -np.inf)))
+                            sp_costs = np.asarray(ctx.env.travel_times[current], dtype=np.float32) + np.asarray(
+                                ctx.env.distances[neighbors, target], dtype=np.float32
+                            )
+                            sp_action = int(np.argmin(np.where(valid, sp_costs, np.inf)))
+
+                            options = []
+                            for action in np.flatnonzero(valid):
+                                action = int(action)
+                                travel = float(ctx.env.travel_times[current, action])
+                                period = float(ctx.env.periods[current, action])
+                                offset = float(ctx.env.offsets[current, action])
+                                green = float(ctx.env.green_durations[current, action])
+                                signal_phase = (phase + travel + offset) % period
+                                wait = 0.0 if signal_phase < green else period - signal_phase
+                                markers = ""
+                                if action == q_action:
+                                    markers += "Q"
+                                if action == sp_action:
+                                    markers += "S"
+                                options.append(
+                                    f"a{action}->{int(neighbors[action])}[{markers or '-'}]:"
+                                    f"Q={float(q_values[action]):.4g},"
+                                    f"SP={float(sp_costs[action]):.1f},wait={wait:.1f}"
+                                )
+                            print(
+                                f"          step={step_idx} phase={phase:.2f} t_idx={time_idx} "
+                                f"state=({current}, target={target}) observed_next={observed_next} "
+                                f"observed_dt={float(step_times[step_idx]):.2f} "
+                                f"options={{" + "; ".join(options) + "}"
+                            )
+                    if len(segments) > 4:
+                        print(f"        ... {len(segments) - 4} additional cycle(s) omitted")
 
                 print("\n--- Trajectory debug (continuous evaluation, node ids) ---")
                 print(f"  starts={_int_list(eval_starts)}")
@@ -1457,6 +1637,23 @@ def run_q_learning(args, ctx: RunContext) -> None:
                         f"target={int(np.asarray(matched_q_pickups)[agent_idx])} "
                         f"step_times={_round_list(q_step_times_continuous[agent_idx])}"
                     )
+                    if print_q_cycle_diagnostics:
+                        if not bool(salt_c_cont[agent_idx]):
+                            _print_q_cycle_diagnostic(
+                                "SALT reassign-every-step",
+                                salt_paths_cont[agent_idx],
+                                salt_targets_cont[agent_idx],
+                                salt_step_times_cont[agent_idx],
+                            )
+                        if not bool(q_completed_cont[agent_idx]):
+                            static_path = q_paths_continuous[agent_idx]
+                            static_target = int(np.asarray(matched_q_pickups)[agent_idx])
+                            _print_q_cycle_diagnostic(
+                                "SALT static-assignment",
+                                static_path,
+                                [static_target] * len(static_path),
+                                q_step_times_continuous[agent_idx],
+                            )
                     print(
                         "    SP static:                 "
                         f"completed={bool(sp_completed_cont[agent_idx])} "
