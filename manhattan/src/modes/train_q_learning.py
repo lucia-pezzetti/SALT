@@ -7,13 +7,30 @@ import os
 
 from datetime import datetime
 
-from taxi_env import TaxiState, init_env
+from taxi_env import (
+    TaxiState,
+    effective_action_mask,
+    init_env,
+    mask_immediate_reverse_actions,
+)
 from training.train_q_learning import train_q_learning, evaluate_q_agent
 from training.q_learning import TabularQLearning
 from utils import offline_shortest_path_action, offline_shortest_path_action_discrete, offline_shortest_path_action_batch, offline_shortest_path_action_discrete_batch
 # from evaluation.plot_agent_paths import plot_rl_vs_shortest_path  # Disabled: trajectory plots removed
 
 from .context import RunContext
+
+
+def _effective_action_masks(env, current_nodes, pickup_nodes, base_masks):
+    return jax.vmap(
+        lambda current, pickup, mask: effective_action_mask(
+            env.adj_list,
+            env.forced_return_actions,
+            current,
+            pickup,
+            mask,
+        )
+    )(current_nodes, pickup_nodes, base_masks)
 
 
 def _hungarian_columns_by_row(cost_matrix: jnp.ndarray) -> jnp.ndarray:
@@ -99,7 +116,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     action = offline_shortest_path_action(
                         state.current_node, state.pickup_node,
                         env.adj_list, env.travel_times, env.distances,
-                        env.neighbor_mask_static[state.current_node]
+                        effective_action_mask(
+                            env.adj_list,
+                            env.forced_return_actions,
+                            state.current_node,
+                            state.pickup_node,
+                            state.neighbor_mask,
+                        ),
                     )
                     noise_key, nk = jax_random.split(noise_key)
                     state, reward, done, info = env.step(state, action, noise_key=nk)
@@ -142,7 +165,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     action = offline_shortest_path_action_discrete(
                         state.current_node, state.pickup_node,
                         env.adj_list, q_agent.discrete_travel_times, env.distances,
-                        env.neighbor_mask_static[state.current_node]
+                        effective_action_mask(
+                            env.adj_list,
+                            env.forced_return_actions,
+                            state.current_node,
+                            state.pickup_node,
+                            state.neighbor_mask,
+                        ),
                     )
                     key, step_key, noise_key = jax.random.split(key, 3)
                     state, reward, done, info = q_agent.step_with_discretization(state, action, step_key, noise_key=noise_key)
@@ -450,8 +479,15 @@ def run_q_learning(args, ctx: RunContext) -> None:
         """Greedy Q-learning policy (epsilon=0)."""
         valid_actions = []
         q_values = []
+        valid_mask = effective_action_mask(
+            ctx.env.adj_list,
+            ctx.env.forced_return_actions,
+            state.current_node,
+            state.pickup_node,
+            state.neighbor_mask,
+        )
         for action in range(ctx.env.max_deg):
-            if state.neighbor_mask[action]:
+            if bool(valid_mask[action]):
                 valid_actions.append(action)
                 q_values.append(q_agent.get_q_value(state, action))
         
@@ -518,6 +554,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
         # Create all combinations
         starts_expanded = jnp.repeat(starts_jax, num_pickups)
         pickups_expanded = jnp.tile(pickups_jax, num_starts)
+        base_action_masks = ctx.env.neighbor_mask_static[starts_expanded]
         
         time_idx = jnp.int32(0)
         
@@ -530,6 +567,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
             ctx.env.num_nodes,
             q_agent.max_time_slices,
             ctx.env,
+            base_action_masks,
         )
         
         # Reshape to [num_starts, num_pickups] and convert to cost (negative return)
@@ -591,19 +629,21 @@ def run_q_learning(args, ctx: RunContext) -> None:
         def body_fn(carry):
             step, states, rewards_acc, steps_acc, completed_mask = carry
             
-            # Discretize state time for Q-table lookup (greedy policy, epsilon=0)
-            discretized_times = dt * jnp.round(states.time / dt)
-            
             # Get state indices for Q-table lookup
             curr = jnp.clip(states.current_node, 0, num_nodes - 1)
             pickup = jnp.clip(states.pickup_node, 0, num_nodes - 1)
-            t_idx = jnp.clip(jnp.int32(discretized_times / dt), 0, max_time_slices - 1)
+            t_idx = jnp.clip(jnp.int32(jnp.floor(states.time / dt)), 0, max_time_slices - 1)
             
             # Get Q-values for all actions: [num_episodes, max_deg]
             q_values = q_table[curr, pickup, t_idx, :]  # [num_episodes, max_deg]
             
             # Mask invalid actions
-            valid_mask = states.neighbor_mask  # [num_episodes, max_deg]
+            valid_mask = _effective_action_masks(
+                env,
+                curr,
+                pickup,
+                states.neighbor_mask,
+            )
             q_masked = jnp.where(valid_mask, q_values, -jnp.inf)
             
             # Greedy action (epsilon=0)
@@ -699,7 +739,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 action = offline_shortest_path_action(
                     state.current_node, state.pickup_node,
                     ctx.env.adj_list, ctx.env.travel_times, ctx.env.distances,
-                    ctx.env.neighbor_mask_static[state.current_node]
+                    effective_action_mask(
+                        ctx.env.adj_list,
+                        ctx.env.forced_return_actions,
+                        state.current_node,
+                        state.pickup_node,
+                        state.neighbor_mask,
+                    ),
                 )
                 noise_key, nk = jax.random.split(noise_key)
                 state, reward, done, info = ctx.env.step(state, action, noise_key=nk)
@@ -734,7 +780,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 action = offline_shortest_path_action_discrete(
                     state.current_node, state.pickup_node,
                     ctx.env.adj_list, q_agent.discrete_travel_times, ctx.env.distances,
-                    ctx.env.neighbor_mask_static[state.current_node]
+                    effective_action_mask(
+                        ctx.env.adj_list,
+                        ctx.env.forced_return_actions,
+                        state.current_node,
+                        state.pickup_node,
+                        state.neighbor_mask,
+                    ),
                 )
                 # Use discretized step
                 noise_key, nk = jax.random.split(noise_key)
@@ -763,8 +815,15 @@ def run_q_learning(args, ctx: RunContext) -> None:
         """Greedy Q-learning policy (epsilon=0)."""
         valid_actions = []
         q_values = []
+        valid_mask = effective_action_mask(
+            ctx.env.adj_list,
+            ctx.env.forced_return_actions,
+            state.current_node,
+            state.pickup_node,
+            state.neighbor_mask,
+        )
         for action in range(ctx.env.max_deg):
-            if state.neighbor_mask[action]:
+            if bool(valid_mask[action]):
                 valid_actions.append(action)
                 q_values.append(q_agent.get_q_value(state, action))
         
@@ -779,7 +838,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
         return offline_shortest_path_action(
             state.current_node, state.pickup_node,
             ctx.env.adj_list, ctx.env.travel_times, ctx.env.distances,
-            ctx.env.neighbor_mask_static[state.current_node]
+            effective_action_mask(
+                ctx.env.adj_list,
+                ctx.env.forced_return_actions,
+                state.current_node,
+                state.pickup_node,
+                state.neighbor_mask,
+            ),
         )
     
     # Shortest path policy (uses discretized travel times with epsilon for zero-time edges)
@@ -787,7 +852,13 @@ def run_q_learning(args, ctx: RunContext) -> None:
         return offline_shortest_path_action_discrete(
             state.current_node, state.pickup_node,
             ctx.env.adj_list, q_agent.discrete_travel_times, ctx.env.distances,
-            ctx.env.neighbor_mask_static[state.current_node]
+            effective_action_mask(
+                ctx.env.adj_list,
+                ctx.env.forced_return_actions,
+                state.current_node,
+                state.pickup_node,
+                state.neighbor_mask,
+            ),
         )
     
     @jax.jit
@@ -856,15 +927,18 @@ def run_q_learning(args, ctx: RunContext) -> None:
         def body_fn(carry):
             step, states, times_acc, rewards_acc, completed_mask, path_buf, step_rewards_buf, step_times_buf, path_lens, step_keys, _ = carry
             
-            # Discretize state time for Q-table lookup
-            discretized_times = dt * jnp.round(states.time / dt)
             curr = jnp.clip(states.current_node, 0, num_nodes - 1)
             pickup = jnp.clip(states.pickup_node, 0, num_nodes - 1)
-            t_idx = jnp.clip(jnp.int32(discretized_times / dt), 0, max_time_slices - 1)
+            t_idx = jnp.clip(jnp.int32(jnp.floor(states.time / dt)), 0, max_time_slices - 1)
             
             # Get Q-values and select greedy action
             q_values = q_table[curr, pickup, t_idx, :]  # [num_eval, max_deg]
-            valid_mask = states.neighbor_mask
+            valid_mask = _effective_action_masks(
+                ctx.env,
+                curr,
+                pickup,
+                states.neighbor_mask,
+            )
             q_masked = jnp.where(valid_mask, q_values, -jnp.inf)
             actions = jnp.argmax(q_masked, axis=-1)
             
@@ -961,7 +1035,12 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     ctx.env.adj_list,
                     q_agent.discrete_travel_times,
                     ctx.env.distances,
-                    ctx.env.neighbor_mask_static[states.current_node],
+                    _effective_action_masks(
+                        ctx.env,
+                        states.current_node,
+                        states.pickup_node,
+                        states.neighbor_mask,
+                    ),
                     1e-6  # epsilon
                 )
             else:
@@ -971,7 +1050,12 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     ctx.env.adj_list,
                     ctx.env.travel_times,
                     ctx.env.distances,
-                    ctx.env.neighbor_mask_static[states.current_node]
+                    _effective_action_masks(
+                        ctx.env,
+                        states.current_node,
+                        states.pickup_node,
+                        states.neighbor_mask,
+                    ),
                 )
             
             # Take step (continuous or discrete), with per-step noise keys
@@ -1076,13 +1160,23 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 actions = offline_shortest_path_action_discrete_batch(
                     states.current_node, states.pickup_node, ctx.env.adj_list,
                     q_agent.discrete_travel_times, ctx.env.distances,
-                    ctx.env.neighbor_mask_static[states.current_node], 1e-6,
+                    _effective_action_masks(
+                        ctx.env,
+                        states.current_node,
+                        states.pickup_node,
+                        states.neighbor_mask,
+                    ), 1e-6,
                 )
             else:
                 actions = offline_shortest_path_action_batch(
                     states.current_node, states.pickup_node, ctx.env.adj_list,
                     ctx.env.travel_times, ctx.env.distances,
-                    ctx.env.neighbor_mask_static[states.current_node],
+                    _effective_action_masks(
+                        ctx.env,
+                        states.current_node,
+                        states.pickup_node,
+                        states.neighbor_mask,
+                    ),
                 )
 
             key, sub = jax.random.split(key)
@@ -1115,7 +1209,7 @@ def run_q_learning(args, ctx: RunContext) -> None:
     from training.q_learning import _estimate_return_q_table_direct
     _estimate_returns_time = jax.vmap(
         _estimate_return_q_table_direct,
-        in_axes=(None, 0, 0, 0, None, None, None),  # q_table, start, pickup, time_idx(batched), ...
+        in_axes=(None, 0, 0, 0, None, None, None, 0),
         out_axes=0,
     )
 
@@ -1154,12 +1248,24 @@ def run_q_learning(args, ctx: RunContext) -> None:
             # Re-solve OT every timestep (step 0 already carries the t=0 matching).
             if step > 0:
                 cur = jnp.clip(states.current_node, 0, nn - 1)
-                t_idx = jnp.clip(jnp.int32(jnp.round(states.time / dt)), 0, mts - 1)  # (B,)
+                t_idx = jnp.clip(jnp.int32(jnp.floor(states.time / dt)), 0, mts - 1)  # (B,)
                 starts_exp = jnp.repeat(cur, num_eval)          # each agent x all targets
                 pool_exp = jnp.tile(pool, num_eval)
                 t_exp = jnp.repeat(t_idx, num_eval)
+                base_action_masks = jnp.repeat(
+                    states.neighbor_mask,
+                    num_eval,
+                    axis=0,
+                )
                 returns = _estimate_returns_time(
-                    q_agent.q_table, starts_exp, pool_exp, t_exp, nn, mts, ctx.env
+                    q_agent.q_table,
+                    starts_exp,
+                    pool_exp,
+                    t_exp,
+                    nn,
+                    mts,
+                    ctx.env,
+                    base_action_masks,
                 )
                 cost = (-returns).reshape(num_eval, num_eval)   # [B agents, B targets]
                 assignment = _hungarian_with_completed_locked(cost, completed, assignment)
@@ -1168,9 +1274,15 @@ def run_q_learning(args, ctx: RunContext) -> None:
             # Greedy learned-Q routing step (epsilon=0), same lookup as evaluate_batch_episodes.
             curr = jnp.clip(states.current_node, 0, nn - 1)
             pk = jnp.clip(states.pickup_node, 0, nn - 1)
-            ti = jnp.clip(jnp.int32(jnp.round(states.time / dt)), 0, mts - 1)
+            ti = jnp.clip(jnp.int32(jnp.floor(states.time / dt)), 0, mts - 1)
             q_vals = q_agent.q_table[curr, pk, ti, :]
-            q_vals = jnp.where(states.neighbor_mask, q_vals, -jnp.inf)
+            valid_mask = _effective_action_masks(
+                ctx.env,
+                curr,
+                pk,
+                states.neighbor_mask,
+            )
+            q_vals = jnp.where(valid_mask, q_vals, -jnp.inf)
             actions = jnp.argmax(q_vals, axis=-1)
 
             key, sub = jax.random.split(key)
@@ -1236,9 +1348,11 @@ def run_q_learning(args, ctx: RunContext) -> None:
         
         starts_expanded = jnp.repeat(starts_jax, num_pickups)
         pickups_expanded = jnp.tile(pickups_jax, num_starts)
+        base_action_masks = ctx.env.neighbor_mask_static[starts_expanded]
         returns_flat = _estimate_returns_batch_q_table_direct(
             q_agent.q_table, starts_expanded, pickups_expanded,
-            time_idx, ctx.env.num_nodes, q_agent.max_time_slices, ctx.env
+            time_idx, ctx.env.num_nodes, q_agent.max_time_slices, ctx.env,
+            base_action_masks,
         )
         returns_matrix = returns_flat.reshape(num_starts, num_pickups)
         cost_matrix_q = -returns_matrix
@@ -1571,9 +1685,26 @@ def run_q_learning(args, ctx: RunContext) -> None:
                             observed_next = int(path[step_idx + 1])
                             target = int(targets[min(step_idx + 1, len(targets) - 1)])
                             phase = float(phases[step_idx])
-                            time_idx = int(np.clip(round(phase / q_agent.dt), 0, q_agent.max_time_slices - 1))
+                            time_idx = int(np.clip(np.floor(phase / q_agent.dt), 0, q_agent.max_time_slices - 1))
 
-                            valid = np.asarray(ctx.env.neighbor_mask_static[current], dtype=bool)
+                            base_mask = ctx.env.neighbor_mask_static[current]
+                            if step_idx > 0:
+                                base_mask = mask_immediate_reverse_actions(
+                                    ctx.env.adj_list,
+                                    base_mask,
+                                    current,
+                                    int(path[step_idx - 1]),
+                                )
+                            valid = np.asarray(
+                                effective_action_mask(
+                                    ctx.env.adj_list,
+                                    ctx.env.forced_return_actions,
+                                    current,
+                                    target,
+                                    base_mask,
+                                ),
+                                dtype=bool,
+                            )
                             neighbors = np.asarray(ctx.env.adj_list[current], dtype=np.int32)
                             q_values = np.asarray(
                                 q_agent.q_table[current, target, time_idx, :], dtype=np.float32

@@ -17,6 +17,33 @@ class TaxiState(NamedTuple):
 
 
 @jax.jit
+def mask_immediate_reverse_actions(
+    adj_list: jnp.ndarray,
+    base_mask: jnp.ndarray,
+    current_node: jnp.ndarray,
+    previous_node: jnp.ndarray,
+) -> jnp.ndarray:
+    """Disallow an immediate return when another valid successor exists."""
+    neighbors = adj_list[current_node]
+    without_reverse = base_mask & (neighbors != previous_node)
+    return jnp.where(jnp.any(without_reverse), without_reverse, base_mask)
+
+
+@jax.jit
+def effective_action_mask(
+    adj_list: jnp.ndarray,
+    forced_return_actions: jnp.ndarray,
+    current_node: jnp.ndarray,
+    pickup_node: jnp.ndarray,
+    base_mask: jnp.ndarray,
+) -> jnp.ndarray:
+    """Also avoid entering a forced-return spur unless it is the target."""
+    enters_target = adj_list[current_node] == pickup_node
+    legal_mask = base_mask & (~forced_return_actions[current_node] | enters_target)
+    return jnp.where(jnp.any(legal_mask), legal_mask, base_mask)
+
+
+@jax.jit
 def init_env(
     rng_key, 
     start_idx: int, 
@@ -44,6 +71,7 @@ class TaxiEnv(eqx.Module):
     travel_times: jnp.ndarray     # [num_nodes, max_deg]
     max_travel_time: float
     neighbor_mask_static: jnp.ndarray
+    forced_return_actions: jnp.ndarray
     max_deg: int
     num_nodes: int
     distances: jnp.ndarray        # [num_nodes, num_nodes]
@@ -95,6 +123,15 @@ class TaxiEnv(eqx.Module):
         self.travel_times = jax.device_put(jnp.array(travel_times, dtype=jnp.float32))
         self.max_travel_time = float(travel_times.max())
         self.neighbor_mask_static = jax.device_put(jnp.array(neighbor_mask_static, dtype=bool))
+        adj_host = np.asarray(adj_list, dtype=np.int32)
+        neighbor_mask_host = np.asarray(neighbor_mask_static, dtype=bool)
+        forced_return_actions = np.zeros_like(neighbor_mask_host)
+        for current in range(adj_host.shape[0]):
+            for action in np.flatnonzero(neighbor_mask_host[current]):
+                next_node = adj_host[current, action]
+                next_successors = set(adj_host[next_node, neighbor_mask_host[next_node]].tolist())
+                forced_return_actions[current, action] = next_successors == {current}
+        self.forced_return_actions = jax.device_put(forced_return_actions)
         self.distances = jax.device_put(jnp.array(distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
         self.hop_distances = jax.device_put(jnp.array(hop_distances, dtype=jnp.float32))  # shape [num_nodes, num_nodes]
         self.paths_dict = paths_dict
@@ -207,7 +244,12 @@ class TaxiEnv(eqx.Module):
         reward = jnp.where(already_done, 0.0, reward)
 
         # Neighbor mask
-        nm = self.neighbor_mask_static[nxt]
+        nm = mask_immediate_reverse_actions(
+            self.adj_list,
+            self.neighbor_mask_static[nxt],
+            nxt,
+            curr,
+        )
         
         # Already done
         at_pickup_before = (curr == state.pickup_node)
