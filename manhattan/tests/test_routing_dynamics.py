@@ -3,6 +3,7 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+import networkx as nx
 
 from taxi_env import (
     TaxiState,
@@ -10,6 +11,12 @@ from taxi_env import (
     effective_action_mask,
     init_env,
     mask_immediate_reverse_actions,
+    pickup_bonus_reward_from_seconds,
+)
+from taxi_env_utils import (
+    apply_minimum_edge_travel_time,
+    build_adj_and_time_matrix,
+    load_or_compute_distance_matrix_parallel,
 )
 from training.q_learning import (
     TabularQLearning,
@@ -128,6 +135,47 @@ class ContinuousTimeTests(unittest.TestCase):
         np.testing.assert_array_equal(
             np.asarray(next_state.neighbor_mask), [False, True]
         )
+
+    def test_minimum_edge_time_updates_dynamics_and_shortest_paths(self):
+        graph = nx.MultiDiGraph()
+        graph.add_edge(0, 1, travel_time_congested=0.5 / 60.0)
+        graph.add_edge(0, 1, travel_time_congested=3.0 / 60.0)
+        graph.add_edge(1, 2, travel_time_congested=1.0 / 60.0)
+        graph.add_edge(0, 2, travel_time_congested=10.0 / 60.0)
+        node_to_idx = {0: 0, 1: 1, 2: 2}
+
+        changed = apply_minimum_edge_travel_time(graph, 2.0)
+        _, travel_times, _ = build_adj_and_time_matrix(
+            graph,
+            node_to_idx=node_to_idx,
+        )
+        distances, _, _, _ = load_or_compute_distance_matrix_parallel(
+            graph,
+            node_to_idx,
+            cache_file=None,
+            num_workers=1,
+        )
+
+        self.assertEqual(changed, 2)
+        self.assertAlmostEqual(float(travel_times[0, 0]), 2.0, places=6)
+        self.assertAlmostEqual(float(distances[0, 2]), 4.0, places=6)
+
+    def test_zero_minimum_keeps_edge_times_unchanged(self):
+        graph = nx.MultiDiGraph()
+        graph.add_edge(0, 1, travel_time_congested=0.5 / 60.0)
+
+        changed = apply_minimum_edge_travel_time(graph, 0.0)
+
+        self.assertEqual(changed, 0)
+        self.assertAlmostEqual(
+            graph[0][1][0]["travel_time_congested"] * 60.0,
+            0.5,
+            places=6,
+        )
+
+    def test_pickup_bonus_seconds_match_travel_cost_units(self):
+        self.assertAlmostEqual(pickup_bonus_reward_from_seconds(10.0), 1.0 / 6.0)
+        self.assertAlmostEqual(pickup_bonus_reward_from_seconds(50.0), 5.0 / 6.0)
 
 
 class QPolicyMaskTests(unittest.TestCase):

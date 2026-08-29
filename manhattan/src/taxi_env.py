@@ -6,6 +6,14 @@ from typing import NamedTuple, Sequence, Tuple, Dict, Optional
 import gymnasium as gym
 import numpy as np
 
+
+def pickup_bonus_reward_from_seconds(seconds: float) -> float:
+    """Convert a travel-time-equivalent bonus in seconds to reward units."""
+    if seconds < 0:
+        raise ValueError("pickup bonus seconds must be non-negative")
+    return seconds / 60.0
+
+
 # State
 class TaxiState(NamedTuple):
     current_node: jnp.ndarray  

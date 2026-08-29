@@ -11,8 +11,8 @@ import threading
 jax.config.update('jax_enable_x64', False)
 jax.config.update('jax_compilation_cache_dir', None)
 
-from taxi_env_utils import build_adj_and_time_matrix, make_obs_fn, load_or_compute_distance_matrix_parallel, load_or_build_graph, build_noise_mask
-from taxi_env import TaxiEnv, init_env
+from taxi_env_utils import apply_minimum_edge_travel_time, build_adj_and_time_matrix, make_obs_fn, load_or_compute_distance_matrix_parallel, load_or_build_graph, build_noise_mask
+from taxi_env import TaxiEnv, init_env, pickup_bonus_reward_from_seconds
 from utils import EstimateReturnsState, load_graph
 from modes.context import RunContext
 
@@ -140,6 +140,15 @@ parser.add_argument("--base_time", type=float, default=1.0, help="Base travel ti
 parser.add_argument("--max_steps", type=int, default=300, help="Maximum number of steps per episode")
 parser.add_argument("--pickup_bonus", type=float, default=50.0, help="Bonus for picking up a passenger")
 parser.add_argument(
+    "--pickup_bonus_seconds",
+    type=float,
+    default=None,
+    help=(
+        "Pickup bonus expressed as seconds of avoided travel. It is divided by 60 "
+        "to match the reward units and overrides --pickup_bonus when provided."
+    ),
+)
+parser.add_argument(
     "--timeout_penalty",
     type=float,
     default=None,
@@ -201,6 +210,15 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility (affects starts/pickups selection)")
 parser.add_argument("--discrete", action="store_true", help="Use discrete time discretization and tabular Q-learning instead of PPO")
 parser.add_argument("--dt", type=float, default=1.0, help="Time discretization step in seconds (default: 1.0, used when --discrete is set)")
+parser.add_argument(
+    "--min_edge_travel_time_seconds",
+    type=float,
+    default=0.0,
+    help=(
+        "Floor each physical edge travel time to this many seconds before building "
+        "runtime and shortest-path data. Zero preserves the original edge times."
+    ),
+)
 parser.add_argument("--q_table_dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Q-table dtype for discrete Q-learning. Use float16/bfloat16 to reduce memory usage.")
 parser.add_argument("--pretrain_enabled", action="store_true", help="Enable shortest path pretraining for Q-learning (discrete mode only)")
 parser.add_argument("--num_pretrain_episodes", type=int, default=10000, help="Number of pretraining episodes using shortest path rollouts (for Q-learning)")
@@ -233,6 +251,10 @@ if args.timeout_penalty is not None:
         "Warning: --timeout_penalty is deprecated and ignored; horizon truncations "
         "use negative nominal shortest-path remaining travel time."
     )
+if args.min_edge_travel_time_seconds < 0:
+    raise ValueError("--min_edge_travel_time_seconds must be non-negative")
+if args.pickup_bonus_seconds is not None:
+    args.pickup_bonus = pickup_bonus_reward_from_seconds(args.pickup_bonus_seconds)
 if args.checkpoint_frequency < 0:
     raise ValueError("--checkpoint_frequency must be non-negative")
 if args.episode_offset < 0:
@@ -306,7 +328,25 @@ else:
     graph_cache_file = os.path.join(args.cache_dir, f"simple_graph_{args.num_layers}layers_{args.offset}offset.pkl")
 G, node_to_idx, idx_to_node, fixed_starts_idx, fixed_pickups_idx, traffic_params = load_or_build_graph(args, graph_cache_file)
 
+floored_edge_count = apply_minimum_edge_travel_time(
+    G,
+    args.min_edge_travel_time_seconds,
+)
+
 print(f"Graph loaded: {len(G.nodes())} nodes, {len(G.edges())} edges")
+if args.min_edge_travel_time_seconds > 0:
+    print(
+        "[TRAVEL TIME FLOOR] "
+        f"minimum={args.min_edge_travel_time_seconds:g}s, "
+        f"floored_edge_records={floored_edge_count}, dt={args.dt:g}s"
+    )
+else:
+    print("[TRAVEL TIME FLOOR] disabled; original edge travel times retained")
+if args.pickup_bonus_seconds is not None:
+    print(
+        "[PICKUP BONUS] "
+        f"{args.pickup_bonus_seconds:g}s equivalent = {args.pickup_bonus:.6f} reward units"
+    )
 print(f"starts: {fixed_starts_idx}, pickups: {fixed_pickups_idx}")
 
 # --- Build graph structures ---
