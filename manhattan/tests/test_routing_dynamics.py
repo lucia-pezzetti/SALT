@@ -25,6 +25,7 @@ from training.q_learning import (
     _update_q_value_jit,
     discretize_time,
 )
+from trajectory_diagnostics import find_repeated_cycle_segments
 
 
 def make_test_env() -> TaxiEnv:
@@ -176,6 +177,47 @@ class ContinuousTimeTests(unittest.TestCase):
     def test_pickup_bonus_seconds_match_travel_cost_units(self):
         self.assertAlmostEqual(pickup_bonus_reward_from_seconds(10.0), 1.0 / 6.0)
         self.assertAlmostEqual(pickup_bonus_reward_from_seconds(50.0), 5.0 / 6.0)
+
+
+class TrajectoryDiagnosticTests(unittest.TestCase):
+    def test_detects_repeated_three_node_cycle(self):
+        path = [
+            4,
+            937,
+            1813,
+            1343,
+            937,
+            1813,
+            1343,
+            937,
+            1813,
+            1343,
+            937,
+            9,
+        ]
+
+        segments = find_repeated_cycle_segments(path)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].start_step, 1)
+        self.assertEqual(segments[0].period, 3)
+        self.assertEqual(segments[0].repetitions, 3)
+        self.assertEqual(segments[0].cycle_nodes, (937, 1813, 1343, 937))
+
+    def test_prefers_fundamental_cycle_period(self):
+        path = [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1]
+
+        segments = find_repeated_cycle_segments(path)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].period, 3)
+        self.assertEqual(segments[0].repetitions, 4)
+
+    def test_ignores_nonrepeated_route(self):
+        self.assertEqual(
+            find_repeated_cycle_segments([1, 2, 3, 4, 5]),
+            [],
+        )
 
 
 class QPolicyMaskTests(unittest.TestCase):
