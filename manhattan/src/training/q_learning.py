@@ -12,7 +12,13 @@ import numpy as np
 import pickle
 from pathlib import Path
 
-from taxi_env import TaxiState, TaxiEnv, init_env
+from taxi_env import (
+    TaxiState,
+    TaxiEnv,
+    effective_action_mask,
+    init_env,
+    mask_immediate_reverse_actions,
+)
 
 
 @jax.jit
@@ -36,7 +42,8 @@ def _jitted_step_with_discretization(
     curr = state.current_node
     nxt = env.adj_list[curr, action]
 
-    travel = discrete_travel_times[curr, action]
+    # Physical dynamics stay continuous; only the Q-table time index is discrete.
+    travel = env.travel_times[curr, action]
     
     # Per-step congestion noise
     if noise_key is not None:
@@ -58,8 +65,7 @@ def _jitted_step_with_discretization(
     wait = jnp.where(cycle < green_edge, 0.0, period_edge - cycle)
     t2 = t1 + wait
 
-    discrete_t2 = jnp.round(t2 / dt) * dt
-    norm_time = jnp.mod(discrete_t2, period_edge)
+    norm_time = jnp.mod(t2, period_edge)
 
     total_delay = travel + wait
 
@@ -67,7 +73,12 @@ def _jitted_step_with_discretization(
     reward = -total_delay / 60.0 + pickup_bonus
     reward = jnp.where(already_done, 0.0, reward)
 
-    nm = env.neighbor_mask_static[nxt]
+    nm = mask_immediate_reverse_actions(
+        env.adj_list,
+        env.neighbor_mask_static[nxt],
+        nxt,
+        curr,
+    )
 
     at_pickup_before = (curr == state.pickup_node)
     reached_pickup_this_step = reach & ~already_done
@@ -101,13 +112,13 @@ def _jitted_step_with_discretization(
 
 
 def discretize_time(time: float, dt: float = 1.0) -> int:
-    """Discretize time to the nearest multiple of dt."""
-    return int(round(time / dt))
+    """Map continuous time to the containing Q-table time bin."""
+    return int(np.floor(time / dt))
 
 
 def discretize_travel_time(travel_time: float, dt: float = 1.0) -> float:
-    """Discretize travel time to the nearest multiple of dt."""
-    return dt * round(travel_time / dt)
+    """Return a positive upper-bin approximation when one is explicitly needed."""
+    return dt * max(1, int(np.ceil(travel_time / dt)))
 
 
 def state_to_discrete_key(state: TaxiState, dt: float = 1.0) -> Tuple[int, int, int]:
@@ -142,7 +153,7 @@ def _get_state_indices_jit(state: TaxiState, dt: float, max_time_slices: int, nu
     """
     curr = jnp.int32(state.current_node)
     pickup = jnp.int32(state.pickup_node)
-    t_idx = jnp.int32(jnp.round(state.time / dt))
+    t_idx = jnp.int32(jnp.floor(state.time / dt))
     # Clamp indices to valid ranges
     t_idx = jnp.clip(t_idx, 0, max_time_slices - 1)
     curr = jnp.clip(curr, 0, num_nodes - 1)
@@ -170,6 +181,8 @@ def _select_action_jit(
     dt: float,
     max_time_slices: int,
     num_nodes: int,
+    adj_list: jnp.ndarray,
+    forced_return_actions: jnp.ndarray,
     key: jnp.ndarray,
 ) -> Tuple[jnp.int32, jnp.ndarray]:
     """
@@ -182,7 +195,13 @@ def _select_action_jit(
     q_row = q_table[curr, pickup, t_idx, :]  # [max_deg]
     
     # Mask invalid actions
-    valid_mask = state.neighbor_mask
+    valid_mask = effective_action_mask(
+        adj_list,
+        forced_return_actions,
+        curr,
+        pickup,
+        state.neighbor_mask,
+    )
     q_masked = jnp.where(valid_mask, q_row, -1e9)
     
     # Calculate epsilon
@@ -223,6 +242,8 @@ def _update_q_value_jit(
     dt: float,
     max_time_slices: int,
     num_nodes: int,
+    adj_list: jnp.ndarray,
+    forced_return_actions: jnp.ndarray,
 ) -> jnp.ndarray:
     """
     JIT-compiled Q-value update.
@@ -236,7 +257,13 @@ def _update_q_value_jit(
     q_next_row = q_table[n_curr, n_pickup, n_t_idx, :]  # [max_deg]
     
     # Mask invalid actions for next state
-    valid_mask = next_state.neighbor_mask
+    valid_mask = effective_action_mask(
+        adj_list,
+        forced_return_actions,
+        n_curr,
+        n_pickup,
+        next_state.neighbor_mask,
+    )
     q_next_masked = jnp.where(valid_mask, q_next_row, -1e9)
     max_next_q = jnp.max(q_next_masked)
     
@@ -262,6 +289,7 @@ def _estimate_return_q_table_direct(
     num_nodes: int,
     max_time_slices: int,
     env: TaxiEnv,
+    base_action_mask: jnp.ndarray,
 ) -> jnp.float32:
     """
     JIT-compiled function to estimate return for a start-pickup pair using Q-table directly.
@@ -275,6 +303,7 @@ def _estimate_return_q_table_direct(
         num_nodes: Number of nodes in the graph
         max_time_slices: Maximum number of time slices
         env: TaxiEnv instance
+        base_action_mask: Actions available for this agent before target-aware filtering
         
     Returns: estimated return (negative cost for matching)
     """
@@ -287,7 +316,13 @@ def _estimate_return_q_table_direct(
     q_row = q_table[curr, pickup_idx, t_idx, :]  # [max_deg]
     
     # Mask invalid actions
-    valid_mask = env.neighbor_mask_static[start]
+    valid_mask = effective_action_mask(
+        env.adj_list,
+        env.forced_return_actions,
+        curr,
+        pickup_idx,
+        base_action_mask,
+    )
     q_masked = jnp.where(valid_mask, q_row, -jnp.inf)
     
     # Return max Q-value (expected return from best action)
@@ -297,7 +332,7 @@ def _estimate_return_q_table_direct(
 # Batched version for multiple start-pickup pairs
 _estimate_returns_batch_q_table_direct = jax.vmap(
     _estimate_return_q_table_direct,
-    in_axes=(None, 0, 0, None, None, None, None),  # q_table, start, pickup, time_idx, num_nodes, max_time_slices, env
+    in_axes=(None, 0, 0, None, None, None, None, 0),
     out_axes=0
 )
 
@@ -305,7 +340,7 @@ _estimate_returns_batch_q_table_direct = jax.vmap(
 # Batched versions for multi-agent training
 _batched_select_action = jax.vmap(
     _select_action_jit,
-    in_axes=(None, 0, 0, None, None, None, None, None, None, 0),
+    in_axes=(None, 0, 0, None, None, None, None, None, None, None, None, 0),
     out_axes=(0, 0)
 )
 
@@ -331,6 +366,8 @@ def _batched_update_q_values_vectorized(
     dt: float,
     max_time_slices: int,
     num_nodes: int,
+    adj_list: jnp.ndarray,
+    forced_return_actions: jnp.ndarray,
 ) -> jnp.ndarray:
     """
     Update Q-table for multiple agents
@@ -339,7 +376,7 @@ def _batched_update_q_values_vectorized(
     def get_indices(curr, pickup, time):
         curr_clipped = jnp.clip(curr, 0, num_nodes - 1)
         pickup_clipped = jnp.clip(pickup, 0, num_nodes - 1)
-        t_idx = jnp.clip(jnp.int32(jnp.round(time / dt)), 0, max_time_slices - 1)
+        t_idx = jnp.clip(jnp.int32(jnp.floor(time / dt)), 0, max_time_slices - 1)
         return curr_clipped, pickup_clipped, t_idx
     
     # Vectorized index computation
@@ -362,7 +399,15 @@ def _batched_update_q_values_vectorized(
     q_next_rows = q_table[next_curr_indices, next_pickup_indices, next_t_indices, :]
     
     # Mask invalid actions for next states [num_agents, max_deg]
-    valid_masks = next_states_neighbor_mask  # [num_agents, max_deg]
+    valid_masks = jax.vmap(
+        lambda curr, pickup, mask: effective_action_mask(
+            adj_list,
+            forced_return_actions,
+            curr,
+            pickup,
+            mask,
+        )
+    )(next_curr_indices, next_pickup_indices, next_states_neighbor_mask)
     q_next_masked = jnp.where(valid_masks, q_next_rows, jnp.asarray(-1e4, dtype=q_dtype))
     max_next_q = jnp.max(q_next_masked, axis=-1)  # [num_agents]
     
@@ -441,13 +486,12 @@ class TabularQLearning:
         self.track_visits = False  # Set to True only if statistics are needed
         self.visit_counts: Dict[Tuple[int, int, int, int], int] = {}
         
-        # Discretize travel times in environment
+        # Kept as a compatibility alias for shortest-path helper call sites.
         self._discretize_travel_times()
     
     def _discretize_travel_times(self):
-        """Discretize all travel times in the environment to multiples of dt."""
-        # Create a discretized copy of travel_times
-        self.discrete_travel_times = jnp.round(self.env.travel_times / self.dt) * self.dt
+        """Keep physical edge times continuous; only Q-table indexing is discrete."""
+        self.discrete_travel_times = self.env.travel_times
     
     def _get_state_indices(self, state: TaxiState) -> Tuple[int, int, int]:
         """Get Q-table indices for a state."""
@@ -661,6 +705,8 @@ class TabularQLearning:
             self.dt,
             self.max_time_slices,
             self.env.num_nodes,
+            self.env.adj_list,
+            self.env.forced_return_actions,
             key,
         )
         return int(action)
@@ -690,6 +736,8 @@ class TabularQLearning:
             self.dt,
             self.max_time_slices,
             self.env.num_nodes,
+            self.env.adj_list,
+            self.env.forced_return_actions,
         )
         
     def estimate_returns_for_matching(
@@ -720,6 +768,7 @@ class TabularQLearning:
         # Create all combinations: [num_starts * num_pickups]
         starts_expanded = jnp.repeat(starts, num_pickups)
         pickups_expanded = jnp.tile(pickups, num_starts)
+        base_action_masks = self.env.neighbor_mask_static[starts_expanded]
         
         # Estimate returns directly from Q-table (no rollouts!)
         returns_flat = _estimate_returns_batch_q_table_direct(
@@ -730,6 +779,7 @@ class TabularQLearning:
             self.env.num_nodes,
             self.max_time_slices,
             self.env,
+            base_action_masks,
         )
         
         # Reshape to [num_starts, num_pickups]
@@ -738,8 +788,7 @@ class TabularQLearning:
     
     def step_with_discretization(self, state: TaxiState, action: int, key: jnp.ndarray, noise_key: jnp.ndarray = None) -> Tuple[TaxiState, float, bool, dict]:
         """
-        Environment step with discretized travel times.
-        This replaces the normal env.step() when using discrete mode.
+        Environment step with continuous dynamics and discrete Q-table indexing.
         """
         next_state, reward, done_flag, info = _jitted_step_with_discretization(
             self.env,

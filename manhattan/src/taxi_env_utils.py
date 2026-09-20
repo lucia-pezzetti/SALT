@@ -13,6 +13,37 @@ from concurrent.futures import ThreadPoolExecutor
 from taxi_env import TaxiEnv, TaxiState
 from utils import load_graph, fixed_starts_pickups, load_simple_graph
 
+
+def apply_minimum_edge_travel_time(
+    G: nx.DiGraph,
+    minimum_seconds: float,
+    attribute: str = "travel_time_congested",
+) -> int:
+    """Floor valid graph edge travel times and return the number changed."""
+    if minimum_seconds < 0:
+        raise ValueError("minimum_seconds must be non-negative")
+    if minimum_seconds == 0:
+        return 0
+
+    minimum_minutes = minimum_seconds / 60.0
+    if G.is_multigraph():
+        edge_data = G.edges(keys=True, data=True)
+        records = (data for _, _, _, data in edge_data)
+    else:
+        edge_data = G.edges(data=True)
+        records = (data for _, _, data in edge_data)
+
+    changed = 0
+    for data in records:
+        travel_time = data.get(attribute)
+        if travel_time is None:
+            continue
+        if float(travel_time) < minimum_minutes:
+            data[attribute] = minimum_minutes
+            changed += 1
+    return changed
+
+
 # Graph conversion utilities
 def build_adj_and_time_matrix(G: nx.DiGraph, max_deg=None, node_to_idx: dict = None):
     node_list = list(G.nodes())

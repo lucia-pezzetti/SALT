@@ -13,7 +13,7 @@ import optax
 import time
 from collections import defaultdict
 
-from taxi_env import TaxiState, TaxiEnv, init_env
+from taxi_env import TaxiState, TaxiEnv, effective_action_mask, init_env
 from training.q_learning import (
     TabularQLearning,
     _jitted_step_with_discretization,
@@ -22,6 +22,14 @@ from training.q_learning import (
     _batched_update_q_values_vectorized,
 )
 from utils import offline_shortest_path_action
+
+
+def _hungarian_columns_by_row(cost_matrix: jnp.ndarray) -> jnp.ndarray:
+    """Return the assigned column for each row of a square cost matrix."""
+    if cost_matrix.shape[0] != cost_matrix.shape[1]:
+        raise ValueError("Manhattan fleet matching requires a square cost matrix")
+    rows, cols = optax.assignment.hungarian_algorithm(cost_matrix)
+    return jnp.full((cost_matrix.shape[0],), -1, dtype=cols.dtype).at[rows].set(cols)
 
 
 def remaining_travel_terminal_value(env: TaxiEnv, current_nodes, pickup_nodes):
@@ -211,7 +219,13 @@ def pretrain_q_learning_on_shortest_path(
                 env.adj_list,
                 q_agent.discrete_travel_times,
                 env.distances,
-                state.neighbor_mask
+                effective_action_mask(
+                    env.adj_list,
+                    env.forced_return_actions,
+                    state.current_node,
+                    state.pickup_node,
+                    state.neighbor_mask,
+                ),
             )
             expert_action = int(expert_action)
             
@@ -610,6 +624,7 @@ def train_q_learning(
             # Create all combinations
             starts_expanded = jnp.repeat(starts, num_pickups)
             pickups_expanded = jnp.tile(pickups, num_starts)
+            base_action_masks = env.neighbor_mask_static[starts_expanded]
             
             # Estimate returns directly from Q-table (batched) at the sampled time
             from training.q_learning import _estimate_returns_batch_q_table_direct
@@ -621,13 +636,14 @@ def train_q_learning(
                 num_nodes,
                 max_time_slices,
                 env,
+                base_action_masks,
             )
             
             # Reshape to [num_starts, num_pickups]
             returns_matrix = returns_flat.reshape(num_starts, num_pickups)
             
             # Hungarian algorithm
-            _, assignment = optax.assignment.hungarian_algorithm(-returns_matrix)
+            assignment = _hungarian_columns_by_row(-returns_matrix)
             return pickups[assignment]
         
         # Use cond to only compute optimal matching when needed
@@ -694,6 +710,8 @@ def train_q_learning(
                 dt,
                 max_time_slices,
                 num_nodes,
+                env.adj_list,
+                env.forced_return_actions,
                 action_keys,
             )
             
@@ -742,6 +760,8 @@ def train_q_learning(
                 dt,
                 max_time_slices,
                 num_nodes,
+                env.adj_list,
+                env.forced_return_actions,
             )
             
             # Update statistics (only for agents that are not done)
@@ -868,6 +888,8 @@ def train_q_learning(
                             q_agent.env,
                         )
                     
+            else:
+                # A single agent needs no assignment step.
                 matched_pickups = pickups
                 if not no_round_trip:
                     return_starts = matched_pickups
@@ -1070,7 +1092,7 @@ def train_q_learning(
                             
                             # Perform Hungarian matching using Q-table at time=0
                             returns_matrix = q_agent.estimate_returns_for_matching(start_set, pickup_set, time_idx=start_time_idx)
-                            _, assignment = optax.assignment.hungarian_algorithm(-returns_matrix)
+                            assignment = _hungarian_columns_by_row(-returns_matrix)
                             matched_pickups = pickup_set[assignment]
                             
                             # Evaluate matched pairs (continuous)
@@ -1098,7 +1120,7 @@ def train_q_learning(
                                     
                                     # Discretize state time for Q-table lookup
                                     dt = q_agent.dt
-                                    discretized_time = dt * round(state.time / dt)
+                                    discretized_time = dt * jnp.floor(state.time / dt)
                                     state_for_policy = TaxiState(
                                         current_node=state.current_node,
                                         pickup_node=state.pickup_node,
@@ -1111,7 +1133,13 @@ def train_q_learning(
                                     # Greedy action
                                     curr, pickup, t_idx = q_agent._get_state_indices(state_for_policy)
                                     q_row = q_agent.q_table[curr, pickup, t_idx, :]  # [max_deg]
-                                    valid_mask = jnp.array(state_for_policy.neighbor_mask, dtype=jnp.bool_)
+                                    valid_mask = effective_action_mask(
+                                        env.adj_list,
+                                        env.forced_return_actions,
+                                        state_for_policy.current_node,
+                                        state_for_policy.pickup_node,
+                                        state_for_policy.neighbor_mask,
+                                    )
                                     q_masked = jnp.where(valid_mask, q_row, -1e9)
                                     
                                     # Check if any valid actions exist
@@ -1163,7 +1191,13 @@ def train_q_learning(
                                     # Greedy action
                                     curr, pickup, t_idx = q_agent._get_state_indices(state)
                                     q_row = q_agent.q_table[curr, pickup, t_idx, :]  # [max_deg]
-                                    valid_mask = jnp.array(state.neighbor_mask, dtype=jnp.bool_)
+                                    valid_mask = effective_action_mask(
+                                        env.adj_list,
+                                        env.forced_return_actions,
+                                        state.current_node,
+                                        state.pickup_node,
+                                        state.neighbor_mask,
+                                    )
                                     q_masked = jnp.where(valid_mask, q_row, -1e9)
                                     
                                     # Check if any valid actions exist
@@ -1252,7 +1286,7 @@ def _discretize_state_time(state: TaxiState, dt: float) -> TaxiState:
     The discretized time is used to access the Q-table, but we keep
     the original continuous time in the actual state for environment steps.
     """
-    discretized_time = dt * round(state.time / dt)
+    discretized_time = dt * jnp.floor(state.time / dt)
     return TaxiState(
         current_node=state.current_node,
         pickup_node=state.pickup_node,
@@ -1339,8 +1373,15 @@ def evaluate_q_agent(
                 # Get Q-values for all valid actions
                 valid_actions = []
                 q_values = []
+                valid_mask = effective_action_mask(
+                    env.adj_list,
+                    env.forced_return_actions,
+                    state_for_q_lookup.current_node,
+                    state_for_q_lookup.pickup_node,
+                    state_for_q_lookup.neighbor_mask,
+                )
                 for action in range(env.max_deg):
-                    if state_for_q_lookup.neighbor_mask[action]:
+                    if bool(valid_mask[action]):
                         valid_actions.append(action)
                         q_values.append(q_agent.get_q_value(state_for_q_lookup, action))
                 
@@ -1404,8 +1445,15 @@ def evaluate_q_agent(
                     # Get Q-values for all valid actions
                     valid_actions = []
                     q_values = []
+                    valid_mask = effective_action_mask(
+                        env.adj_list,
+                        env.forced_return_actions,
+                        state_for_q_lookup.current_node,
+                        state_for_q_lookup.pickup_node,
+                        state_for_q_lookup.neighbor_mask,
+                    )
                     for action in range(env.max_deg):
-                        if state_for_q_lookup.neighbor_mask[action]:
+                        if bool(valid_mask[action]):
                             valid_actions.append(action)
                             q_values.append(q_agent.get_q_value(state_for_q_lookup, action))
                     
