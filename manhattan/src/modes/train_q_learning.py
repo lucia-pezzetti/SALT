@@ -15,7 +15,6 @@ from taxi_env import (
 )
 from training.train_q_learning import train_q_learning, evaluate_q_agent
 from training.q_learning import TabularQLearning
-from trajectory_diagnostics import find_repeated_cycle_segments
 from utils import offline_shortest_path_action, offline_shortest_path_action_discrete, offline_shortest_path_action_batch, offline_shortest_path_action_discrete_batch
 # from evaluation.plot_agent_paths import plot_rl_vs_shortest_path  # Disabled: trajectory plots removed
 
@@ -1613,6 +1612,28 @@ def run_q_learning(args, ctx: RunContext) -> None:
                 def _round_list(values):
                     return [round(float(x), 2) for x in values]
 
+                def _alternating_cycle_segments(path, min_backtracks=3):
+                    """Return maximal path-index ranges containing repeated A-B-A moves."""
+                    backtracks = [
+                        idx for idx in range(2, len(path))
+                        if path[idx] == path[idx - 2]
+                    ]
+                    if not backtracks:
+                        return []
+
+                    runs = []
+                    run_start = run_end = backtracks[0]
+                    for idx in backtracks[1:]:
+                        if idx == run_end + 1:
+                            run_end = idx
+                        else:
+                            if run_end - run_start + 1 >= min_backtracks:
+                                runs.append((run_start - 2, run_end))
+                            run_start = run_end = idx
+                    if run_end - run_start + 1 >= min_backtracks:
+                        runs.append((run_start - 2, run_end))
+                    return runs
+
                 def _trajectory_phases(path, step_times):
                     """Reconstruct the pre-action traffic phase from observed step times."""
                     phases = [0.0]
@@ -1630,96 +1651,35 @@ def run_q_learning(args, ctx: RunContext) -> None:
                     return phases
 
                 def _print_q_cycle_diagnostic(label, path, targets, step_times):
-                    segments = find_repeated_cycle_segments(path)
+                    segments = _alternating_cycle_segments(path)
                     if not segments:
-                        print(f"      {label} cycle diagnosis: no repeated cycle found")
+                        print(f"      {label} cycle diagnosis: no long two-node cycle found")
                         return
 
                     phases = _trajectory_phases(path, step_times)
                     print(
-                        f"      {label} cycle diagnosis: {len(segments)} repeated cycle(s); "
-                        "Q=learned value, SP=edge+remaining nominal seconds"
+                        f"      {label} cycle diagnosis: {len(segments)} long cycle(s); "
+                        "Q=learned value, SP=nominal edge+remaining time, wait=nominal wait now"
                     )
-                    for segment_idx, segment in enumerate(segments, start=1):
-                        start_idx = segment.start_step
-                        end_idx = min(segment.end_step, len(step_times))
+                    for segment_idx, (start_idx, end_idx) in enumerate(segments[:4], start=1):
+                        cycle_nodes = sorted({int(node) for node in path[start_idx:end_idx + 1]})
                         cycle_targets = sorted({
                             int(targets[min(step + 1, len(targets) - 1)])
-                            for step in range(start_idx, end_idx)
+                            for step in range(start_idx, min(end_idx, len(step_times)))
                         })
-                        cycle_times = [
-                            sum(step_times[step:step + segment.period])
-                            for step in range(start_idx, end_idx, segment.period)
-                            if step + segment.period <= len(step_times)
-                        ]
-                        time_indices = [
-                            int(np.clip(
-                                np.floor(phases[step] / q_agent.dt),
-                                0,
-                                q_agent.max_time_slices - 1,
-                            ))
-                            for step in range(start_idx, end_idx)
-                        ]
                         print(
-                            f"        cycle {segment_idx}: pattern={list(segment.cycle_nodes)} "
-                            f"period={segment.period} repetitions={segment.repetitions} "
-                            f"path_steps={start_idx}-{end_idx - 1} targets={cycle_targets} "
-                            f"time_bins={min(time_indices)}-{max(time_indices)} "
-                            f"cycle_time_median={float(np.median(cycle_times)):.2f}s"
+                            f"        cycle {segment_idx}: nodes={cycle_nodes} "
+                            f"path_steps={start_idx}-{end_idx} targets={cycle_targets}"
                         )
 
-                        first_cycle_steps = range(
-                            start_idx,
-                            min(start_idx + segment.period, end_idx),
-                        )
-                        sp_disagreement_offsets = []
-                        for step_idx in first_cycle_steps:
-                            current = int(path[step_idx])
-                            observed_next = int(path[step_idx + 1])
-                            target = int(targets[min(step_idx + 1, len(targets) - 1)])
-                            phase = float(phases[step_idx])
-                            time_idx = int(np.clip(
-                                np.floor(phase / q_agent.dt),
-                                0,
-                                q_agent.max_time_slices - 1,
-                            ))
-                            base_mask = ctx.env.neighbor_mask_static[current]
-                            if step_idx > 0:
-                                base_mask = mask_immediate_reverse_actions(
-                                    ctx.env.adj_list,
-                                    base_mask,
-                                    current,
-                                    int(path[step_idx - 1]),
-                                )
-                            valid = np.asarray(
-                                effective_action_mask(
-                                    ctx.env.adj_list,
-                                    ctx.env.forced_return_actions,
-                                    current,
-                                    target,
-                                    base_mask,
-                                ),
-                                dtype=bool,
-                            )
-                            neighbors = np.asarray(ctx.env.adj_list[current], dtype=np.int32)
-                            sp_costs = np.asarray(ctx.env.travel_times[current], dtype=np.float32) + np.asarray(
-                                ctx.env.distances[neighbors, target], dtype=np.float32
-                            )
-                            sp_action = int(np.argmin(np.where(valid, sp_costs, np.inf)))
-                            if int(neighbors[sp_action]) != observed_next:
-                                sp_disagreement_offsets.append(step_idx - start_idx)
-
-                        representative_repetitions = sorted({
-                            0,
-                            segment.repetitions // 2,
-                            segment.repetitions - 1,
-                        })
-                        shown_steps = list(first_cycle_steps)
-                        for repetition in representative_repetitions[1:]:
-                            for offset in sp_disagreement_offsets:
-                                step_idx = start_idx + repetition * segment.period + offset
-                                if step_idx < end_idx:
-                                    shown_steps.append(step_idx)
+                        cycle_steps = list(range(start_idx, min(end_idx, len(step_times))))
+                        if len(cycle_steps) > 8:
+                            middle = cycle_steps[len(cycle_steps) // 2]
+                            shown_steps = cycle_steps[:3] + [middle] + cycle_steps[-3:]
+                        else:
+                            shown_steps = cycle_steps
+                        if end_idx < len(step_times):
+                            shown_steps.append(end_idx)  # Include the action that exits the cycle.
                         shown_steps = list(dict.fromkeys(shown_steps))
 
                         for step_idx in shown_steps:
@@ -1756,14 +1716,6 @@ def run_q_learning(args, ctx: RunContext) -> None:
                                 ctx.env.distances[neighbors, target], dtype=np.float32
                             )
                             sp_action = int(np.argmin(np.where(valid, sp_costs, np.inf)))
-                            chosen_actions = np.flatnonzero(valid & (neighbors == observed_next))
-                            chosen_action = (
-                                q_action
-                                if q_action in chosen_actions
-                                else int(chosen_actions[0])
-                            )
-                            q_gap = float(q_values[chosen_action] - q_values[sp_action])
-                            sp_extra = float(sp_costs[chosen_action] - sp_costs[sp_action])
 
                             options = []
                             for action in np.flatnonzero(valid):
@@ -1781,17 +1733,17 @@ def run_q_learning(args, ctx: RunContext) -> None:
                                     markers += "S"
                                 options.append(
                                     f"a{action}->{int(neighbors[action])}[{markers or '-'}]:"
-                                    f"Q={float(q_values[action]):.6g},"
-                                    f"SP={float(sp_costs[action]):.1f},"
-                                    f"travel={travel:.2f},wait={wait:.1f}"
+                                    f"Q={float(q_values[action]):.4g},"
+                                    f"SP={float(sp_costs[action]):.1f},wait={wait:.1f}"
                                 )
                             print(
                                 f"          step={step_idx} phase={phase:.2f} t_idx={time_idx} "
                                 f"state=({current}, target={target}) observed_next={observed_next} "
                                 f"observed_dt={float(step_times[step_idx]):.2f} "
-                                f"q_gap_vs_sp={q_gap:.6g} sp_extra={sp_extra:.1f}s "
                                 f"options={{" + "; ".join(options) + "}"
                             )
+                    if len(segments) > 4:
+                        print(f"        ... {len(segments) - 4} additional cycle(s) omitted")
 
                 print("\n--- Trajectory debug (continuous evaluation, node ids) ---")
                 print(f"  starts={_int_list(eval_starts)}")

@@ -112,3 +112,15 @@ src/submit_clariden_chunks.sh
 src/submit_clariden_eval_5agents_trajectories.sbatch
 src/submit_clariden_eval_ce.sbatch
 src/submit_clariden_fleet_eval.sh
+
+# Local cluster launchers, diagnostics, and tests
+src/audit_manhattan_single_neighbor_nodes.py
+src/run_routing_ablation_rank.sh
+src/run_routing_ablation_trajectory_rank.sh
+src/submit_clariden_routing_ablation.sbatch
+src/submit_clariden_routing_ablation_chunks.sh
+src/submit_clariden_routing_ablation_trajectories.sbatch
+src/submit_clariden_routing_ablation_trajectories.sh
+src/trajectory_diagnostics.py
+src/summarize_manhattan_eval.py
+tests/test_routing_dynamics.py
