@@ -11,7 +11,9 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from .env import GridConfig, SingleAgentGoalGrid, Pos, target_col_lo
+from .early_stopping import ReachTargetStopper
 from .noise import NoiseConfig
+from .torch_utils import from_numpy, module_device, resolve_device, seed_torch, to_numpy
 
 # The small tensor workloads here are faster with bounded intra-op parallelism.
 torch.set_num_threads(min(torch.get_num_threads(), 8))
@@ -20,6 +22,7 @@ _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int
 
 @dataclass
 class SepPPOConfig:
+    device: str = "auto"
     gamma: float = 0.98
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
@@ -40,9 +43,10 @@ class SepPPOConfig:
     early_stop_plateau_window_batches: int = 0
     early_stop_max_delta_reach_rate: float = 0.0
     early_stop_max_delta_mean_reward: float = 0.0
-    # Success stop: halt once training reach rate is sustained >= this target
-    # for `plateau_window` (fallback `patience`) consecutive batches. 0 disables.
+    # A positive target enables threshold-only early stopping: plateau stopping
+    # is disabled, and training stops after the target is sustained for the window.
     early_stop_reach_target: float = 0.0
+    early_stop_reach_window_batches: int = 10
 
 
 class _Actor(nn.Module):
@@ -135,8 +139,11 @@ def _assign_goals_by_value(
             pair_ij.append((i, j))
 
     if obs_pairs:
+        device = module_device(critic)
         with torch.no_grad():
-            vals = critic(torch.from_numpy(np.asarray(obs_pairs, dtype=np.float32))).numpy()
+            vals = to_numpy(
+                critic(from_numpy(np.asarray(obs_pairs, dtype=np.float32), device))
+            )
         for (i, j), v in zip(pair_ij, vals):
             C[i, j] = -float(v)
 
@@ -165,33 +172,57 @@ def _epsilon_by_interactions(interactions_done: int, decay_interactions: int, cf
 
 
 class GoalConditionedPPOPolicy:
-    def __init__(self, actor: _Actor, h: int, w: int):
+    def __init__(
+        self, actor: _Actor, h: int, w: int, critic: _Critic | None = None,
+    ):
         self.actor = actor
+        # The critic is kept so that evaluation can use -V(s, z, t) as the
+        # transport cost of the optimal-transport assignment (SALT's \hat j).
+        self.critic = critic
         self.h = int(h)
         self.w = int(w)
         self.obs_dim = 6
 
     def act_greedy(self, s: Pos, z: Pos, t: int, grid: GridConfig) -> int:
         obs = _obs_sep(s, z, t, grid)[None, :]
+        device = module_device(self.actor)
         with torch.no_grad():
-            logits = self.actor.net(torch.from_numpy(obs))
+            logits = self.actor.net(from_numpy(obs, device))
             return int(logits.argmax(-1).item())
 
     def save(self, path: str):
+        lin0 = self.actor.net[0]
+        assert isinstance(lin0, nn.Linear)
         torch.save({
             "actor_state_dict": self.actor.state_dict(),
+            "critic_state_dict": (
+                None if self.critic is None else self.critic.state_dict()
+            ),
             "h": self.h,
             "w": self.w,
             "obs_dim": self.obs_dim,
+            "hidden_size": int(lin0.out_features),
         }, path)
 
     @classmethod
-    def load(cls, path: str, hidden_size: int = 64) -> "GoalConditionedPPOPolicy":
+    def load(
+        cls, path: str, hidden_size: int = 64, device: str = "auto"
+    ) -> "GoalConditionedPPOPolicy":
         payload = torch.load(path, map_location="cpu")
-        actor = _Actor(obs_dim=int(payload["obs_dim"]), hidden=hidden_size)
+        dev = resolve_device(device)
+        obs_dim = int(payload["obs_dim"])
+        hidden = int(payload.get("hidden_size", hidden_size))
+        actor = _Actor(obs_dim=obs_dim, hidden=hidden).to(dev)
         actor.load_state_dict(payload["actor_state_dict"])
         actor.eval()
-        return cls(actor=actor, h=int(payload["h"]), w=int(payload["w"]))
+        critic: _Critic | None = None
+        if payload.get("critic_state_dict") is not None:
+            critic = _Critic(obs_dim=obs_dim, hidden=hidden).to(dev)
+            critic.load_state_dict(payload["critic_state_dict"])
+            critic.eval()
+        return cls(
+            actor=actor, h=int(payload["h"]), w=int(payload["w"]), critic=critic,
+        )
 
 
 def train_goal_ppo(
@@ -208,7 +239,8 @@ def train_goal_ppo(
     if cfg is None:
         cfg = SepPPOConfig()
 
-    torch.manual_seed(seed)
+    device = resolve_device(cfg.device)
+    seed_torch(seed, device)
     rng = np.random.default_rng(seed)
 
     obs_dim = 6
@@ -221,8 +253,8 @@ def train_goal_ppo(
         if cfg.eps_decay_interactions is not None
         else max(1, total_interactions // 2)
     )
-    actor = _Actor(obs_dim=obs_dim, hidden=cfg.hidden_size)
-    critic = _Critic(obs_dim=obs_dim, hidden=cfg.hidden_size)
+    actor = _Actor(obs_dim=obs_dim, hidden=cfg.hidden_size).to(device)
+    critic = _Critic(obs_dim=obs_dim, hidden=cfg.hidden_size).to(device)
     opt_a = torch.optim.Adam(actor.parameters(), lr=cfg.lr_actor)
     opt_c = torch.optim.Adam(critic.parameters(), lr=cfg.lr_critic)
 
@@ -230,7 +262,10 @@ def train_goal_ppo(
     reach_log: List[float] = []
     train_curve: List[Dict[str, float]] = []
     consecutive_small_updates = 0
-    consecutive_target_ok = 0
+    target_stopper = ReachTargetStopper(
+        cfg.early_stop_reach_target,
+        cfg.early_stop_reach_window_batches,
+    )
     early_stopped = False
     stop_reason = ""
     if wb_run is not None:
@@ -292,11 +327,12 @@ def train_goal_ppo(
 
             obs_flat = obs.reshape(E * N, obs_dim)
             with torch.no_grad():
-                a_t, lp_t = actor.sample(torch.from_numpy(obs_flat))
-                v_t = critic(torch.from_numpy(obs_flat))
-            actions = a_t.numpy().astype(np.int64).reshape(E, N)
-            logp = lp_t.numpy().astype(np.float32).reshape(E, N)
-            vals = v_t.numpy().astype(np.float32).reshape(E, N)
+                obs_t = from_numpy(obs_flat, device)
+                a_t, lp_t = actor.sample(obs_t)
+                v_t = critic(obs_t)
+            actions = to_numpy(a_t).astype(np.int64).reshape(E, N)
+            logp = to_numpy(lp_t).astype(np.float32).reshape(E, N)
+            vals = to_numpy(v_t).astype(np.float32).reshape(E, N)
             actions[reached] = 4
 
             exec_a = actions.copy().astype(np.int32)
@@ -345,12 +381,12 @@ def train_goal_ppo(
         s_rew_f = s_rew.reshape(H, E * N)
         s_val_f = s_val.reshape(H, E * N)
         adv, ret = _gae_batched(s_rew_f, s_val_f, cfg.gamma, cfg.gae_lambda)
-        b_obs = torch.from_numpy(s_obs.reshape(H * E * N, obs_dim))
-        b_acts = torch.from_numpy(s_acts.reshape(H * E * N))
-        b_logp = torch.from_numpy(s_logp.reshape(H * E * N))
-        b_adv = torch.from_numpy(adv.reshape(H * E * N))
-        b_ret = torch.from_numpy(ret.reshape(H * E * N))
-        b_mask = torch.from_numpy(s_mask.reshape(H * E * N))
+        b_obs = from_numpy(s_obs.reshape(H * E * N, obs_dim), device)
+        b_acts = from_numpy(s_acts.reshape(H * E * N), device)
+        b_logp = from_numpy(s_logp.reshape(H * E * N), device)
+        b_adv = from_numpy(adv.reshape(H * E * N), device)
+        b_ret = from_numpy(ret.reshape(H * E * N), device)
+        b_mask = from_numpy(s_mask.reshape(H * E * N), device)
         am = b_mask > 0.5
         if am.sum() > 1:
             b_adv = (b_adv - b_adv[am].mean()) / (b_adv[am].std() + 1e-8)
@@ -432,22 +468,15 @@ def train_goal_ppo(
                 f"{p}/entropy": entropy_v,
             })
 
-        if cfg.early_stop_reach_target > 0.0:
-            if mean_reach >= cfg.early_stop_reach_target:
-                consecutive_target_ok += 1
-            else:
-                consecutive_target_ok = 0
-            tw = (cfg.early_stop_plateau_window_batches
-                  or cfg.early_stop_patience_batches or 1)
-            if consecutive_target_ok >= max(1, tw):
-                early_stopped = True
-                stop_reason = (f"reach rate >= {cfg.early_stop_reach_target:.0%} "
-                               f"for {consecutive_target_ok} batches")
-                print(f"[SepPPO-{noise_cfg.kind}] early stop at batch "
-                      f"{batch_idx + 1}: {stop_reason}")
-                break
+        if target_stopper.update(mean_reach):
+            early_stopped = True
+            stop_reason = target_stopper.reason()
+            print(f"[SepPPO-{noise_cfg.kind}] early stop at batch "
+                  f"{batch_idx + 1}: {stop_reason}")
+            break
 
-        if cfg.early_stop_patience_batches > 0:
+        if (target_stopper.allows_plateau_stop
+                and cfg.early_stop_patience_batches > 0):
             small_update_ok = (
                 cfg.early_stop_min_rel_policy_update <= 0.0
                 or rel_policy_update < cfg.early_stop_min_rel_policy_update
@@ -482,7 +511,8 @@ def train_goal_ppo(
                 print(f"[SepPPO-{noise_cfg.kind}] early stop at batch {batch_idx + 1}: {stop_reason}")
                 break
 
-    policy = GoalConditionedPPOPolicy(actor=actor, h=grid.h, w=grid.w)
+    critic.eval()
+    policy = GoalConditionedPPOPolicy(actor=actor, h=grid.h, w=grid.w, critic=critic)
     executed_batches = len(train_curve)
     executed_episodes = int(executed_batches * E)
     executed_interactions = int(executed_batches * E * N * H)
@@ -493,6 +523,7 @@ def train_goal_ppo(
         "noise_kind": noise_cfg.kind,
         "p": noise_cfg.p,
         "sep_ppo_config": asdict(cfg),
+        "device": str(device),
         "mean_reward_last10": float(np.mean(rewards_log[-10:])),
         "mean_reach_last10": float(np.mean(reach_log[-10:])),
         "env_interactions": executed_interactions,
@@ -524,7 +555,8 @@ def train_goal_a2c(
     if cfg is None:
         cfg = SepPPOConfig()
 
-    torch.manual_seed(seed)
+    device = resolve_device(cfg.device)
+    seed_torch(seed, device)
     rng = np.random.default_rng(seed)
 
     obs_dim = 6
@@ -537,8 +569,8 @@ def train_goal_a2c(
         if cfg.eps_decay_interactions is not None
         else max(1, total_interactions // 2)
     )
-    actor = _Actor(obs_dim=obs_dim, hidden=cfg.hidden_size)
-    critic = _Critic(obs_dim=obs_dim, hidden=cfg.hidden_size)
+    actor = _Actor(obs_dim=obs_dim, hidden=cfg.hidden_size).to(device)
+    critic = _Critic(obs_dim=obs_dim, hidden=cfg.hidden_size).to(device)
     opt_a = torch.optim.Adam(actor.parameters(), lr=cfg.lr_actor)
     opt_c = torch.optim.Adam(critic.parameters(), lr=cfg.lr_critic)
 
@@ -546,7 +578,10 @@ def train_goal_a2c(
     reach_log: List[float] = []
     train_curve: List[Dict[str, float]] = []
     consecutive_small_updates = 0
-    consecutive_target_ok = 0
+    target_stopper = ReachTargetStopper(
+        cfg.early_stop_reach_target,
+        cfg.early_stop_reach_window_batches,
+    )
     early_stopped = False
     stop_reason = ""
     if wb_run is not None:
@@ -608,11 +643,12 @@ def train_goal_a2c(
 
             obs_flat = obs.reshape(E * N, obs_dim)
             with torch.no_grad():
-                a_t, lp_t = actor.sample(torch.from_numpy(obs_flat))
-                v_t = critic(torch.from_numpy(obs_flat))
-            actions = a_t.numpy().astype(np.int64).reshape(E, N)
-            logp = lp_t.numpy().astype(np.float32).reshape(E, N)
-            vals = v_t.numpy().astype(np.float32).reshape(E, N)
+                obs_t = from_numpy(obs_flat, device)
+                a_t, lp_t = actor.sample(obs_t)
+                v_t = critic(obs_t)
+            actions = to_numpy(a_t).astype(np.int64).reshape(E, N)
+            logp = to_numpy(lp_t).astype(np.float32).reshape(E, N)
+            vals = to_numpy(v_t).astype(np.float32).reshape(E, N)
             actions[reached] = 4
 
             exec_a = actions.copy().astype(np.int32)
@@ -661,12 +697,12 @@ def train_goal_a2c(
         s_rew_f = s_rew.reshape(H, E * N)
         s_val_f = s_val.reshape(H, E * N)
         adv, ret = _gae_batched(s_rew_f, s_val_f, cfg.gamma, cfg.gae_lambda)
-        b_obs = torch.from_numpy(s_obs.reshape(H * E * N, obs_dim))
-        b_acts = torch.from_numpy(s_acts.reshape(H * E * N))
-        b_logp = torch.from_numpy(s_logp.reshape(H * E * N))
-        b_adv = torch.from_numpy(adv.reshape(H * E * N))
-        b_ret = torch.from_numpy(ret.reshape(H * E * N))
-        b_mask = torch.from_numpy(s_mask.reshape(H * E * N))
+        b_obs = from_numpy(s_obs.reshape(H * E * N, obs_dim), device)
+        b_acts = from_numpy(s_acts.reshape(H * E * N), device)
+        b_logp = from_numpy(s_logp.reshape(H * E * N), device)
+        b_adv = from_numpy(adv.reshape(H * E * N), device)
+        b_ret = from_numpy(ret.reshape(H * E * N), device)
+        b_mask = from_numpy(s_mask.reshape(H * E * N), device)
         am = b_mask > 0.5
         if am.sum() > 1:
             b_adv = (b_adv - b_adv[am].mean()) / (b_adv[am].std() + 1e-8)
@@ -742,22 +778,15 @@ def train_goal_a2c(
                 f"{p}/entropy": entropy_v,
             })
 
-        if cfg.early_stop_reach_target > 0.0:
-            if mean_reach >= cfg.early_stop_reach_target:
-                consecutive_target_ok += 1
-            else:
-                consecutive_target_ok = 0
-            tw = (cfg.early_stop_plateau_window_batches
-                  or cfg.early_stop_patience_batches or 1)
-            if consecutive_target_ok >= max(1, tw):
-                early_stopped = True
-                stop_reason = (f"reach rate >= {cfg.early_stop_reach_target:.0%} "
-                               f"for {consecutive_target_ok} batches")
-                print(f"[SepPPO-{noise_cfg.kind}] early stop at batch "
-                      f"{batch_idx + 1}: {stop_reason}")
-                break
+        if target_stopper.update(mean_reach):
+            early_stopped = True
+            stop_reason = target_stopper.reason()
+            print(f"[SepA2C-{noise_cfg.kind}] early stop at batch "
+                  f"{batch_idx + 1}: {stop_reason}")
+            break
 
-        if cfg.early_stop_patience_batches > 0:
+        if (target_stopper.allows_plateau_stop
+                and cfg.early_stop_patience_batches > 0):
             small_update_ok = (
                 cfg.early_stop_min_rel_policy_update <= 0.0
                 or rel_policy_update < cfg.early_stop_min_rel_policy_update
@@ -792,7 +821,8 @@ def train_goal_a2c(
                 print(f"[SepA2C-{noise_cfg.kind}] early stop at batch {batch_idx + 1}: {stop_reason}")
                 break
 
-    policy = GoalConditionedPPOPolicy(actor=actor, h=grid.h, w=grid.w)
+    critic.eval()
+    policy = GoalConditionedPPOPolicy(actor=actor, h=grid.h, w=grid.w, critic=critic)
     executed_batches = len(train_curve)
     executed_episodes = int(executed_batches * E)
     executed_interactions = int(executed_batches * E * N * H)
@@ -803,6 +833,7 @@ def train_goal_a2c(
         "noise_kind": noise_cfg.kind,
         "p": noise_cfg.p,
         "sep_a2c_config": asdict(cfg),
+        "device": str(device),
         "mean_reward_last10": float(np.mean(rewards_log[-10:])),
         "mean_reach_last10": float(np.mean(reach_log[-10:])),
         "env_interactions": executed_interactions,

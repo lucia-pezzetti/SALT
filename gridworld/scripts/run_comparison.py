@@ -53,6 +53,40 @@ from salt.salt_ppo import (
     train_goal_a2c,
 )
 from salt.matching import assign_goals, terminal_ot_cost, target_coverage_rate
+from salt.salt_ppo import _assign_goals_by_value as _ppo_assign_goals_by_value
+from salt.salt_dqn import _assign_goals_by_qmax as _dqn_assign_goals_by_qmax
+
+# Transport cost used by the optimal-transport assignment at EVALUATION time.
+#   "learned":  the learned cost-to-go \hat j(s, z) of the SALT learner
+#               (min_a Q for tabular Q, -max_a Q for DDQN, -V for PPO/A2C),
+#               i.e. the deployment step of Algorithm 1 in the paper;
+#   "distance": the nominal Manhattan distance (the behaviour of the
+#               code before this switch existed).
+# Set from --sep_eval_assignment in main().
+SEP_EVAL_ASSIGNMENT = "learned"
+
+
+def _sep_assign(model, pos, targets, t, grid):
+    """Optimal-transport (Hungarian) assignment of agents to targets.
+
+    With ``SEP_EVAL_ASSIGNMENT == "learned"`` the transportation cost is the
+    learned cost-to-go estimate of ``model``; otherwise the Manhattan distance.
+    ``t`` is the current time step (the neural observation contains t/(T-1)).
+    """
+    if SEP_EVAL_ASSIGNMENT == "distance":
+        return assign_goals(pos, targets)
+    if isinstance(model, GoalConditionedTabularQ):
+        return model.assign_goals_by_q(pos, targets)
+    if isinstance(model, GoalConditionedDeepDQNPolicy):
+        return _dqn_assign_goals_by_qmax(pos, targets, t, grid, model.q_net)
+    if isinstance(model, GoalConditionedPPOPolicy):
+        if model.critic is None:
+            raise ValueError(
+                "PPO/A2C checkpoint has no critic: retrain (or re-save) with the "
+                "critic, or pass --sep_eval_assignment distance"
+            )
+        return _ppo_assign_goals_by_value(pos, targets, t, grid, model.critic)
+    raise TypeError(f"unsupported SALT model type {type(model)!r}")
 from salt.mappo import (
     MAPPOConfig,
     train_mappo,
@@ -89,6 +123,7 @@ from salt.mfq_local import (
     rollout_mfq_local,
 )
 from salt.viz import plot_terminal_hist
+from salt.torch_utils import resolve_device
 
 
 def _sample_targets(
@@ -195,10 +230,11 @@ def _stable_reach_milestones(
                 break
         if idx is None:
             continue
+        attained_idx = idx + stability_window - 1
         out[k] = {
-            "env_interactions": interactions[idx],
-            "epochs": batches[idx],
-            "episodes": episodes[idx],
+            "env_interactions": interactions[attained_idx],
+            "epochs": batches[attained_idx],
+            "episodes": episodes[attained_idx],
         }
     return out
 
@@ -306,6 +342,18 @@ def _parse_fixed_targets(s: str, h: int, w: int) -> List[Pos]:
     return targets
 
 
+def _require_checkpoint(path: str | None, what: str) -> None:
+    """Fail loudly when an explicit checkpoint path does not exist.
+
+    The ``--*_path_<noise>`` flags are the only way a path reaches the
+    ``ensure_sep_*`` loaders, so a missing file is always a caller mistake;
+    silently retraining from scratch would produce numbers that look like a
+    re-evaluation of the checkpoint but are not.
+    """
+    if path and not os.path.exists(path):
+        raise FileNotFoundError(f"[{what}] checkpoint path given but not found: {path}")
+
+
 def ensure_sep_q(
     grid: GridConfig, noise_cfg: NoiseConfig, q_path: str | None,
     n_agents: int, seed: int, sep_episodes: int = 250_000,
@@ -313,6 +361,7 @@ def ensure_sep_q(
     log_every: int = 5000,
 ) -> tuple[GoalConditionedTabularQ, dict]:
     """Train or load a noise-specific goal-conditioned Q-table."""
+    _require_checkpoint(q_path, "sep")
     if q_path and os.path.exists(q_path):
         Q = GoalConditionedTabularQ.load(q_path)
         if Q.h == grid.h and Q.w == grid.w:
@@ -352,10 +401,12 @@ def ensure_sep_ddqn(
     wb_prefix: str = "train",
     log_every: int = 10,
     print_every: int = 10_000,
+    device: str = "auto",
 ) -> tuple[GoalConditionedDeepDQNPolicy, dict]:
     """Train or load a noise-specific deep Double DQN policy (.pt)."""
+    _require_checkpoint(policy_path, "sep-ddqn")
     if policy_path and os.path.exists(policy_path):
-        policy = GoalConditionedDeepDQNPolicy.load(policy_path)
+        policy = GoalConditionedDeepDQNPolicy.load(policy_path, device=device)
         if policy.h == grid.h and policy.w == grid.w:
             print(f"[sep-ddqn] Loaded policy from {policy_path}")
             return policy, {"loaded_from": policy_path}
@@ -363,6 +414,7 @@ def ensure_sep_ddqn(
 
     total_ix = max(1, sep_ppo_batches * sep_ppo_batch_eps * n_agents * grid.horizon)
     dqcfg = SepDeepDQNConfig(
+        device=device,
         n_batches=sep_ppo_batches,
         batch_episodes=sep_ppo_batch_eps,
         eps_decay_interactions=max(1, total_ix // 2),
@@ -405,21 +457,25 @@ def ensure_sep_a2c(
     early_stop_max_delta_reach_rate: float = 0.0,
     early_stop_max_delta_mean_reward: float = 0.0,
     early_stop_reach_target: float = 0.0,
+    early_stop_reach_window_batches: int = 10,
     save_dir: str | None = None,
     wb_run=None,
     wb_prefix: str = "train",
     log_every: int = 10,
     print_every: int = 10_000,
+    device: str = "auto",
 ) -> tuple[GoalConditionedPPOPolicy, dict]:
     """Train or load a noise-specific Separation A2C policy (.pt, same format as Sep-PPO)."""
+    _require_checkpoint(policy_path, "sep-a2c")
     if policy_path and os.path.exists(policy_path):
-        policy = GoalConditionedPPOPolicy.load(policy_path)
+        policy = GoalConditionedPPOPolicy.load(policy_path, device=device)
         if policy.h == grid.h and policy.w == grid.w:
             print(f"[sep-a2c] Loaded policy from {policy_path}")
             return policy, {"loaded_from": policy_path}
         print("[warn] Sep A2C shape mismatch, retraining …")
 
     a2c_cfg = SepPPOConfig(
+        device=device,
         n_batches=sep_ppo_batches,
         batch_episodes=sep_ppo_batch_eps,
         eps_decay_episodes=max(1, (sep_ppo_batches * sep_ppo_batch_eps) // 2),
@@ -432,6 +488,7 @@ def ensure_sep_a2c(
         early_stop_max_delta_reach_rate=early_stop_max_delta_reach_rate,
         early_stop_max_delta_mean_reward=early_stop_max_delta_mean_reward,
         early_stop_reach_target=early_stop_reach_target,
+        early_stop_reach_window_batches=early_stop_reach_window_batches,
     )
     model, metrics = train_goal_a2c(
         grid,
@@ -463,7 +520,7 @@ def rollout_separation(
     start_rows: List[int] | None = None,
     collect_step_traces: bool = False,
 ) -> dict:
-    """Greedy rollout with the separation principle (Q + Hungarian)."""
+    """Greedy rollout with the separation principle (learned-cost OT assignment + greedy Q routing)."""
     eval_grid = replace(grid, rng_seed=seed)
     eval_noise = NoiseConfig(
         kind=noise_cfg.kind, p=noise_cfg.p, rng_seed=seed + 10_000,
@@ -472,7 +529,7 @@ def rollout_separation(
         eval_grid, eval_noise, n_agents=n_agents, targets=targets,
     )
     env.reset(start_rows=start_rows)
-    env.goals = assign_goals(env.pos, env.targets)
+    env.goals = _sep_assign(Q, env.pos, env.targets, 0, grid)
 
     arrival_time: list[int | None] = [None] * n_agents
     trajectories: List[List[Pos]] = [
@@ -481,7 +538,7 @@ def rollout_separation(
     step_traces: List[dict] = []
     total_cost = 0.0
 
-    def _rematch_unreached_only() -> None:
+    def _rematch_unreached_only(t: int) -> None:
         active_idx = [i for i, r in enumerate(env.reached) if not r]
         if not active_idx:
             return
@@ -490,14 +547,14 @@ def rollout_separation(
         if len(available_targets) < len(active_idx):
             available_targets = list(env.targets)
         active_agents = [env.pos[i] for i in active_idx]
-        matched = assign_goals(active_agents, available_targets)
+        matched = _sep_assign(Q, active_agents, available_targets, t, grid)
         for i, g in zip(active_idx, matched):
             env.goals[i] = g
 
     for t in range(grid.horizon):
         states_before = [tuple(p) for p in env.pos]
         if rematch_every > 0 and t > 0 and t % rematch_every == 0:
-            _rematch_unreached_only()
+            _rematch_unreached_only(t)
 
         greedy_actions = [
             4 if env.reached[i]
@@ -557,6 +614,7 @@ def rollout_separation(
         "noise_kind": noise_cfg.kind, "p": noise_cfg.p,
         "agents": n_agents, "horizon": grid.horizon,
         "rematch_every": rematch_every,
+        "eval_assignment": SEP_EVAL_ASSIGNMENT,
         "target_coverage": cov,
         "reach_rate": n_reached / n_agents,
         "mean_time_to_reach": (
@@ -585,19 +643,23 @@ def ensure_sep_ppo(
     early_stop_max_delta_reach_rate: float = 0.0,
     early_stop_max_delta_mean_reward: float = 0.0,
     early_stop_reach_target: float = 0.0,
+    early_stop_reach_window_batches: int = 10,
     save_dir: str | None = None, wb_run=None, wb_prefix: str = "train",
     log_every: int = 10,
     print_every: int = 10_000,
+    device: str = "auto",
 ) -> tuple[GoalConditionedPPOPolicy, dict]:
     """Train or load a noise-specific goal-conditioned PPO policy."""
+    _require_checkpoint(policy_path, "sep-ppo")
     if policy_path and os.path.exists(policy_path):
-        policy = GoalConditionedPPOPolicy.load(policy_path)
+        policy = GoalConditionedPPOPolicy.load(policy_path, device=device)
         if policy.h == grid.h and policy.w == grid.w:
             print(f"[sep-ppo] Loaded policy from {policy_path}")
             return policy, {"loaded_from": policy_path}
         print("[warn] SepPPO shape mismatch, retraining …")
 
     ppo_cfg = SepPPOConfig(
+        device=device,
         n_batches=sep_ppo_batches,
         batch_episodes=sep_ppo_batch_eps,
         eps_decay_episodes=max(1, (sep_ppo_batches * sep_ppo_batch_eps) // 2),
@@ -610,6 +672,7 @@ def ensure_sep_ppo(
         early_stop_max_delta_reach_rate=early_stop_max_delta_reach_rate,
         early_stop_max_delta_mean_reward=early_stop_max_delta_mean_reward,
         early_stop_reach_target=early_stop_reach_target,
+        early_stop_reach_window_batches=early_stop_reach_window_batches,
     )
     model, metrics = train_goal_ppo(
         grid, noise_cfg, n_agents=n_agents,
@@ -635,7 +698,7 @@ def rollout_separation_ppo(
     start_rows: List[int] | None = None,
     collect_step_traces: bool = False,
 ) -> dict:
-    """Greedy rollout with separation principle (goal-conditioned PPO + Hungarian)."""
+    """Greedy rollout with the separation principle (learned-cost OT assignment + greedy goal-conditioned policy)."""
     eval_grid = replace(grid, rng_seed=seed)
     eval_noise = NoiseConfig(
         kind=noise_cfg.kind, p=noise_cfg.p, rng_seed=seed + 10_000,
@@ -644,7 +707,7 @@ def rollout_separation_ppo(
         eval_grid, eval_noise, n_agents=n_agents, targets=targets,
     )
     env.reset(start_rows=start_rows)
-    env.goals = assign_goals(env.pos, env.targets)
+    env.goals = _sep_assign(policy, env.pos, env.targets, 0, grid)
 
     arrival_time: list[int | None] = [None] * n_agents
     trajectories: List[List[Pos]] = [
@@ -653,7 +716,7 @@ def rollout_separation_ppo(
     step_traces: List[dict] = []
     total_cost = 0.0
 
-    def _rematch_unreached_only() -> None:
+    def _rematch_unreached_only(t: int) -> None:
         active_idx = [i for i, r in enumerate(env.reached) if not r]
         if not active_idx:
             return
@@ -662,14 +725,14 @@ def rollout_separation_ppo(
         if len(available_targets) < len(active_idx):
             available_targets = list(env.targets)
         active_agents = [env.pos[i] for i in active_idx]
-        matched = assign_goals(active_agents, available_targets)
+        matched = _sep_assign(policy, active_agents, available_targets, t, grid)
         for i, g in zip(active_idx, matched):
             env.goals[i] = g
 
     for t in range(grid.horizon):
         states_before = [tuple(p) for p in env.pos]
         if rematch_every > 0 and t > 0 and t % rematch_every == 0:
-            _rematch_unreached_only()
+            _rematch_unreached_only(t)
 
         greedy_actions = [
             4 if env.reached[i]
@@ -729,6 +792,7 @@ def rollout_separation_ppo(
         "noise_kind": noise_cfg.kind, "p": noise_cfg.p,
         "agents": n_agents, "horizon": grid.horizon,
         "rematch_every": rematch_every,
+        "eval_assignment": SEP_EVAL_ASSIGNMENT,
         "target_coverage": cov,
         "reach_rate": n_reached / n_agents,
         "mean_time_to_reach": (
@@ -764,6 +828,17 @@ def main():
         help="Noise probability p, or comma-separated list (e.g. 0,0.05,0.1,0.25)",
     )
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--sep_eval_assignment",
+        type=str,
+        default="learned",
+        choices=["learned", "distance"],
+        help=(
+            "Transport cost of the OT assignment at SALT evaluation time: the "
+            "learned cost-to-go (default, Algorithm 1 in the paper) or the "
+            "nominal Manhattan distance (previous behaviour)."
+        ),
+    )
     ap.add_argument("--eval_seeds", type=int, default=20,
                     help="Number of evaluation seeds for multi-seed averaging")
     ap.add_argument(
@@ -1099,24 +1174,36 @@ def main():
                     help="Decay the MFQ-local tau/eps exploration schedule to its floor over "
                          "this many batches (default 5000), or the whole run if shorter. "
                          "0 means decay over the full batch budget.")
-    # Shared success stop: halt a method once its training reach rate is
-    # sustained >= target for the plateau window. Applies to MAPPO, Sep-PPO, MFQ,
-    # MFQ-local.
+    # Shared threshold-only stop. When enabled, low plateaus cannot terminate a
+    # run; training stops only after the reach target is sustained for its window.
     ap.add_argument("--early_stop_reach_target", type=float, default=0.0,
                     help="Stop training once training reach rate is sustained >= this "
                          "target (e.g. 0.99). 0 disables. Applies to MAPPO, Sep-PPO, MFQ, "
                          "MFQ-local.")
+    ap.add_argument("--early_stop_reach_window", type=int, default=10,
+                    help="Consecutive batches required at or above "
+                         "--early_stop_reach_target. When a target is enabled, "
+                         "plateau-based stopping is disabled.")
     ap.add_argument("--early_stop_min_reach", type=float, default=0.0,
                     help="MFQ / MFQ-local plateau stop only fires once the reach-rate "
                          "moving average is >= this floor, preventing a false stop during "
                          "early low-reach exploration. 0 disables the guard.")
     # Output and logging.
+    ap.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="PyTorch device for neural methods. auto selects CUDA when available.",
+    )
     ap.add_argument("--outdir", type=str, default="runs/comparison")
     ap.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     ap.add_argument("--wandb_project", type=str, default="marl-separation-noise",
                     help="W&B project name")
     ap.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (team/account)")
     args = ap.parse_args()
+    global SEP_EVAL_ASSIGNMENT
+    SEP_EVAL_ASSIGNMENT = args.sep_eval_assignment
+    print(f"[sep] evaluation assignment cost: {SEP_EVAL_ASSIGNMENT}")
 
     p_values = _parse_p_values(args.p)
     if len(p_values) > 1:
@@ -1139,9 +1226,15 @@ def main():
             subprocess.run(cmd, check=True)
         return
     args.p = float(p_values[0])
+    args.device = str(resolve_device(args.device))
+    print(f"[device] neural methods will run on {args.device}")
     reach_thresholds = _parse_reach_thresholds(args.reach_thresholds)
     if args.stability_window <= 0:
         raise ValueError("--stability_window must be >= 1.")
+    if not 0.0 <= args.early_stop_reach_target <= 1.0:
+        raise ValueError("--early_stop_reach_target must be in [0, 1].")
+    if args.early_stop_reach_window <= 0:
+        raise ValueError("--early_stop_reach_window must be >= 1.")
     if args.sep_ppo_early_stop_patience < 0 or args.mappo_early_stop_patience < 0:
         raise ValueError("Early-stop patience values must be >= 0.")
     if args.sep_ppo_early_stop_min_rel_update < 0.0 or args.mappo_early_stop_min_rel_update < 0.0:
@@ -1210,6 +1303,7 @@ def main():
 
     mappo_modes = _parse_relative_only_modes(args.mappo_obs_modes, "MAPPO") if args.run_mappo else []
     mappo_cfg = MAPPOConfig(
+        device=args.device,
         n_batches=args.mappo_batches,
         batch_episodes=args.mappo_batch_eps,
         early_stop_patience_batches=args.mappo_early_stop_patience,
@@ -1218,12 +1312,14 @@ def main():
         early_stop_max_delta_reach_rate=args.mappo_early_stop_max_delta_reach,
         early_stop_max_delta_mean_reward=args.mappo_early_stop_max_delta_reward,
         early_stop_reach_target=args.early_stop_reach_target,
+        early_stop_reach_window_batches=args.early_stop_reach_window,
     )
     ippo_modes = (
         _parse_relative_only_modes(args.ippo_obs_modes, "IPPO")
         if args.run_ippo else []
     )
     ippo_cfg = IPPOConfig(
+        device=args.device,
         n_batches=args.ippo_batches,
         batch_episodes=args.ippo_batch_eps,
     )
@@ -1232,6 +1328,7 @@ def main():
         if args.run_happo else []
     )
     happo_cfg = HAPPOConfig(
+        device=args.device,
         n_batches=args.happo_batches,
         batch_episodes=args.happo_batch_eps,
     )
@@ -1240,6 +1337,7 @@ def main():
         if args.run_qmix else []
     )
     qmix_cfg = QMIXConfig(
+        device=args.device,
         n_batches=args.qmix_batches,
         batch_episodes=args.qmix_batch_eps,
         eps_decay_episodes=max(1, (args.qmix_batches * args.qmix_batch_eps) // 2),
@@ -1249,6 +1347,7 @@ def main():
         if args.run_vdn else []
     )
     vdn_cfg = VDNConfig(
+        device=args.device,
         n_batches=args.vdn_batches,
         batch_episodes=args.vdn_batch_eps,
         eps_decay_episodes=max(1, (args.vdn_batches * args.vdn_batch_eps) // 2),
@@ -1266,6 +1365,7 @@ def main():
                              args.mfq_explore_decay_cap_batches or args.mfq_batches)
     mfq_decay_episodes = max(1, _mfq_decay_batches * args.mfq_batch_eps)
     mfq_cfg = MFQConfig(
+        device=args.device,
         n_batches=args.mfq_batches,
         batch_episodes=args.mfq_batch_eps,
         tau_decay_episodes=mfq_decay_episodes,
@@ -1275,6 +1375,7 @@ def main():
         early_stop_max_delta_reach_rate=args.mfq_early_stop_max_delta_reach,
         early_stop_max_delta_mean_reward=args.mfq_early_stop_max_delta_reward,
         early_stop_reach_target=args.early_stop_reach_target,
+        early_stop_reach_window_batches=args.early_stop_reach_window,
         early_stop_min_reach=args.early_stop_min_reach,
     )
     mfq_local_modes = [args.mfq_local_obs_mode] if args.run_mfq_local else []
@@ -1282,6 +1383,7 @@ def main():
                                    args.mfq_local_explore_decay_cap_batches or args.mfq_local_batches)
     mfq_local_decay_episodes = max(1, _mfq_local_decay_batches * args.mfq_local_batch_eps)
     mfq_local_cfg = MFQLocalConfig(
+        device=args.device,
         n_batches=args.mfq_local_batches,
         batch_episodes=args.mfq_local_batch_eps,
         obs_mode=args.mfq_local_obs_mode,
@@ -1295,6 +1397,7 @@ def main():
         early_stop_max_delta_reach_rate=args.mfq_local_early_stop_max_delta_reach,
         early_stop_max_delta_mean_reward=args.mfq_local_early_stop_max_delta_reward,
         early_stop_reach_target=args.early_stop_reach_target,
+        early_stop_reach_window_batches=args.early_stop_reach_window,
         early_stop_min_reach=args.early_stop_min_reach,
     )
     # Keep logged curves comparable without storing every training batch.
@@ -1381,6 +1484,7 @@ def main():
                     wb_prefix=f"train_sep_ddqn/{kind}",
                     log_every=sep_log_every_ddqn,
                     print_every=sep_ppo_print_every,
+                    device=args.device,
                 )
                 sep_env_interactions = (
                     sep_train_info.get("train_metrics", {}).get("env_interactions")
@@ -1403,10 +1507,12 @@ def main():
                     early_stop_max_delta_reach_rate=args.sep_ppo_early_stop_max_delta_reach,
                     early_stop_max_delta_mean_reward=args.sep_ppo_early_stop_max_delta_reward,
                     early_stop_reach_target=args.early_stop_reach_target,
+                    early_stop_reach_window_batches=args.early_stop_reach_window,
                     save_dir=kind_dir, wb_run=wb_run,
                     wb_prefix=f"train_sep_ppo/{kind}",
                     log_every=sep_log_every_ppo,
                     print_every=sep_ppo_print_every,
+                    device=args.device,
                 )
                 sep_env_interactions = (
                     sep_train_info.get("train_metrics", {}).get("env_interactions")
@@ -1429,10 +1535,12 @@ def main():
                     early_stop_max_delta_reach_rate=args.sep_ppo_early_stop_max_delta_reach,
                     early_stop_max_delta_mean_reward=args.sep_ppo_early_stop_max_delta_reward,
                     early_stop_reach_target=args.early_stop_reach_target,
+                    early_stop_reach_window_batches=args.early_stop_reach_window,
                     save_dir=kind_dir, wb_run=wb_run,
                     wb_prefix=f"train_sep_a2c/{kind}",
                     log_every=sep_log_every_a2c,
                     print_every=sep_ppo_print_every,
+                    device=args.device,
                 )
                 sep_env_interactions = (
                     sep_train_info.get("train_metrics", {}).get("env_interactions")
