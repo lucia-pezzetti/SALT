@@ -46,7 +46,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .env import GridConfig, ACTIONS, Pos, target_col_lo
-from .noise import NoiseConfig
+from .noise import NoiseConfig, apply_global_slip
 from .matching import terminal_ot_cost, target_coverage_rate, assign_goals, manhattan
 # Reuse the generic, obs-shape-agnostic pieces from the primary MFQ baseline.
 from .mfq import MFQQNet, MFQReplayBuffer, _vec_slip, _geom_decay, _ACTIONS_ARR
@@ -358,11 +358,7 @@ def train_mfq_local(
                         if len(si):
                             flat[si] = _vec_slip(rng, flat[si], n_act)
                 elif kind == "global":
-                    ep_slip = rng.random(E) < p_noise
-                    for e in np.where(ep_slip)[0]:
-                        ie = np.where(active[e])[0]
-                        if len(ie):
-                            exec_a[e, ie] = _vec_slip(rng, exec_a[e, ie], n_act)
+                    exec_a = apply_global_slip(rng, exec_a, active, p_noise, n_act)
                 elif kind == "local":
                     cache: Dict[tuple, int] = {}
                     for e in range(E):
@@ -672,8 +668,7 @@ def rollout_mfq_local(
                 if len(si):
                     exec_a[si] = _vec_slip(rng, exec_a[si], n_act)
             elif kind == "global":
-                if rng.random() < p_noise:
-                    exec_a[idx_a] = _vec_slip(rng, exec_a[idx_a], n_act)
+                exec_a = apply_global_slip(rng, exec_a, active, p_noise, n_act)
             elif kind == "local":
                 cache: Dict[tuple, int] = {}
                 for i in idx_a:

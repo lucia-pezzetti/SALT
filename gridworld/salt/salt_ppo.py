@@ -12,7 +12,7 @@ from torch.distributions import Categorical
 
 from .env import GridConfig, SingleAgentGoalGrid, Pos, target_col_lo
 from .early_stopping import ReachTargetStopper
-from .noise import NoiseConfig
+from .noise import NoiseConfig, apply_global_slip
 from .torch_utils import from_numpy, module_device, resolve_device, seed_torch, to_numpy
 
 # The small tensor workloads here are faster with bounded intra-op parallelism.
@@ -337,7 +337,9 @@ def train_goal_ppo(
 
             exec_a = actions.copy().astype(np.int32)
             active = ~reached
-            if noise_cfg.kind != "none" and p_noise > 0:
+            if noise_cfg.kind == "global" and p_noise > 0:
+                exec_a = apply_global_slip(rng, exec_a, active, p_noise, n_act)
+            elif noise_cfg.kind != "none" and p_noise > 0:
                 idx = np.where(active.ravel())[0]
                 if len(idx):
                     flat = exec_a.ravel()
@@ -653,7 +655,9 @@ def train_goal_a2c(
 
             exec_a = actions.copy().astype(np.int32)
             active = ~reached
-            if noise_cfg.kind != "none" and p_noise > 0:
+            if noise_cfg.kind == "global" and p_noise > 0:
+                exec_a = apply_global_slip(rng, exec_a, active, p_noise, n_act)
+            elif noise_cfg.kind != "none" and p_noise > 0:
                 idx = np.where(active.ravel())[0]
                 if len(idx):
                     flat = exec_a.ravel()

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from .env import GridConfig, ACTIONS, Pos, target_col_lo
-from .noise import NoiseConfig
+from .noise import NoiseConfig, apply_global_slip
 from .matching import terminal_ot_cost, target_coverage_rate
 
 _ACTIONS_ARR = np.array([(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)], dtype=np.int32)
@@ -217,11 +217,7 @@ def train_ippo(
                         if len(si):
                             flat[si] = _vec_slip(rng, flat[si], n_act)
                 elif kind == "global":
-                    ep_slip = rng.random(E) < p_noise
-                    for e in np.where(ep_slip)[0]:
-                        ie = np.where(active[e])[0]
-                        if len(ie):
-                            exec_a[e, ie] = _vec_slip(rng, exec_a[e, ie], n_act)
+                    exec_a = apply_global_slip(rng, exec_a, active, p_noise, n_act)
                 elif kind == "local":
                     cache: Dict[tuple, int] = {}
                     for e in range(E):
@@ -473,8 +469,7 @@ def rollout_ippo(
                 if len(si):
                     exec_a[si] = _vec_slip(rng, exec_a[si], n_act)
             elif kind == "global":
-                if rng.random() < p_noise:
-                    exec_a[idx_a] = _vec_slip(rng, exec_a[idx_a], n_act)
+                exec_a = apply_global_slip(rng, exec_a, active, p_noise, n_act)
             elif kind == "local":
                 cache: Dict[tuple, int] = {}
                 for i in idx_a:
