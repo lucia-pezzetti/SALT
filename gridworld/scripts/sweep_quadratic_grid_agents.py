@@ -407,7 +407,7 @@ def main() -> None:
             "--collision_penalty",
             str(args.collision_penalty),
             "--eval_start_mode",
-            "bottom_left",
+            "random_rows",
             # Drives both training and evaluation target sampling: the
             # scalability experiment uses the whole grid.
             "--eval_target_region",

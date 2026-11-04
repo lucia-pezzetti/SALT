@@ -11,6 +11,41 @@ class NoiseConfig:
     p: float
     rng_seed: int = 0
 
+
+def apply_global_slip(
+    rng: np.random.Generator,
+    intended: np.ndarray,
+    active: np.ndarray,
+    p: float,
+    n_actions: int = 5,
+) -> np.ndarray:
+    """Share one slip decision and replacement offset per episode and timestep.
+
+    Accept either one episode (agents,) or a batch (episodes, agents).
+    Inactive agents keep their intended actions.
+    """
+    actions = np.asarray(intended)
+    active = np.asarray(active, dtype=bool)
+    if actions.shape != active.shape or actions.ndim not in (1, 2):
+        raise ValueError("intended and active must have matching 1D or 2D shapes")
+
+    single_episode = actions.ndim == 1
+    batched_actions = actions[None, :] if single_episode else actions
+    batched_active = active[None, :] if single_episode else active
+    result = batched_actions.copy()
+
+    slips = rng.random(batched_actions.shape[0]) < p
+    slipped = np.flatnonzero(slips)
+    if slipped.size:
+        offsets = rng.integers(0, n_actions - 1, size=slipped.size)
+        replacement = offsets[:, None] + (
+            offsets[:, None] >= batched_actions[slipped]
+        )
+        mask = batched_active[slipped]
+        result[slipped] = np.where(mask, replacement, result[slipped])
+
+    return result[0] if single_episode else result
+
 class NoiseModel:
     """
     Applies an action 'slip' with probability p:
@@ -27,15 +62,25 @@ class NoiseModel:
             raise ValueError(f"Unknown noise kind: {cfg.kind}")
 
         self._global_slip: Optional[bool] = None
+        self._global_offset: Optional[int] = None
         self._local_choices: Dict[Tuple[int, int, int, int], int] = {}
 
     def reset_timestep(self):
         self._global_slip = None
+        self._global_offset = None
         self._local_choices.clear()
 
     def _slip_action(self, intended: Action) -> Action:
         choices = [a for a in range(self.n_actions) if a != intended]
         return int(self.rng.choice(choices))
+
+    def _global_draw(self, p: float) -> Optional[int]:
+        """Reuse one slip decision and replacement offset for the whole timestep."""
+        if self._global_slip is None:
+            self._global_slip = bool(self.rng.random() < p)
+            if self._global_slip:
+                self._global_offset = int(self.rng.integers(0, self.n_actions - 1))
+        return self._global_offset
 
     def apply(self, intended: Action, *, t: int, s: Tuple[int, int], agent_id: int) -> Action:
         kind = self.cfg.kind
@@ -48,10 +93,9 @@ class NoiseModel:
             return self._slip_action(intended) if slip else intended
 
         if kind == "global":
-            if self._global_slip is None:
-                self._global_slip = bool(self.rng.random() < p)
-            if self._global_slip:
-                return self._slip_action(intended)
+            offset = self._global_draw(p)
+            if offset is not None:
+                return offset + (offset >= intended)
             return intended
 
         if kind == "local":
@@ -110,10 +154,9 @@ class NoiseModel:
             return result
 
         if kind == "global":
-            if self._global_slip is None:
-                self._global_slip = bool(self.rng.random() < p)
-            if self._global_slip:
-                return self._vec_slip(intended)
+            offset = self._global_draw(p)
+            if offset is not None:
+                return offset + (offset >= intended).astype(np.int32)
             return intended.copy()
 
         if kind == "local":

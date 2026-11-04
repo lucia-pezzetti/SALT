@@ -138,7 +138,7 @@ parser.add_argument(
 parser.add_argument("--num_agents", type=int, default=1, help="Number of agents in the environment")
 parser.add_argument("--base_time", type=float, default=1.0, help="Base travel time for grid environment")
 parser.add_argument("--max_steps", type=int, default=300, help="Maximum number of steps per episode")
-parser.add_argument("--pickup_bonus", type=float, default=50.0, help="Bonus for picking up a passenger")
+parser.add_argument("--pickup_bonus", type=float, default=0.0, help="Bonus for picking up a passenger")
 parser.add_argument(
     "--pickup_bonus_seconds",
     type=float,

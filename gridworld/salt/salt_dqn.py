@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .env import GridConfig, Pos, target_col_lo
-from .noise import NoiseConfig
+from .noise import NoiseConfig, apply_global_slip
 from .salt_ppo import _obs_sep
 
 torch.set_num_threads(min(torch.get_num_threads(), 8))
@@ -309,7 +309,9 @@ def train_goal_deep_double_dqn(
 
             exec_a = actions.copy().astype(np.int32)
             active = ~reached
-            if noise_cfg.kind != "none" and p_noise > 0:
+            if noise_cfg.kind == "global" and p_noise > 0:
+                exec_a = apply_global_slip(rng, exec_a, active, p_noise, n_act)
+            elif noise_cfg.kind != "none" and p_noise > 0:
                 idx = np.where(active.ravel())[0]
                 if len(idx):
                     flat = exec_a.ravel()
