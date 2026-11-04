@@ -1,23 +1,6 @@
 """
 Heterogeneous-Agent Proximal Policy Optimization (HAPPO) — Kuba et al., 2022,
 "Trust Region Policy Optimisation in Multi-Agent Reinforcement Learning" (ICLR).
-
-HAPPO is a CTDE actor-critic that, unlike MAPPO, does **not** share actor
-parameters and updates agents **sequentially**: within each iteration a random
-agent order i_1, ..., i_N is drawn, and each agent i_m maximizes a clipped
-surrogate whose advantage is scaled by the cumulative product of the
-already-updated agents' policy ratios,
-
-    M^{1:m}(s, a) = prod_{j<m}  pi_new^{i_j}(a^{i_j}|s) / pi_old^{i_j}(a^{i_j}|s),
-
-which yields the multi-agent advantage decomposition and a monotonic-improvement
-guarantee. We keep a **centralized** value function over the global state (as in
-MAPPO) and estimate the joint advantage with GAE on the shared team reward.
-
-For a clean, apples-to-apples comparison the environment dynamics, observation
-encoding, reward shaping and GAE are reused verbatim from :mod:`salt.mappo`; the
-*only* algorithmic difference from MAPPO is the per-agent (non-shared) actors and
-the sequential cumulative-ratio update above. This isolates HAPPO's contribution.
 """
 from __future__ import annotations
 

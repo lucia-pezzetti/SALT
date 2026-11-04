@@ -6,8 +6,8 @@ original Yang et al., "Mean Field Multi-Agent Reinforcement Learning"
 (ICML 2018) design along the two axes where the primary `mfq.py` baseline
 deliberately departs from it:
 
-1. **N-independent observation.** The primary MFQ observes the relative
-   offset + active flag of *every* target (`obs_dim = 5 + 3*M`), so the
+1. N-independent observation. The primary MFQ observes the relative
+   offset + active flag of every target (`obs_dim = 5 + 3*M`), so the
    per-agent representation — and hence the replay footprint — grows with the
    population. That contradicts MFQ's signature property (Yang et al., Sec. 4:
    "the parameters of the Q-function is independent of the number of agents").
@@ -20,8 +20,8 @@ deliberately departs from it:
    targets is summarised as a distribution, exactly as the population of agents
    is summarised by the mean action.
 
-2. **Local mean field.** The primary MFQ averages the Boltzmann policy over
-   *all* active agents (the Gaussian-Squeeze / global-coupling regime). Here the
+2. Local mean field. The primary MFQ averages the Boltzmann policy over
+   all active agents (the Gaussian-Squeeze / global-coupling regime). Here the
    mean action `a_bar_i` is averaged only over active agents within a spatial
    radius `R` of agent `i` (Chebyshev distance, i.e. a (2R+1)x(2R+1) box),
    matching the *nearest-neighbour* mean field of the Ising and Battle-game
