@@ -1,9 +1,5 @@
 """
 Multi-Agent Proximal Policy Optimization (MAPPO) — cooperative MARL baseline.
-
-CTDE architecture with parameter sharing and shared team reward.
-Optimised: all episodes within a batch are simulated **in parallel**,
-giving a single large forward pass per timestep instead of E small ones.
 """
 from __future__ import annotations
 

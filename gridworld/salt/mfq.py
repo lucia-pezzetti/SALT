@@ -16,7 +16,7 @@ few times per timestep. The Bellman target uses the mean-field *soft* value:
 
 Design choices for the SALT population-control setting
 ------------------------------------------------------
-* We use a **global** mean field: the neighbourhood N(i) is the set of all
+* We use a global mean field: the neighbourhood N(i) is the set of all
   currently-active agents. This is the natural regime for the homogeneous,
   large-population fleet SALT targets, and it is exactly the regime mean-field
   methods are designed for (as reviewer R1 requested, "despite the potential

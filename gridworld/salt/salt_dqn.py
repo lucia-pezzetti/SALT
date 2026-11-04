@@ -1,12 +1,5 @@
 """
 Deep Double DQN (Van Hasselt et al.) for goal-conditioned separation policies.
-
-Uses the same observation encoding as Sep-PPO / Sep-A2C. Q(s,z,·) outputs action values
-for **reward** (higher is better), matching the PPO rollout sign convention.
-
-Replay transitions use the **executed** action after action slip (same as the dynamics that
-produce r and s′). Storing the pre-noise “intended” action would mismatch the Bellman backup
-whenever p > 0.
 """
 from __future__ import annotations
 
